@@ -1,0 +1,197 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import networkx as nx
+
+from scr.data.projection import normalize_name
+
+
+def _import_scglue_models():
+    try:
+        from scglue.models import configure_dataset, fit_SCGLUE
+    except ModuleNotFoundError:
+        vendor_path = Path(__file__).resolve().parents[2] / "vendor" / "glue"
+        if vendor_path.exists():
+            sys.path.insert(0, str(vendor_path))
+            from scglue.models import configure_dataset, fit_SCGLUE
+        else:
+            raise
+    return configure_dataset, fit_SCGLUE
+
+
+def _feature_key(name: str) -> str:
+    key = normalize_name(str(name))
+    if key.startswith("SYNTHETIC_RNA_"):
+        return key.replace("SYNTHETIC_RNA_", "SYNTHETIC_FEATURE_", 1)
+    if key.startswith("SYNTHETIC_PROTEIN_"):
+        return key.replace("SYNTHETIC_PROTEIN_", "SYNTHETIC_FEATURE_", 1)
+    return key
+
+
+def _first_present(mapping, keys):
+    for key in keys:
+        if key in mapping:
+            value = mapping[key]
+            if value is not None:
+                return value
+    return None
+
+
+def _links_from_uns(rna_adata, second_adata) -> list[tuple[str, str, float, int]]:
+    links = None
+    for uns in (rna_adata.uns, second_adata.uns):
+        for key in ("rna_protein_feature_links", "guidance_edges"):
+            if key in uns:
+                links = uns[key]
+                break
+        if links is not None:
+            break
+
+    if links is None:
+        return []
+
+    if isinstance(links, dict):
+        rna_names = _first_present(links, ("rna", "gene", "source"))
+        second_names = _first_present(links, ("second", "protein", "target"))
+        if rna_names is None or second_names is None:
+            return []
+        weights = links.get("weight", [1.0] * len(rna_names))
+        signs = links.get("sign", [1] * len(rna_names))
+        return [
+            (str(gene), str(feat), float(weight), int(sign))
+            for gene, feat, weight, sign in zip(rna_names, second_names, weights, signs)
+        ]
+
+    parsed = []
+    for row in links:
+        if isinstance(row, dict):
+            gene = _first_present(row, ("rna", "gene", "source"))
+            feat = _first_present(row, ("second", "protein", "target"))
+            if gene is None or feat is None:
+                continue
+            weight = row.get("weight", 1.0)
+            sign = row.get("sign", 1)
+        else:
+            gene, feat, *rest = row
+            weight = rest[0] if len(rest) >= 1 else 1.0
+            sign = rest[1] if len(rest) >= 2 else 1
+        parsed.append((str(gene), str(feat), float(weight), int(sign)))
+    return parsed
+
+
+def build_guidance_graph(
+    rna_adata,
+    second_adata,
+    *,
+    uniform_fallback: bool = False,
+) -> nx.Graph:
+    """
+    Build a bipartite guidance graph linking RNA genes to second-modality features.
+
+    - Self-loops on every vertex (GLUE requires them)
+    - Explicit links in .uns["rna_protein_feature_links"] or .uns["guidance_edges"]
+    - Name/synthetic-index matches when explicit links are unavailable
+    - Optional uniform fallback when no feature-level prior exists
+
+    Every var_name in both adatas must appear as a graph node; GLUE enforces this.
+    """
+    rna_features    = rna_adata.var_names.tolist()
+    second_features = second_adata.var_names.tolist()
+    rna_set         = set(rna_features)
+
+    vertices = rna_features + [f for f in second_features if f not in rna_set]
+
+    graph = nx.Graph()
+    graph.add_nodes_from(vertices)
+
+    for v in vertices:
+        graph.add_edge(v, v, weight=1.0, sign=1)
+
+    second_set = set(second_features)
+    added = 0
+    for gene, feat, weight, sign in _links_from_uns(rna_adata, second_adata):
+        if gene in rna_set and feat in second_set:
+            graph.add_edge(gene, feat, weight=weight, sign=sign)
+            added += 1
+
+    if added == 0:
+        rna_by_key = {}
+        for gene in rna_features:
+            rna_by_key.setdefault(_feature_key(gene), gene)
+        for feat in second_features:
+            gene = rna_by_key.get(_feature_key(feat))
+            if gene is not None:
+                graph.add_edge(gene, feat, weight=1.0, sign=1)
+                added += 1
+
+    if added == 0 and uniform_fallback:
+        w = 1.0 / max(len(rna_features), 1)
+        for feat in [f for f in second_features if f not in rna_set]:
+            for gene in rna_features:
+                graph.add_edge(gene, feat, weight=w, sign=1)
+                added += 1
+
+    print(
+        "[GLUE] Guidance graph: "
+        f"{len(rna_features)} RNA features, {len(second_features)} second-modality "
+        f"features, {added} cross-feature edges."
+    )
+
+    return graph
+
+
+def run_glue(context: dict, cfg: dict) -> tuple[list, np.ndarray | None]:
+    """
+    GLUE alignment: graph-guided VAE producing a shared latent space.
+
+    Both RNA and second-modality cells are embedded into the same latent_dim
+    space; aligned[0] and aligned[1] are those embeddings.
+    GLUE does not produce a coupling matrix, so coupling is None.
+
+    Returns
+    -------
+    aligned  : [rna_emb (n, latent_dim), second_emb (n, latent_dim)]
+    coupling : None
+    """
+    rna_adata    = context["rna_adata"]
+    second_adata = context["second_adata"]
+    second_label = context["second_label"]
+
+    latent_dim  = int(cfg.get("latent_dim", 50))
+    max_epochs  = int(cfg.get("max_epochs",  200))
+    lr          = float(cfg.get("lr",        2e-3))
+    lam_data    = float(cfg.get("lam_data",  1.0))
+    lam_kl      = float(cfg.get("lam_kl",   1.0))
+    lam_graph   = float(cfg.get("lam_graph", 0.02))
+    lam_align   = float(cfg.get("lam_align", 0.05))
+    uniform_fallback = bool(cfg.get("glue_uniform_fallback", False))
+    seed        = int(cfg.get("seed",        42))
+    configure_dataset, fit_SCGLUE = _import_scglue_models()
+
+    # RNA: NB on raw counts (paper default); protein: Normal on CLR-normalized adata.X
+    configure_dataset(rna_adata,    "NB",     use_highly_variable=False, use_layer="counts")
+    configure_dataset(second_adata, "Normal", use_highly_variable=False)
+
+    graph = build_guidance_graph(
+        rna_adata,
+        second_adata,
+        uniform_fallback=uniform_fallback,
+    )
+
+    adatas = {"rna": rna_adata, second_label: second_adata}
+
+    model = fit_SCGLUE(
+        adatas, graph,
+        init_kws=dict(latent_dim=latent_dim, random_seed=seed),
+        compile_kws=dict(lam_data=lam_data, lam_kl=lam_kl,
+                         lam_graph=lam_graph, lam_align=lam_align, lr=lr),
+        fit_kws=dict(max_epochs=max_epochs),
+    )
+
+    rna_emb    = model.encode_data("rna",        rna_adata)
+    second_emb = model.encode_data(second_label, second_adata)
+
+    return [rna_emb, second_emb], None

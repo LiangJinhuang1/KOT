@@ -1,0 +1,120 @@
+defaults:
+  output_root: cache/training
+  synthetic_seed: 42
+  model: kot          # fallback when `models` is not set
+  #models:
+  #  - totalvi
+  #  - kot
+  #  - moscot
+  #  - scot
+  #  - linear_ode
+  #  - glue
+  #  - uniport
+  modality_pair: rna_protein
+  rna_repr: X_pca
+  second_repr: X_pca         # protein → X_pca  |  ATAC → X_lsi (override below)
+
+  # SCOT hyperparameters
+  proj_method: barycentric   # barycentric | embedding
+  k: 110
+  eps: 5.0e-3
+  rho: 1.0
+  normalize: true
+  nits_plan: 5000
+  nits_sinkhorn: 1000
+  norm: l2
+  metric: correlation
+  mode: connectivity
+  out_dim: 30
+  lambda: 1.0
+
+  # MOSCOT hyperparameters (TranslationProblem, pure GW)
+  epsilon: 0.1               # entropic regularization
+  tau_a: 1.0                 # source marginal relaxation (1.0 = balanced)
+  tau_b: 1.0                 # target marginal relaxation
+  max_iterations: 100
+
+  # GLUE hyperparameters
+  latent_dim: 50
+  max_epochs: 200
+  lam_data: 1.0
+  lam_kl: 1.0
+  lam_graph: 0.02
+  lam_align: 0.05
+  glue_uniform_fallback: false
+
+  # uniPort hyperparameters (diagonal integration, mode='d')
+  lambda_s: 0.5
+  lambda_kl: 0.5
+  lambda_ot: 1.0
+  reg: 0.1
+  reg_m: 1.0
+  iteration: 30000
+  uniport_n_latent: 20
+  uniport_hidden_dim: 1024
+  uniport_sinkhorn_reg: 0.1
+  uniport_sinkhorn_iter: 200
+  uniport_max_coupling_entries: 25000000
+  # lr and batch_size shared with KOT defaults above
+
+  # uniPort hyperparameters
+  # lambda_s: 0.5
+  # n_latent: 10
+  # max_epochs: 200
+
+  # totalVI hyperparameters (upper bound — trained on true paired data)
+  n_latent: 20
+  totalvi_max_epochs: 400
+
+  # Linear ODE hyperparameters (our convex baseline)
+  lambda_ode: 1.0
+  sinkhorn_reg: 0.1
+  n_als_outer: 5
+  anchor_betas: []           # list of D_p degradation rates; empty = all 1.0
+
+  # KOT hyperparameters
+  lambda_dyn: 1.0
+  lambda_reg: 1.0e-4
+  n_epochs: 500
+  batch_size: 256
+  lr: 1.0e-3
+  seed: 42
+  phi_dims: [1024, 512, 256]
+  kappa_dims: [64, 32]
+  g_dims: [256, 128]
+  phi_init_gain: 0.5
+  kot_use_explicit_links: false
+
+
+# ---------------------------------------------------------------
+# Active datasets — uncomment to run
+# ---------------------------------------------------------------
+datasets:
+  synthetic:
+    modality_pair: rna_protein
+
+  # pbmc:
+  #   modality_pair: rna_protein
+
+  # bmmc_cite:
+  #   modality_pair: rna_protein
+
+  # perturb:
+  #   modality_pair: rna_protein
+
+  # --- Secondary / exploratory (not in proposal) ---
+  # bmmc_multiome:
+  #   modality_pair: rna_atac
+  #   second_repr: X_lsi
+
+  # shareseq_skin:
+  #   modality_pair: rna_atac
+  #   second_repr: X_lsi
+
+  # shareseq_brain:
+  #   modality_pair: rna_atac
+  #   second_repr: X_lsi
+
+  # shareseq_lung:
+  #   modality_pair: rna_atac
+  #   second_repr: X_lsi

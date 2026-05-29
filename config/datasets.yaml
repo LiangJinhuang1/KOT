@@ -1,0 +1,46 @@
+datasets:
+  bmmc_cite:
+    name: BMMC CITE-seq
+    rna_path: cache/velocity/bmmc_cite/bmmc_cite_scvelo_results.h5ad
+    protein_path: Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
+    protein_label: ADT
+
+  bmmc_multiome:
+    name: BMMC Multiome
+    rna_path: cache/velocity/bmmc_multiome/bmmc_multiome_scvelo_results.h5ad
+    atac_path: Datasets/BMMC/GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad
+    atac_label: ATAC
+
+  pbmc:
+    name: PBMC CITE-seq
+    rna_path: cache/velocity/pbmc/pbmc_scvelo_results.h5ad
+    protein_path: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
+    protein_label: Antibody Capture
+
+  perturb:
+    name: Perturb-CITE-seq
+    rna_path: cache/velocity/perturb/perturb_scvelo_results.h5ad
+    protein_path: Datasets/Perturb_CITE_Seq/SCP1064/documentation/Protein_expression.csv.gz
+    protein_label: Protein
+
+  synthetic:
+    # run first: python -m scr.data.synthetic
+    name: Synthetic
+    rna_path: cache/velocity/synthetic/synthetic_scvelo_results.h5ad
+    protein_path: cache/synthetic/protein.h5ad
+    protein_label: Protein
+
+  shareseq_skin:
+    name: SHARE-seq Skin
+    rna_path: cache/velocity/shareseq_skin/shareseq_skin_scvelo_results.h5ad
+    atac_path: Datasets/SHARE_seq/Raw_Files/GSM4156597_skin.late.anagen.counts.txt.gz
+
+  shareseq_brain:
+    name: SHARE-seq Brain
+    rna_path: cache/velocity/shareseq_brain/shareseq_brain_scvelo_results.h5ad
+    atac_path: Datasets/SHARE_seq/Raw_Files/GSM4156599_brain.counts.txt.gz
+
+  shareseq_lung:
+    name: SHARE-seq Lung
+    rna_path: cache/velocity/shareseq_lung/shareseq_lung_scvelo_results.h5ad
+    atac_path: Datasets/SHARE_seq/Raw_Files/GSM4156600_lung.counts.txt.gz

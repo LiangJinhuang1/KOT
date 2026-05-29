@@ -1,0 +1,67 @@
+defaults:
+  output_root: cache/velocity
+  n_top_genes: 2000
+  n_pcs: 30
+  n_neighbors: 30
+  min_shared_counts: 20
+  hvg_flavor: seurat_v3
+  velocity_mode: dynamical
+  dynamics_n_jobs: 8
+  random_state: 0
+
+datasets:
+  bmmc_cite:
+    mode: starsolo_h5ad
+    report: /data2/core-med1-telem/common/Thesis_Jin/Datasets/BMMC/bmmc_starsolo_output_report.tsv
+    original_h5ad: /data2/core-med1-telem/common/Thesis_Jin/Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
+    assay: cite
+    label: bmmc_cite
+    umap_key: GEX_X_umap
+    n_top_genes: 2000
+
+  bmmc_multiome:
+    mode: starsolo_h5ad
+    report: /data2/core-med1-telem/common/Thesis_Jin/Datasets/BMMC/bmmc_starsolo_output_report.tsv
+    original_h5ad: /data2/core-med1-telem/common/Thesis_Jin/Datasets/BMMC/GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad
+    assay: multiome
+    label: bmmc_multiome
+    umap_key: GEX_X_umap
+    n_top_genes: 2000
+
+  pbmc:
+    mode: pbmc_10x_loom
+    pbmc_counts: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
+    loom: Datasets/PBMC/pbmc_final_sorted_B4NII.loom
+    label: pbmc
+    n_top_genes: 2000
+
+  perturb:
+    # TODO: set mode once STARsolo alignment is complete for Perturb-CITE-seq.
+    # Expected inputs: spliced/unspliced loom or h5ad from STARsolo.
+    mode: h5ad
+    input_h5ad: Datasets/Perturb_CITE_Seq/SCP1064/velocity/perturb_velocity_input.h5ad
+    label: perturb
+    n_top_genes: 2000
+
+  # SHARE-seq: run velocyto on BAM files first (see velocyto_slurm.sh), then set loom paths below.
+  shareseq_skin:
+    mode: shareseq_loom
+    counts: Datasets/SHARE_seq/Raw_Files/GSM4156608_skin.late.anagen.rna.counts.txt.gz
+    loom: Datasets/SHARE_seq/velocyto/skin.late.anagen.rna.norg.loom
+    label: shareseq_skin
+    n_top_genes: 2000
+
+  shareseq_brain:
+    mode: shareseq_loom
+    counts: Datasets/SHARE_seq/Raw_Files/GSM4156610_brain.rna.counts.txt.gz
+    loom: Datasets/SHARE_seq/velocyto/brain.rna.norg.loom
+    label: shareseq_brain
+    n_top_genes: 2000
+
+  shareseq_lung:
+    mode: shareseq_loom
+    counts: Datasets/SHARE_seq/Raw_Files/GSM4156611_lung.rna.counts.txt.gz
+    loom: Datasets/SHARE_seq/velocyto/lung.rna.norg.loom
+    label: shareseq_lung
+    n_top_genes: 0
+    min_shared_counts: 1

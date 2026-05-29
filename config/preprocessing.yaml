@@ -1,0 +1,59 @@
+defaults:
+  rna:
+    min_cells: 3
+    n_top_genes: 2000
+    n_pcs: 30
+    n_neighbors: 30
+  protein:
+    min_cells: 1
+    n_pcs: 10
+  atac:
+    min_cells: 3
+    n_components: 30
+    n_neighbors: 30
+
+# Stage 2 inputs: all rna_path values point to Stage 1 outputs (cache/velocity/).
+# protein/atac sources are dataset-specific — see notes per dataset.
+
+datasets:
+  bmmc_cite:
+    rna_path: cache/velocity/bmmc_cite/bmmc_cite_scvelo_results.h5ad
+    # protein comes from the original h5ad (not included in velocity output)
+    protein_path: Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
+    protein_label: ADT
+
+  bmmc_multiome:
+    rna_path: cache/velocity/bmmc_multiome/bmmc_multiome_scvelo_results.h5ad
+    # ATAC comes from the original h5ad (not included in velocity output)
+    atac_path: Datasets/BMMC/GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad
+    atac_label: ATAC
+
+  pbmc:
+    rna_path: cache/velocity/pbmc/pbmc_scvelo_results.h5ad
+    # protein loaded from the original 10x h5 file — velocity output is RNA-only
+    protein_path: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
+    protein_label: Antibody Capture
+
+  perturb:
+    rna_path: cache/velocity/perturb/perturb_scvelo_results.h5ad
+    # protein CSV loaded separately
+    protein_path: Datasets/Perturb_CITE_Seq/SCP1064/documentation/Protein_expression.csv.gz
+    protein_label: Protein
+
+  synthetic:
+    # run: python -m scr.data.synthetic  (generates both files below)
+    rna_path: cache/velocity/synthetic/synthetic_scvelo_results.h5ad
+    protein_path: cache/synthetic/protein.h5ad
+    protein_label: Protein
+
+  shareseq_skin:
+    rna_path: cache/velocity/shareseq_skin/shareseq_skin_scvelo_results.h5ad
+    atac_path: Datasets/SHARE_seq/Raw_Files/GSM4156597_skin.late.anagen.counts.txt.gz
+
+  shareseq_brain:
+    rna_path: cache/velocity/shareseq_brain/shareseq_brain_scvelo_results.h5ad
+    atac_path: Datasets/SHARE_seq/Raw_Files/GSM4156599_brain.counts.txt.gz
+
+  shareseq_lung:
+    rna_path: cache/velocity/shareseq_lung/shareseq_lung_scvelo_results.h5ad
+    atac_path: Datasets/SHARE_seq/Raw_Files/GSM4156600_lung.counts.txt.gz

@@ -1,0 +1,46 @@
+# --- 仅本地，不上传 GitHub ---
+Litterature/
+vendor/
+cache/
+logs/
+Datasets/
+/data/
+
+# 文档与脚本（本地 / HPC）
+*.md
+*.sh
+*.qmd
+*.ipynb
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+.ipynb_checkpoints/
+
+# --- 数据与模型输出 ---
+*.h5ad
+*.h5
+*.h5mu
+*.loom
+*.bam
+*.bai
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# --- 编辑器 / 系统 ---
+.DS_Store
+.idea/
+.vscode/
+.cursor/
+.claude/
+
+# --- 集群工具（仅 HPC）---
+STAR
+samtools*/
+references/
