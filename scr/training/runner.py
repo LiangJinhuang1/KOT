@@ -28,14 +28,21 @@ TRAINING_CONFIG = Path("config/training.yaml")
 #   second_adata — full second modality AnnData
 #   second_label — "protein" or "atac"
 MODELS = {
-    "scot":       run_scot,
-    "moscot":     run_moscot,
-    "glue":       run_glue,
-    "uniport":    run_uniport,
-    "totalvi":    run_totalvi,
-    "linear_ode": run_linear_ode,
-    "kot":        run_kot,
-    "kot_nodyn":  run_kot,   # same function; lambda_dyn=0 is set in config
+    "scot":        run_scot,
+    "moscot":      run_moscot,
+    "glue":        run_glue,
+    "uniport":     run_uniport,
+    "totalvi":     run_totalvi,
+    "linear_ode":  run_linear_ode,
+    "kot":         run_kot,
+    "kot_nodyn":   run_kot,
+    "kot_anchor":  run_kot,
+}
+
+# Per-model config overrides injected automatically at runtime
+MODEL_OVERRIDES = {
+    "kot_nodyn":  {"lambda_dyn": 0.0},
+    "kot_anchor": {"use_anchor": True},
 }
 
 
@@ -167,7 +174,7 @@ def run_training(config_path: Path = TRAINING_CONFIG) -> None:
             continue
         base_cfg = {**defaults, **(overrides or {})}
         for model_name in model_names_from_cfg(base_cfg):
-            run_cfg = {**base_cfg, "model": model_name}
+            run_cfg = {**base_cfg, "model": model_name, **MODEL_OVERRIDES.get(model_name, {})}
             run_one(name, datasets[name], run_cfg)
             if model_name not in trained_models:
                 trained_models.append(model_name)

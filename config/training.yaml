@@ -83,7 +83,14 @@ defaults:
   kappa_dims: [64, 32]
   g_dims: [256, 128]
   phi_init_gain: 0.5
-  kot_use_explicit_links: false
+  kot_use_feature_space: true # KOT paper objective: RNA/protein feature coordinates, not PCA
+  kot_rna_layer: null         # null/"X" = preprocessed RNA expression
+  kot_protein_layer: null     # null/"X" = preprocessed protein expression
+  kot_use_explicit_links: true  # paper S matrix: target-protein genes when links are available
+  kot_anchor_beta: 0.5          # scalar β* fallback if kot_anchor_indices is set and kot_anchor_betas is empty
+  kot_anchor_indices: []        # anchor set H; empty means skip anchor prior
+  kot_anchor_betas: []          # optional β*_h values matching kot_anchor_indices
+  lambda_prior: 1.0            # weight of anchor prior Σ(β_h − β*)²
 
 
 # ---------------------------------------------------------------
@@ -92,6 +99,8 @@ defaults:
 datasets:
   synthetic:
     modality_pair: rna_protein
+    models:
+      - kot
 
   # pbmc:
   #   modality_pair: rna_protein

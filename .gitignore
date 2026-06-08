@@ -1,5 +1,6 @@
 # --- 仅本地，不上传 GitHub ---
 Litterature/
+KOT_paperwork/
 vendor/
 cache/
 logs/

@@ -8,7 +8,8 @@ gene i encodes protein j.  Used in the KOT ODE constraint:
 
 For CITE-seq datasets gene names match protein panel names after stripping
 common suffixes (.1, -TotalSeqB, etc.).  For cases where no match is found
-the row is left as all-zeros (protein has no measured mRNA transcript).
+the implementation falls back to a uniform projection so the kinetic term
+still receives a stable input.
 """
 from __future__ import annotations
 

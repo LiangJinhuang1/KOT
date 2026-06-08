@@ -6,10 +6,7 @@ ODE:  dφ/dt = κ(r) · (α(r) ⊙ S·r − β ⊙ φ(r))
 The JVP J_φ(r)·v gives dφ/dt for free in a single forward pass.
 """
 import torch
-try:
-    from torch.func import jvp as torch_jvp
-except ImportError:
-    from functorch import jvp as torch_jvp
+from torch.func import jvp as torch_jvp
 
 
 def kinetics_loss(
