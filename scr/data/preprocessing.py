@@ -10,6 +10,7 @@ from scr.data.transforms import (
     qc_protein,
     qc_atac,
     normalize_rna,
+    add_log_velocity_layers,
     normalize_protein,
     normalize_atac,
     reduce_rna,
@@ -37,9 +38,9 @@ def add_umap_from_csv(adata, umap_path, key="X_umap"):
             adata.obsm[key] = coord_df.to_numpy(dtype="float32")
             print(f"Stored UMAP in adata.obsm['{key}']; missing cells: {missing_count}")
         else:
-            print("UMAP coordinates were not aligned to cell names.")
+            raise ValueError("UMAP coordinates were not aligned to cell names.")
     else:
-        print("UMAP coordinate columns were not found.")
+        raise ValueError("UMAP coordinate columns were not found.")
 
 
 # --- loaders ---
@@ -48,7 +49,10 @@ def load_rna_from_h5ad(path, raw_layer=None):
     print(f"Loading RNA from: {path}")
     adata = sc.read_h5ad(path)
     adata.var_names_make_unique()
-    if raw_layer and raw_layer in adata.layers:
+    if raw_layer:
+        if raw_layer not in adata.layers:
+            available = list(adata.layers.keys())
+            raise ValueError(f"RNA raw_layer '{raw_layer}' not found. Available layers: {available}")
         adata.X = adata.layers[raw_layer].copy()
         print(f"Using layer '{raw_layer}' as X for normalization.")
     if "feature_types" in adata.var.columns:
@@ -128,10 +132,20 @@ def align_common_obs(rna_adata, protein_adata, atac_adata):
 
 # --- per-modality preprocessing orchestrators ---
 
-def preprocess_rna(adata, min_cells=3, n_top_genes=2000, n_pcs=30, n_neighbors=30):
+def preprocess_rna(
+    adata,
+    min_cells=3,
+    n_top_genes=2000,
+    n_pcs=30,
+    n_neighbors=30,
+    add_log_velocity_layer=False,
+    log_velocity_scale=1.0,
+):
     print(f"Preprocessing RNA: {adata.shape}")
     qc_rna(adata, min_cells=min_cells)
     normalize_rna(adata, n_top_genes=n_top_genes)
+    if add_log_velocity_layer:
+        add_log_velocity_layers(adata, velocity_scale=log_velocity_scale)
     reduce_rna(adata, n_pcs=n_pcs, n_neighbors=n_neighbors)
     print(f"RNA after preprocessing: {adata.shape}")
     return adata
@@ -168,10 +182,13 @@ def load_and_preprocess_cached(
     rna_umap_path=None,
     cache_dir="cache/preprocessed",
     force_recompute=False,
+    cache_version=None,
     rna_min_cells=3,
     rna_n_top_genes=2000,
     rna_n_pcs=30,
     rna_n_neighbors=30,
+    add_log_velocity_layer=False,
+    log_velocity_scale=1.0,
     protein_min_cells=1,
     protein_n_pcs=10,
     atac_min_cells=3,
@@ -179,10 +196,17 @@ def load_and_preprocess_cached(
     atac_n_neighbors=30,
 ):
     key_parts = os.path.abspath(rna_path)
+    if rna_raw_layer:
+        key_parts += f"|rna_raw_layer={rna_raw_layer}"
     if protein_path:
-        key_parts += f"|{os.path.abspath(protein_path)}"
+        key_parts += f"|{os.path.abspath(protein_path)}|protein_label={protein_label}"
+    if protein_obsm_key:
+        key_parts += f"|protein_obsm_key={protein_obsm_key}"
     if atac_path:
-        key_parts += f"|{os.path.abspath(atac_path)}"
+        key_parts += f"|{os.path.abspath(atac_path)}|atac_label={atac_label}"
+    if cache_version:
+        key_parts += f"|cache_version={cache_version}"
+    key_parts += f"|log_velocity={bool(add_log_velocity_layer)}:{float(log_velocity_scale)}"
     cache_key = hashlib.md5(key_parts.encode("utf-8")).hexdigest()[:12]
     base_name = os.path.splitext(os.path.basename(rna_path))[0]
     safe_base = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in base_name)
@@ -199,9 +223,12 @@ def load_and_preprocess_cached(
         rna_adata = sc.read_h5ad(rna_cache)
         protein_adata = sc.read_h5ad(protein_cache) if os.path.exists(protein_cache) else None
         atac_adata = sc.read_h5ad(atac_cache) if os.path.exists(atac_cache) else None
-        if rna_umap_path and os.path.exists(rna_umap_path) and "X_umap" not in rna_adata.obsm:
-            add_umap_from_csv(rna_adata, rna_umap_path)
-            rna_adata.write_h5ad(rna_cache)
+        if rna_umap_path:
+            if not os.path.exists(rna_umap_path):
+                raise FileNotFoundError(f"RNA UMAP path not found: {rna_umap_path}")
+            if "X_umap" not in rna_adata.obsm:
+                add_umap_from_csv(rna_adata, rna_umap_path)
+                rna_adata.write_h5ad(rna_cache)
         return rna_adata, protein_adata, atac_adata
 
     rna_adata = load_rna_from_h5ad(rna_path, raw_layer=rna_raw_layer)
@@ -212,6 +239,8 @@ def load_and_preprocess_cached(
             protein_adata = load_protein_from_10x_h5(protein_path, protein_label)
         else:
             protein_adata = load_protein_from_h5ad(protein_path, protein_label)
+    elif protein_obsm_key:
+        protein_adata = load_protein_from_obsm(rna_adata, protein_obsm_key)
     else:
         protein_adata = None
 
@@ -225,7 +254,9 @@ def load_and_preprocess_cached(
 
     rna_adata, protein_adata, atac_adata = align_common_obs(rna_adata, protein_adata, atac_adata)
 
-    if rna_umap_path and os.path.exists(rna_umap_path):
+    if rna_umap_path:
+        if not os.path.exists(rna_umap_path):
+            raise FileNotFoundError(f"RNA UMAP path not found: {rna_umap_path}")
         add_umap_from_csv(rna_adata, rna_umap_path)
 
     rna_adata = preprocess_rna(
@@ -234,6 +265,8 @@ def load_and_preprocess_cached(
         n_top_genes=rna_n_top_genes,
         n_pcs=rna_n_pcs,
         n_neighbors=rna_n_neighbors,
+        add_log_velocity_layer=add_log_velocity_layer,
+        log_velocity_scale=log_velocity_scale,
     )
     if protein_adata is not None:
         protein_adata = preprocess_protein(

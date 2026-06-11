@@ -7,7 +7,7 @@ Three learnable maps:
   g_omega    : R^D_r → R^D_p   RNA → translation efficiency α > 0  (Softplus)
 
 β (degradation rates) is a learnable parameter, kept positive via Softplus.
-All networks use Xavier normal init with gain=0.1 for stable JVP computation.
+All networks use configurable weight initialization and hidden activations.
 """
 from __future__ import annotations
 
@@ -15,26 +15,73 @@ import torch
 import torch.nn as nn
 
 
-def build_mlp(in_dim: int, out_dim: int, hidden_dims: list[int], init_gain: float = 1.0) -> nn.Sequential:
-    """Build a GELU MLP with Xavier normal initialisation."""
+def activation_module(name: str) -> nn.Module:
+    name = name.lower()
+    if name == "gelu":
+        return nn.GELU()
+    if name == "silu":
+        return nn.SiLU()
+    if name == "tanh":
+        return nn.Tanh()
+    if name == "softplus":
+        return nn.Softplus()
+    if name == "relu":
+        return nn.ReLU()
+    raise ValueError(f"Unknown KOT activation '{name}'. Use gelu, silu, tanh, softplus, or relu.")
+
+
+def build_mlp(
+    in_dim: int,
+    out_dim: int,
+    hidden_dims: list[int],
+    init_gain: float = 1.0,
+    activation: str = "gelu",
+    init_method: str = "orthogonal",
+    use_spectral_norm: bool = False,
+) -> nn.Sequential:
+    """Build an MLP with configurable weight initialization."""
     dims = [in_dim] + list(hidden_dims) + [out_dim]
     layers: list[nn.Module] = []
     for i in range(len(dims) - 1):
         lin = nn.Linear(dims[i], dims[i + 1])
-        nn.init.xavier_normal_(lin.weight, gain=init_gain)
+        if init_method == "orthogonal":
+            nn.init.orthogonal_(lin.weight, gain=init_gain)
+        elif init_method == "xavier":
+            nn.init.xavier_normal_(lin.weight, gain=init_gain)
+        else:
+            raise ValueError("KOT init_method must be 'orthogonal' or 'xavier'.")
         nn.init.zeros_(lin.bias)
+        if use_spectral_norm:
+            lin = nn.utils.spectral_norm(lin)
         layers.append(lin)
         if i < len(dims) - 2:
-            layers.append(nn.GELU())
+            layers.append(activation_module(activation))
     return nn.Sequential(*layers)
 
 
 class PhiTheta(nn.Module):
     """RNA → protein mapping."""
 
-    def __init__(self, d_rna: int, d_protein: int, hidden_dims: list[int], init_gain: float = 0.1):
+    def __init__(
+        self,
+        d_rna: int,
+        d_protein: int,
+        hidden_dims: list[int],
+        init_gain: float = 0.1,
+        activation: str = "gelu",
+        init_method: str = "orthogonal",
+        use_spectral_norm: bool = False,
+    ):
         super().__init__()
-        self.net = build_mlp(d_rna, d_protein, hidden_dims, init_gain=init_gain)
+        self.net = build_mlp(
+            d_rna,
+            d_protein,
+            hidden_dims,
+            init_gain=init_gain,
+            activation=activation,
+            init_method=init_method,
+            use_spectral_norm=use_spectral_norm,
+        )
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
         return self.net(r)
@@ -43,9 +90,22 @@ class PhiTheta(nn.Module):
 class KappaPsi(nn.Module):
     """RNA → scalar kinetic time-scale κ > 0."""
 
-    def __init__(self, d_rna: int, hidden_dims: list[int]):
+    def __init__(
+        self,
+        d_rna: int,
+        hidden_dims: list[int],
+        activation: str = "gelu",
+        init_method: str = "orthogonal",
+    ):
         super().__init__()
-        self.net = build_mlp(d_rna, 1, hidden_dims, init_gain=0.1)
+        self.net = build_mlp(
+            d_rna,
+            1,
+            hidden_dims,
+            init_gain=0.1,
+            activation=activation,
+            init_method=init_method,
+        )
         self.softplus = nn.Softplus()
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
@@ -55,9 +115,23 @@ class KappaPsi(nn.Module):
 class GOmega(nn.Module):
     """RNA → per-protein translation efficiency α > 0."""
 
-    def __init__(self, d_rna: int, d_protein: int, hidden_dims: list[int]):
+    def __init__(
+        self,
+        d_rna: int,
+        d_protein: int,
+        hidden_dims: list[int],
+        activation: str = "gelu",
+        init_method: str = "orthogonal",
+    ):
         super().__init__()
-        self.net = build_mlp(d_rna, d_protein, hidden_dims, init_gain=0.1)
+        self.net = build_mlp(
+            d_rna,
+            d_protein,
+            hidden_dims,
+            init_gain=0.1,
+            activation=activation,
+            init_method=init_method,
+        )
         self.softplus = nn.Softplus()
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
@@ -85,11 +159,33 @@ class KOTModel(nn.Module):
         kappa_dims: list[int] = (64, 32),
         g_dims: list[int] = (256, 128),
         phi_init_gain: float = 0.1,
+        activation: str = "gelu",
+        init_method: str = "orthogonal",
+        phi_spectral_norm: bool = False,
     ):
         super().__init__()
-        self.phi   = PhiTheta(d_rna, d_protein, list(phi_dims), init_gain=phi_init_gain)
-        self.kappa = KappaPsi(d_rna, list(kappa_dims))
-        self.g     = GOmega(d_rna, d_protein, list(g_dims))
+        self.phi   = PhiTheta(
+            d_rna,
+            d_protein,
+            list(phi_dims),
+            init_gain=phi_init_gain,
+            activation=activation,
+            init_method=init_method,
+            use_spectral_norm=phi_spectral_norm,
+        )
+        self.kappa = KappaPsi(
+            d_rna,
+            list(kappa_dims),
+            activation=activation,
+            init_method=init_method,
+        )
+        self.g     = GOmega(
+            d_rna,
+            d_protein,
+            list(g_dims),
+            activation=activation,
+            init_method=init_method,
+        )
 
         self.beta_raw  = nn.Parameter(torch.rand(d_protein) * 0.1)
         self.softplus  = nn.Softplus()

@@ -38,35 +38,6 @@ def matrix_from_adata(adata, layer_key: str | None, label: str) -> np.ndarray:
     return dense_array(adata.layers[layer_key])
 
 
-def report_branch_mixing(aligned_rna: np.ndarray, protein: np.ndarray, obs) -> None:
-    """Diagnostic only: report whether mapped RNA branches match protein branch centroids."""
-    if obs is None or "state" not in obs.columns:
-        return
-    states = np.asarray(obs["state"].values)
-    branch_names = [name for name in ("Branch_A", "Branch_B") if np.any(states == name)]
-    if len(branch_names) < 2:
-        return
-
-    centroids = np.vstack([protein[states == name].mean(axis=0) for name in branch_names])
-    counts = np.zeros((len(branch_names), len(branch_names)), dtype=int)
-    for i, true_state in enumerate(branch_names):
-        idx = np.where(states == true_state)[0]
-        if idx.size == 0:
-            continue
-        dists = ((aligned_rna[idx, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
-        nearest = dists.argmin(axis=1)
-        counts[i] = np.bincount(nearest, minlength=len(branch_names))
-
-    total = counts.sum()
-    correct = int(np.trace(counts))
-    accuracy = correct / total if total else float("nan")
-    print("[kot] Branch centroid diagnostic (rows=true RNA branch, cols=nearest protein branch):")
-    print("[kot] " + " ".join(f"{name:>10s}" for name in branch_names))
-    for name, row in zip(branch_names, counts):
-        print("[kot] " + f"{name:>10s} " + " ".join(f"{value:10d}" for value in row))
-    print(f"[kot] Branch centroid accuracy: {accuracy:.3f}")
-
-
 def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataFrame]:
     """
     Full KOT training + alignment.
@@ -85,6 +56,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     second_adata = context["second_adata"]   # protein AnnData
 
     # Hyperparameters
+    model_name   = str(cfg.get("model",       "kot"))
     n_epochs     = int(cfg.get("n_epochs",     500))
     batch_size   = int(cfg.get("batch_size",   256))
     lr           = float(cfg.get("lr",         1e-3))
@@ -96,15 +68,21 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     kappa_dims   = list(cfg.get("kappa_dims",  [64, 32]))
     g_dims       = list(cfg.get("g_dims",      [256, 128]))
     phi_init_gain = float(cfg.get("phi_init_gain", 0.1))
+    activation = str(cfg.get("kot_activation", "gelu"))
+    init_method = str(cfg.get("kot_init", "orthogonal"))
     use_explicit_links = bool(cfg.get("kot_use_explicit_links", True))
     use_anchor   = bool(cfg.get("use_anchor",        False))
     anchor_beta  = float(cfg.get("kot_anchor_beta",  0.5))
     anchor_indices = list(cfg.get("kot_anchor_indices", []))
     anchor_betas = list(cfg.get("kot_anchor_betas", []))
     lambda_prior = float(cfg.get("lambda_prior",     1.0))
+    phi_spectral_norm = bool(cfg.get("phi_spectral_norm", False))
+    dyn_warmup_epochs       = int(cfg.get("dyn_warmup_epochs",       n_epochs // 2))
+    early_stopping_patience = int(cfg.get("early_stopping_patience", 100))
     use_feature_space = bool(cfg.get("kot_use_feature_space", False))
     rna_layer = cfg.get("kot_rna_layer")
     protein_layer = cfg.get("kot_protein_layer")
+    velocity_layer = cfg.get("kot_velocity_layer") or cfg.get("velocity_layer")
 
     if use_feature_space:
         x = matrix_from_adata(rna_adata, rna_layer, "RNA")
@@ -133,42 +111,38 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             protein_PCs = np.array(second_adata.varm["PCs"])  # (n_proteins, D_p)
             S_model = protein_PCs.T @ S_model                 # (D_p, D_r)
         else:
-            S_model = np.zeros((D_p, D_r), dtype=np.float32)
-            print("[kot] Warning: no protein PCA components — S matrix is zero.")
+            raise ValueError("KOT representation mode requires protein PCA components in .varm['PCs'].")
     else:
-        S_model = S_np.copy()
-        print("[kot] Warning: no RNA PCA components — S matrix in gene space.")
+        raise ValueError("KOT representation mode requires RNA PCA components in .varm['PCs'].")
 
-    # RNA velocity in PCA space: real data → "velocity" (scVelo), synthetic → "true_velocity"
+    # RNA velocity in the same coordinate system as the KOT RNA input.
     V_raw = None
-    for key in ["true_velocity", "velocity"]:
+    velocity_candidates = [velocity_layer] if velocity_layer else ["true_velocity", "velocity"]
+    for key in velocity_candidates:
         if key in rna_adata.layers:
             V_raw = np.nan_to_num(dense_array(rna_adata.layers[key]), nan=0.0)
             print(f"[kot] Using velocity layer: '{key}'")
             break
-    if V_raw is not None:
-        if V_raw.shape[1] == D_r:
-            V = V_raw.astype(np.float32)
-        elif not use_feature_space and "PCs" in rna_adata.varm:
-            V = V_raw @ np.array(rna_adata.varm["PCs"])
-        else:
-            V = np.zeros_like(x)
-            print(
-                f"[kot] Warning: velocity shape {V_raw.shape} is incompatible "
-                f"with KOT input shape {x.shape}; kinetics loss will be zero."
-            )
-            lambda_dyn = 0.0
-        if lambda_dyn == 0.0:
-            conf = np.zeros(n, dtype=np.float32)
-        elif "velocity_confidence" in rna_adata.obs.columns:
-            conf = np.array(rna_adata.obs["velocity_confidence"].values, dtype=np.float32)
-        else:
-            conf = np.ones(n, dtype=np.float32)
+    if velocity_layer and V_raw is None:
+        available = list(rna_adata.layers.keys())
+        raise ValueError(f"KOT velocity layer '{velocity_layer}' not found. Available layers: {available}")
+    if V_raw is None:
+        available = list(rna_adata.layers.keys())
+        raise ValueError(f"KOT requires a velocity layer. Available layers: {available}")
+
+    if V_raw.shape[1] == D_r:
+        V = V_raw.astype(np.float32)
+    elif not use_feature_space and "PCs" in rna_adata.varm:
+        V = V_raw @ np.array(rna_adata.varm["PCs"])
     else:
-        print("[kot] Warning: no velocity layer — kinetics loss is zero.")
-        V = np.zeros_like(x)
-        conf = np.zeros(n, dtype=np.float32)
-        lambda_dyn = 0.0
+        raise ValueError(
+            f"KOT velocity shape {V_raw.shape} is incompatible with KOT input shape {x.shape}."
+        )
+
+    if "velocity_confidence" in rna_adata.obs.columns:
+        conf = np.array(rna_adata.obs["velocity_confidence"].values, dtype=np.float32)
+    else:
+        conf = np.ones(n, dtype=np.float32)
 
     # Move to device
     R_t    = to_tensor(x,     device)   # (n, D_r)
@@ -185,7 +159,12 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         kappa_dims=kappa_dims,
         g_dims=g_dims,
         phi_init_gain=phi_init_gain,
+        activation=activation,
+        init_method=init_method,
+        phi_spectral_norm=phi_spectral_norm,
     ).to(device)
+
+    initial_beta = model.beta.detach().cpu().numpy().copy()
 
     network_params = (
         list(model.phi.parameters())
@@ -193,6 +172,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         + list(model.g.parameters())
     )
     optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=n_epochs)
     loader = DataLoader(
         TensorDataset(R_t, V_t, conf_t, torch.arange(n, device=device)),
         batch_size=batch_size, shuffle=True,
@@ -203,21 +183,34 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     anchor_idx_t = None
     anchor_target = None
     if use_anchor:
-        if anchor_indices:
-            anchor_idx_t = torch.tensor(anchor_indices, dtype=torch.long, device=device)
-            if anchor_betas:
-                if len(anchor_betas) != len(anchor_indices):
-                    raise ValueError(
-                        "kot_anchor_betas must have the same length as kot_anchor_indices."
-                    )
-                anchor_target = torch.tensor(anchor_betas, dtype=torch.float32, device=device)
-            else:
-                anchor_target = torch.full((anchor_idx_t.numel(),), anchor_beta, device=device)
-            print(f"[kot] Anchor prior enabled for {anchor_idx_t.numel()} proteins.")
+        if not anchor_indices:
+            raise ValueError("use_anchor=true requires at least one kot_anchor_indices entry.")
+        anchor_idx_t = torch.tensor(anchor_indices, dtype=torch.long, device=device)
+        if anchor_betas:
+            if len(anchor_betas) != len(anchor_indices):
+                raise ValueError(
+                    "kot_anchor_betas must have the same length as kot_anchor_indices."
+                )
+            anchor_target = torch.tensor(anchor_betas, dtype=torch.float32, device=device)
         else:
-            print("[kot] Anchor prior requested but kot_anchor_indices is empty; skipping anchor term.")
+            anchor_target = torch.full((anchor_idx_t.numel(),), anchor_beta, device=device)
+        print(f"[kot] Anchor prior enabled for {anchor_idx_t.numel()} proteins.")
+
+    print("model:", model_name)
+    print("use_anchor:", use_anchor)
+    print("anchor_indices:", anchor_indices)
+    print("anchor_target:", anchor_target.cpu().numpy() if anchor_target is not None else None)
+    print("lambda_prior:", lambda_prior)
+    print("initial beta:", initial_beta)
+    print(f"[kot] dyn_warmup_epochs={dyn_warmup_epochs} | early_stopping_patience={early_stopping_patience}")
 
     loss_history = {"epoch": [], "align": [], "dyn": [], "anchor": [], "reg": [], "total": []}
+
+    best_align = float("inf")
+    best_epoch = 0
+    best_state = None
+    epochs_since_improvement = 0
+    stop_epoch = n_epochs
 
     for epoch in range(1, n_epochs + 1):
         model.train()
@@ -241,12 +234,17 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             else torch.tensor(0.0, device=device)
         )
         loss_reg = lambda_reg * sum(param.pow(2).sum() for param in network_params)
-        loss = loss_align + lambda_dyn * loss_dyn_total + loss_anchor + loss_reg
+        if dyn_warmup_epochs > 0:
+            effective_lambda_dyn = lambda_dyn * min(1.0, (epoch - 1) / dyn_warmup_epochs)
+        else:
+            effective_lambda_dyn = lambda_dyn
+        loss = loss_align + effective_lambda_dyn * loss_dyn_total + loss_anchor + loss_reg
 
         optimiser.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimiser.step()
+        scheduler.step()
 
         loss_history["epoch"].append(epoch)
         loss_history["align"].append(loss_align.item())
@@ -257,14 +255,43 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
         if epoch % 50 == 0 or epoch == 1:
             print(f"  epoch {epoch:4d}  align={loss_align.item():.6f}  "
-                  f"dyn={loss_dyn_total.item():.6f}  total={loss.item():.6f}")
+                  f"dyn={loss_dyn_total.item():.6f}  λ_dyn={effective_lambda_dyn:.3f}  "
+                  f"lr={optimiser.param_groups[0]['lr']:.2e}  total={loss.item():.6f}")
+
+        # Early stopping: only monitor after warmup completes (kinetics term active at full weight).
+        if epoch > dyn_warmup_epochs:
+            current_align = loss_align.item()
+            if current_align < best_align:
+                best_align = current_align
+                best_epoch = epoch
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+                if epochs_since_improvement >= early_stopping_patience:
+                    stop_epoch = epoch
+                    print(f"[kot] Early stopping at epoch {epoch}: "
+                          f"best align={best_align:.6f} at epoch {best_epoch}")
+                    break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"[kot] Restored best state from epoch {best_epoch} (align={best_align:.6f})")
 
     # Final aligned representations
     model.eval()
     with torch.no_grad():
         phi_final = model.phi(R_t).cpu().numpy()        # (n, D_p)
         p_np = y                                         # (n, D_p) observed
+        loss_anchor_final = (
+            lambda_prior * (model.beta[anchor_idx_t] - anchor_target).pow(2).sum()
+            if anchor_target is not None
+            else torch.tensor(0.0, device=device)
+        )
+
+    print("anchor_loss:", loss_anchor_final.item())
+    print("final beta:", model.beta.detach().cpu().numpy())
+    print(f"[kot] stopped at epoch {stop_epoch} / {n_epochs}")
 
     aligned = [phi_final, p_np]
-    report_branch_mixing(phi_final, p_np, rna_adata.obs)
     return aligned, None, pd.DataFrame(loss_history)

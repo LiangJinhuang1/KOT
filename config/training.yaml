@@ -1,15 +1,11 @@
 defaults:
   output_root: cache/training
   synthetic_seed: 42
+  preprocessing_cache_version: default
+  force_preprocess: false
+  add_log_velocity_layer: false
+  log_velocity_scale: 1.0
   model: kot          # fallback when `models` is not set
-  #models:
-  #  - totalvi
-  #  - kot
-  #  - moscot
-  #  - scot
-  #  - linear_ode
-  #  - glue
-  #  - uniport
   modality_pair: rna_protein
   rna_repr: X_pca
   second_repr: X_pca         # protein → X_pca  |  ATAC → X_lsi (override below)
@@ -57,11 +53,6 @@ defaults:
   uniport_max_coupling_entries: 25000000
   # lr and batch_size shared with KOT defaults above
 
-  # uniPort hyperparameters
-  # lambda_s: 0.5
-  # n_latent: 10
-  # max_epochs: 200
-
   # totalVI hyperparameters (upper bound — trained on true paired data)
   n_latent: 20
   totalvi_max_epochs: 400
@@ -71,9 +62,10 @@ defaults:
   sinkhorn_reg: 0.1
   n_als_outer: 5
   anchor_betas: []           # list of D_p degradation rates; empty = all 1.0
+  velocity_layer: null        # optional shared velocity layer for KOT and Linear ODE
 
   # KOT hyperparameters
-  lambda_dyn: 1.0
+  lambda_dyn: 1
   lambda_reg: 1.0e-4
   n_epochs: 500
   batch_size: 256
@@ -83,13 +75,19 @@ defaults:
   kappa_dims: [64, 32]
   g_dims: [256, 128]
   phi_init_gain: 0.5
+  phi_spectral_norm: false
+  dyn_warmup_epochs: 250           # half of n_epochs: pure Sinkhorn → joint
+  early_stopping_patience: 100     # stop if align loss has not improved for N epochs post-warmup
+  kot_init: xavier
+  kot_activation: silu
   kot_use_feature_space: true # KOT paper objective: RNA/protein feature coordinates, not PCA
   kot_rna_layer: null         # null/"X" = preprocessed RNA expression
   kot_protein_layer: null     # null/"X" = preprocessed protein expression
   kot_use_explicit_links: true  # paper S matrix: target-protein genes when links are available
   kot_anchor_beta: 0.5          # scalar β* fallback if kot_anchor_indices is set and kot_anchor_betas is empty
-  kot_anchor_indices: []        # anchor set H; empty means skip anchor prior
-  kot_anchor_betas: []          # optional β*_h values matching kot_anchor_indices
+  use_anchor: true              # β-anchor control experiment: pin β to its true value (GAMMA_P=0.5)
+  kot_anchor_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]   # anchor set H = all 10 proteins
+  kot_anchor_betas:   [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # true degradation rate
   lambda_prior: 1.0            # weight of anchor prior Σ(β_h − β*)²
 
 
@@ -99,8 +97,20 @@ defaults:
 datasets:
   synthetic:
     modality_pair: rna_protein
+    preprocessing_cache_version: synthetic_log_velocity_v1
+    add_log_velocity_layer: true
+    log_velocity_scale: 80.0  # synthetic true_velocity is in mean units; counts use RNA_COUNT_SCALE=80
+    velocity_layer: true_velocity_log
+    seeds: [42, 123, 2026, 6, 9]
+    seeded_models: [kot]
     models:
+      #- totalvi
       - kot
+      #- moscot
+      #- scot
+      #- linear_ode
+      #- glue
+      #- uniport
 
   # pbmc:
   #   modality_pair: rna_protein

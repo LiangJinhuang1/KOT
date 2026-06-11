@@ -10,28 +10,21 @@ import numpy as np
 if not hasattr(np, "Inf"):
     np.Inf = np.inf
 
+VENDOR_UNIPORT_PATH = Path(__file__).resolve().parents[2] / "vendor" / "uniport"
+if VENDOR_UNIPORT_PATH.exists():
+    sys.path.insert(0, str(VENDOR_UNIPORT_PATH))
 
-def _import_uniport():
-    try:
-        import uniport as up
-    except ModuleNotFoundError:
-        vendor_path = Path(__file__).resolve().parents[2] / "vendor" / "uniport"
-        if vendor_path.exists():
-            sys.path.insert(0, str(vendor_path))
-            import uniport as up
-        else:
-            raise
-    return up
+import uniport as up
 
 
-def _dense_float32(matrix) -> np.ndarray:
+def dense_float32(matrix) -> np.ndarray:
     if hasattr(matrix, "toarray"):
         matrix = matrix.toarray()
     return np.asarray(matrix, dtype=np.float32)
 
 
-def _minmax01(matrix) -> np.ndarray:
-    values = _dense_float32(matrix)
+def minmax01(matrix) -> np.ndarray:
+    values = dense_float32(matrix)
     mins = np.nanmin(values, axis=0, keepdims=True)
     maxs = np.nanmax(values, axis=0, keepdims=True)
     denom = maxs - mins
@@ -44,14 +37,14 @@ def _minmax01(matrix) -> np.ndarray:
     return np.clip(scaled, 0.0, 1.0).astype(np.float32)
 
 
-def _sinkhorn_coupling(
+def sinkhorn_coupling(
     x: np.ndarray,
     y: np.ndarray,
     reg: float = 0.1,
     n_iter: int = 200,
 ) -> np.ndarray:
-    x = _dense_float32(x)
-    y = _dense_float32(y)
+    x = dense_float32(x)
+    y = dense_float32(y)
     n, m = x.shape[0], y.shape[0]
     cost = np.sum((x[:, None, :] - y[None, :, :]) ** 2, axis=-1, dtype=np.float32)
     cost_max = float(np.max(cost))
@@ -103,38 +96,36 @@ def run_uniport(context: dict, cfg: dict) -> tuple[list, np.ndarray | None]:
     rna_adata.obs["source"]    = "rna"
     second_adata.obs["domain_id"] = 1
     second_adata.obs["source"]    = second_label
-    rna_adata.obsm["_uniport_scaled"] = _minmax01(rna_adata.X)
-    second_adata.obsm["_uniport_scaled"] = _minmax01(second_adata.X)
+    rna_adata.obsm["uniport_scaled"] = minmax01(rna_adata.X)
+    second_adata.obsm["uniport_scaled"] = minmax01(second_adata.X)
 
-    outdir = tempfile.mkdtemp(prefix="uniport_")
-    up = _import_uniport()
-
-    up.Run(
-        adatas=[rna_adata, second_adata],
-        mode="d",                              # diagonal: no shared genes
-        use_rep=["_uniport_scaled", "_uniport_scaled"],
-        out="latent",
-        save_OT=False,
-        lambda_s=lambda_s,
-        lambda_kl=lambda_kl,
-        lambda_ot=lambda_ot,
-        reg=reg,
-        reg_m=reg_m,
-        iteration=iteration,
-        batch_size=batch_size,
-        lr=lr,
-        seed=seed,
-        enc=[["fc", hidden_dim, 1, "relu"], ["fc", n_latent, "", ""]],
-        loss_type="MSE",
-        outdir=outdir,
-        verbose=False,
-    )
+    with tempfile.TemporaryDirectory(prefix="uniport_") as outdir:
+        up.Run(
+            adatas=[rna_adata, second_adata],
+            mode="d",                              # diagonal: no shared genes
+            use_rep=["uniport_scaled", "uniport_scaled"],
+            out="latent",
+            save_OT=False,
+            lambda_s=lambda_s,
+            lambda_kl=lambda_kl,
+            lambda_ot=lambda_ot,
+            reg=reg,
+            reg_m=reg_m,
+            iteration=iteration,
+            batch_size=batch_size,
+            lr=lr,
+            seed=seed,
+            enc=[["fc", hidden_dim, 1, "relu"], ["fc", n_latent, "", ""]],
+            loss_type="MSE",
+            outdir=outdir,
+            verbose=False,
+        )
 
     rna_latent    = np.array(rna_adata.obsm["latent"])
     second_latent = np.array(second_adata.obsm["latent"])
     n_entries = rna_latent.shape[0] * second_latent.shape[0]
     if n_entries <= max_coupling_entries:
-        coupling = _sinkhorn_coupling(
+        coupling = sinkhorn_coupling(
             rna_latent,
             second_latent,
             reg=sinkhorn_reg,

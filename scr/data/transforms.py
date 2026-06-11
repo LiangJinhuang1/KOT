@@ -46,6 +46,40 @@ def normalize_rna(adata, target_sum=1e4, n_top_genes=2000, flavor="seurat_v3"):
     )
 
 
+def add_log_velocity_layers(adata, target_sum=1e4, velocity_scale=1.0):
+    """
+    Add velocity layers in the same coordinates as normalize_total + log1p RNA.
+
+    If x_j = log(1 + target_sum * c_j / sum_k c_k), then this stores dx_j/dt
+    for each available raw velocity layer. velocity_scale converts velocities
+    into the same raw units as adata.layers["counts"] when needed.
+    """
+    counts = dense_matrix(adata.layers["counts"]).astype("float32")
+    total = counts.sum(axis=1, keepdims=True)
+    total_safe = np.maximum(total, 1e-8)
+    normalized = target_sum * counts / total_safe
+
+    for source in ("true_velocity", "velocity"):
+        if source not in adata.layers:
+            continue
+
+        velocity = dense_matrix(adata.layers[source]).astype("float32") * float(velocity_scale)
+        total_velocity = velocity.sum(axis=1, keepdims=True)
+        normalized_velocity = target_sum * (
+            velocity * total_safe - counts * total_velocity
+        ) / (total_safe ** 2)
+        log_velocity = normalized_velocity / (1.0 + normalized)
+
+        target = f"{source}_log"
+        adata.layers[target] = log_velocity.astype("float32")
+        adata.uns.setdefault("log_velocity_layers", {})[target] = {
+            "source": source,
+            "transform": "d/dt log1p(normalize_total(counts))",
+            "target_sum": float(target_sum),
+            "velocity_scale": float(velocity_scale),
+        }
+
+
 def normalize_protein(adata):
     adata.layers["counts"] = adata.X.copy()
     adata.X = clr_transform(adata.X)

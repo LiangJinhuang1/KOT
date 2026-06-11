@@ -4,6 +4,12 @@ from sklearn.preprocessing import normalize
 from scr.models.LinearODE import solve_linear_ode
 
 
+def dense_array(matrix) -> np.ndarray:
+    if hasattr(matrix, "toarray"):
+        matrix = matrix.toarray()
+    return np.asarray(matrix)
+
+
 def sinkhorn_coupling(x: np.ndarray, y: np.ndarray, reg: float = 0.1, n_iter: int = 100) -> np.ndarray:
     """Sinkhorn algorithm for entropic OT coupling between x and y."""
     n, m = x.shape[0], y.shape[0]
@@ -36,18 +42,23 @@ def run_linear_ode(context: dict, cfg: dict) -> tuple[list, np.ndarray]:
     lambda_ode = float(cfg.get("lambda_ode", 1.0))
     sinkhorn_reg = float(cfg.get("sinkhorn_reg", 0.1))
     n_outer = int(cfg.get("n_als_outer", 5))
+    velocity_layer = cfg.get("linear_ode_velocity_layer") or cfg.get("velocity_layer")
 
-    # RNA velocity in gene space: real data → "velocity" (scVelo), synthetic → "true_velocity"
     V_raw = None
-    for key in ["velocity", "true_velocity"]:
+    velocity_candidates = [velocity_layer] if velocity_layer else ["velocity", "true_velocity"]
+    for key in velocity_candidates:
         if key in rna_adata.layers:
-            V_raw = np.nan_to_num(np.array(rna_adata.layers[key]), nan=0.0)
+            V_raw = np.nan_to_num(dense_array(rna_adata.layers[key]), nan=0.0)
             print(f"[linear_ode] Using velocity layer: '{key}'")
             break
+    if velocity_layer and V_raw is None:
+        available = list(rna_adata.layers.keys())
+        raise ValueError(
+            f"Linear ODE velocity layer '{velocity_layer}' not found. Available layers: {available}"
+        )
     if V_raw is None:
-        print("[linear_ode] Warning: no velocity layer found — ODE term will be zero.")
-        X_mat = rna_adata.X.toarray() if hasattr(rna_adata.X, "toarray") else rna_adata.X
-        V_raw = np.zeros_like(np.array(X_mat))
+        available = list(rna_adata.layers.keys())
+        raise ValueError(f"Linear ODE requires a velocity layer. Available layers: {available}")
 
     # Project velocity into PCA space using existing PCA components
     if "PCs" in rna_adata.varm:
@@ -60,7 +71,7 @@ def run_linear_ode(context: dict, cfg: dict) -> tuple[list, np.ndarray]:
     anchor_betas = cfg.get("anchor_betas") or [1.0] * D_p
     B = np.array(anchor_betas, dtype=float)
     if len(B) != D_p:
-        B = np.ones(D_p)
+        raise ValueError(f"Linear ODE anchor_betas length {len(B)} does not match protein dimension {D_p}.")
 
     # Normalize inputs
     x_norm = normalize(x, norm="l2")
