@@ -68,7 +68,7 @@ defaults:
   lambda_dyn: 1
   lambda_reg: 1.0e-4
   n_epochs: 500
-  batch_size: 256
+  batch_size: 1024
   lr: 1.0e-3
   seed: 42
   phi_dims: [1024, 512, 256]
@@ -101,7 +101,7 @@ datasets:
     add_log_velocity_layer: true
     log_velocity_scale: 80.0  # synthetic true_velocity is in mean units; counts use RNA_COUNT_SCALE=80
     velocity_layer: true_velocity_log
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
     seeded_models: [kot]
     models:
       #- totalvi
