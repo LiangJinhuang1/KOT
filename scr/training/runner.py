@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import shutil
+import sys
+from datetime import datetime
+
 import numpy as np
 from pathlib import Path
 
@@ -19,6 +23,25 @@ from scr.visualization.results import save_comparison_table
 DATASETS_CONFIG = Path("config/datasets.yaml")
 TRAINING_CONFIG = Path("config/training.yaml")
 
+
+class Tee:
+    """Duplicate writes to multiple streams (e.g., stdout + file)."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+    def isatty(self):
+        return False
+
 # Registry: model name → alignment function
 # Each function accepts (context, cfg) and returns (aligned, coupling).
 # context keys:
@@ -34,15 +57,53 @@ MODELS = {
     "uniport":     run_uniport,
     "totalvi":     run_totalvi,
     "linear_ode":  run_linear_ode,
-    "kot":         run_kot,
-    "kot_nodyn":   run_kot,
-    "kot_anchor":  run_kot,
+    "kot":            run_kot,
+    "kot_nodyn":      run_kot,
+    "kot_fixedkappa": run_kot,
+    "kot_fixedalpha": run_kot,
+    "kot_unbounded":    run_kot,
+    "kot_unbounded_sn": run_kot,
+    "kot_anchor":     run_kot,
 }
 
 # Per-model config overrides injected automatically at runtime
 MODEL_OVERRIDES = {
-    "kot_nodyn":  {"lambda_dyn": 0.0},
-    "kot_anchor": {"use_anchor": True},
+    "kot_nodyn":       {"lambda_dyn": 0.0},
+    "kot_fixedkappa":  {"kot_fixed_kappa": 0.6931471805599453},
+    "kot_fixedalpha": {
+        "kot_fixed_alpha": 0.6931471805599453,
+        "kot_fixed_kappa": None,
+        "kot_kappa_min": 1.0e-3,
+        "kot_kappa_max": 1.5,
+        "kot_kappa_prior": 0.6931471805599453,
+        "lambda_kappa_prior": 0.01,
+        "kot_alpha_min": 1.0e-6,
+        "kot_alpha_max": None,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": False,
+        "g_dims": [256, 128],
+    },
+    "kot_unbounded": {
+        "kot_kappa_min": 1.0e-6,
+        "kot_kappa_max": None,
+        "kot_alpha_min": 1.0e-6,
+        "kot_alpha_max": None,
+        "lambda_kappa_prior": 0.0,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": False,
+        "g_dims": [256, 128],
+    },
+    "kot_unbounded_sn": {
+        "kot_kappa_min": 1.0e-6,
+        "kot_kappa_max": None,
+        "kot_alpha_min": 1.0e-6,
+        "kot_alpha_max": None,
+        "lambda_kappa_prior": 0.0,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": True,
+        "g_dims": [256, 128],
+    },
+    "kot_anchor":      {"use_anchor": True},
 }
 
 
@@ -75,7 +136,8 @@ def model_names_from_cfg(run_cfg: dict) -> list[str]:
     return [str(model) for model in models]
 
 
-def seed_values_from_cfg(run_cfg: dict) -> tuple[list[int], bool]:
+def seed_list_from_cfg(run_cfg: dict) -> tuple[list[int], bool]:
+    """Return (seeds, is_multi_seed). is_multi_seed True if 'seeds' is explicitly set."""
     seeds = run_cfg.get("seeds")
     if seeds is None:
         return [int(run_cfg.get("seed", 42))], False
@@ -84,13 +146,14 @@ def seed_values_from_cfg(run_cfg: dict) -> tuple[list[int], bool]:
     return [int(seed) for seed in seeds], True
 
 
-def model_uses_seed_repeats(run_cfg: dict, model_name: str) -> bool:
-    seeded_models = run_cfg.get("seeded_models")
-    if seeded_models is None:
-        return "seeds" in run_cfg
-    if isinstance(seeded_models, str):
-        seeded_models = [seeded_models]
-    return model_name in {str(model) for model in seeded_models}
+def seeded_models_from_cfg(run_cfg: dict, all_models: list[str]) -> set[str]:
+    """Set of models that should run across all configured seeds."""
+    seeded = run_cfg.get("seeded_models")
+    if seeded is None:
+        return set(all_models) if "seeds" in run_cfg else set()
+    if isinstance(seeded, str):
+        return {seeded}
+    return {str(model) for model in seeded}
 
 
 def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
@@ -152,6 +215,7 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
     print(f"{second_label.upper()} repr ({second_repr_key}): {y.shape}")
 
     context = build_context(x, y, rna_adata, second_adata, second_label, modality_pair)
+    context["output_dir"] = output_dir
 
     align_fn = MODELS[model_name]
     result = align_fn(context, run_cfg)
@@ -199,6 +263,29 @@ def run_training(config_path: Path = TRAINING_CONFIG) -> None:
     train_cfg = load_yaml(config_path)
     datasets = load_yaml(DATASETS_CONFIG).get("datasets", {})
     defaults = train_cfg.get("defaults", {})
+
+    # Per-run timestamped output directory: isolates artifacts, config, and log.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_root = Path(defaults.get("output_root", "cache/training"))
+    run_root = base_root / f"run_{timestamp}"
+    run_root.mkdir(parents=True, exist_ok=True)
+    defaults["output_root"] = str(run_root)
+
+    # Snapshot the config used for this run.
+    config_snapshot = run_root / "training.yaml"
+    shutil.copy(config_path, config_snapshot)
+
+    # Tee stdout/stderr to a log file inside the run directory.
+    log_path = run_root / "run.log"
+    log_file = open(log_path, "w", buffering=1)
+    sys.stdout = Tee(sys.stdout, log_file)
+    sys.stderr = Tee(sys.stderr, log_file)
+
+    print(f"[runner] Run timestamp: {timestamp}")
+    print(f"[runner] Output root:   {run_root}")
+    print(f"[runner] Config saved:  {config_snapshot}")
+    print(f"[runner] Log file:      {log_path}")
+
     trained_models = []
     result_seeded_models = set()
 
@@ -206,19 +293,16 @@ def run_training(config_path: Path = TRAINING_CONFIG) -> None:
         if name not in datasets:
             raise ValueError(f"Dataset '{name}' is not defined in {DATASETS_CONFIG}.")
         base_cfg = {**defaults, **(overrides or {})}
-        seeded_models = base_cfg.get("seeded_models")
-        if seeded_models is None:
-            if "seeds" in base_cfg:
-                result_seeded_models.update(model_names_from_cfg(base_cfg))
-        elif isinstance(seeded_models, str):
-            result_seeded_models.add(seeded_models)
-        else:
-            result_seeded_models.update(str(model) for model in seeded_models)
-        for model_name in model_names_from_cfg(base_cfg):
-            if model_uses_seed_repeats(base_cfg, model_name):
-                seeds, is_multi_seed = seed_values_from_cfg(base_cfg)
-            else:
-                seeds, is_multi_seed = [int(base_cfg.get("seed", 42))], False
+        all_models = model_names_from_cfg(base_cfg)
+        seeded = seeded_models_from_cfg(base_cfg, all_models)
+        result_seeded_models.update(seeded)
+
+        multi_seeds, is_multi_seed = seed_list_from_cfg(base_cfg)
+        default_seeds = [int(base_cfg.get("seed", 42))]
+
+        for model_name in all_models:
+            use_run_seed = is_multi_seed and model_name in seeded
+            seeds = multi_seeds if model_name in seeded else default_seeds
             for seed in seeds:
                 run_cfg = {
                     **base_cfg,
@@ -226,7 +310,7 @@ def run_training(config_path: Path = TRAINING_CONFIG) -> None:
                     "seed": seed,
                     **MODEL_OVERRIDES.get(model_name, {}),
                 }
-                if is_multi_seed:
+                if use_run_seed:
                     run_cfg["run_seed"] = seed
                 run_one(name, datasets[name], run_cfg)
             if model_name not in trained_models:

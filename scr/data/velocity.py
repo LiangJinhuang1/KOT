@@ -359,9 +359,9 @@ def run_scvelo(adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neigh
     sc.tl.pca(adata, n_comps=actual_n_pcs)
     sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=actual_n_pcs)
     # scVelo velocity_graph requires CSR format; newer scanpy may use other sparse types
-    for _key in ("connectivities", "distances"):
-        if _key in adata.obsp:
-            adata.obsp[_key] = sparse.csr_matrix(adata.obsp[_key])
+    for key in ("connectivities", "distances"):
+        if key in adata.obsp:
+            adata.obsp[key] = sparse.csr_matrix(adata.obsp[key])
     scv.pp.moments(adata, n_pcs=actual_n_pcs, n_neighbors=n_neighbors)
     if velocity_mode == "dynamical":
         scv.tl.recover_dynamics(adata, n_jobs=dynamics_n_jobs)
@@ -559,7 +559,9 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
+    config = load_yaml(Path(args.config))
+    config.setdefault("defaults", {})
+    config.setdefault("datasets", {})
 
     if args.list:
         for name in sorted(config.get("datasets", {})):

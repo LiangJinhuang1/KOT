@@ -73,15 +73,31 @@ defaults:
   seed: 42
   phi_dims: [1024, 512, 256]
   kappa_dims: [64, 32]
+  kot_fixed_kappa: null        # null = learn kappa; float = use fixed scalar kappa
+  kot_fixed_alpha: null        # null = learn alpha/g; float/list = fixed translation scale
   g_dims: [256, 128]
   phi_init_gain: 0.5
-  phi_spectral_norm: false
-  dyn_warmup_epochs: 250           # half of n_epochs: pure Sinkhorn → joint
+  phi_spectral_norm: true     # true limits φ Lipschitz; ablate separately after bounds work
+  # --- bounded κ / α (v2: low floor + log-prior, not high floor) ---
+  kot_kappa_min: 0.001         # block κ→0; 0.05 was too high (all seeds stuck at floor in run_001331)
+  kot_kappa_max: 1.5           # cap runaway κ; null = upper-unbounded softplus
+  kot_kappa_prior: 0.6931471805599453  # softplus(0): expected inverse time scale
+  lambda_kappa_prior: 0.01     # pull κ toward prior; 1e-3 was too weak vs dyn loss
+  kot_alpha_min: 0.1e-4          # 0.05 forced α to floor alongside κ
+  kot_alpha_max: 3.0           # cap g(r) absorbing the whole ODE RHS
+  g_freeze_epochs: 0           # 100 hurt: φ/κ trained with wrong frozen α
+  dyn_warmup_epochs: 0         # keep joint training; warmup + bounds conflict
   early_stopping_patience: 100     # stop if align loss has not improved for N epochs post-warmup
+  # Alternating-phase optimization (v3). 0 = phases off → joint training (current behavior).
+  # When any of phase{1,2,3}_epochs > 0, n_epochs is overridden by their sum.
+  phase1_epochs: 0           # Sinkhorn only, phi trainable, κ/α/β frozen
+  phase2_epochs: 0           # Dynamics only, phi frozen, κ/α/β trainable
+  phase3_epochs: 0           # Joint, all trainable, LR scaled by phase3_lr_scale
+  phase3_lr_scale: 0.1
   kot_init: xavier
   kot_activation: silu
   kot_use_feature_space: true # KOT paper objective: RNA/protein feature coordinates, not PCA
-  kot_rna_layer: null         # null/"X" = preprocessed RNA expression
+  kot_rna_layer: null         # null/"X" = preprocessed RNA expression (log feature space)
   kot_protein_layer: null     # null/"X" = preprocessed protein expression
   kot_use_explicit_links: true  # paper S matrix: target-protein genes when links are available
   kot_anchor_beta: 0.5          # scalar β* fallback if kot_anchor_indices is set and kot_anchor_betas is empty
@@ -102,10 +118,16 @@ datasets:
     log_velocity_scale: 80.0  # synthetic true_velocity is in mean units; counts use RNA_COUNT_SCALE=80
     velocity_layer: true_velocity_log
     seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
-    seeded_models: [kot]
+    # Diagnostic: bounded/prior kappa, fixed alpha, no spectral norm.
+    seeded_models: [kot_fixedalpha]
     models:
       #- totalvi
-      - kot
+      #- kot_unbounded
+      #- kot_unbounded_sn
+      - kot_fixedalpha
+      #- kot
+      #- kot_nodyn
+      #- kot_fixedkappa
       #- moscot
       #- scot
       #- linear_ode

@@ -3,8 +3,8 @@ KOT neural network components.
 
 Three learnable maps:
   phi_theta  : R^D_r → R^D_p   RNA → protein
-  kappa_psi  : R^D_r → R^1     RNA → time-scale κ > 0  (Softplus)
-  g_omega    : R^D_r → R^D_p   RNA → translation efficiency α > 0  (Softplus)
+  kappa_psi  : R^D_r → R^1     RNA → bounded positive time-scale κ
+  g_omega    : R^D_r → R^D_p   RNA → bounded positive translation efficiency α
 
 β (degradation rates) is a learnable parameter, kept positive via Softplus.
 All networks use configurable weight initialization and hidden activations.
@@ -88,7 +88,7 @@ class PhiTheta(nn.Module):
 
 
 class KappaPsi(nn.Module):
-    """RNA → scalar kinetic time-scale κ > 0."""
+    """RNA → scalar kinetic time-scale κ constrained to a positive interval."""
 
     def __init__(
         self,
@@ -96,6 +96,8 @@ class KappaPsi(nn.Module):
         hidden_dims: list[int],
         activation: str = "gelu",
         init_method: str = "orthogonal",
+        min_value: float = 1e-6,
+        max_value: float | None = None,
     ):
         super().__init__()
         self.net = build_mlp(
@@ -107,13 +109,19 @@ class KappaPsi(nn.Module):
             init_method=init_method,
         )
         self.softplus = nn.Softplus()
+        self.min_value = float(min_value)
+        self.max_value = float(max_value) if max_value is not None else None
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
-        return self.softplus(self.net(r)) + 1e-6
+        raw = self.net(r)
+        if self.max_value is None:
+            return self.softplus(raw) + self.min_value
+        span = self.max_value - self.min_value
+        return self.min_value + span * torch.sigmoid(raw)
 
 
 class GOmega(nn.Module):
-    """RNA → per-protein translation efficiency α > 0."""
+    """RNA → per-protein translation efficiency α constrained to a positive interval."""
 
     def __init__(
         self,
@@ -122,6 +130,8 @@ class GOmega(nn.Module):
         hidden_dims: list[int],
         activation: str = "gelu",
         init_method: str = "orthogonal",
+        min_value: float = 1e-6,
+        max_value: float | None = None,
     ):
         super().__init__()
         self.net = build_mlp(
@@ -133,9 +143,15 @@ class GOmega(nn.Module):
             init_method=init_method,
         )
         self.softplus = nn.Softplus()
+        self.min_value = float(min_value)
+        self.max_value = float(max_value) if max_value is not None else None
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
-        return self.softplus(self.net(r)) + 1e-6
+        raw = self.net(r)
+        if self.max_value is None:
+            return self.softplus(raw) + self.min_value
+        span = self.max_value - self.min_value
+        return self.min_value + span * torch.sigmoid(raw)
 
 
 class KOTModel(nn.Module):
@@ -162,6 +178,10 @@ class KOTModel(nn.Module):
         activation: str = "gelu",
         init_method: str = "orthogonal",
         phi_spectral_norm: bool = False,
+        kappa_min: float = 1e-6,
+        kappa_max: float | None = None,
+        alpha_min: float = 1e-6,
+        alpha_max: float | None = None,
     ):
         super().__init__()
         self.phi   = PhiTheta(
@@ -178,6 +198,8 @@ class KOTModel(nn.Module):
             list(kappa_dims),
             activation=activation,
             init_method=init_method,
+            min_value=kappa_min,
+            max_value=kappa_max,
         )
         self.g     = GOmega(
             d_rna,
@@ -185,6 +207,8 @@ class KOTModel(nn.Module):
             list(g_dims),
             activation=activation,
             init_method=init_method,
+            min_value=alpha_min,
+            max_value=alpha_max,
         )
 
         self.beta_raw  = nn.Parameter(torch.rand(d_protein) * 0.1)
