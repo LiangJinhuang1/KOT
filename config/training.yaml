@@ -106,33 +106,64 @@ defaults:
   kot_anchor_betas:   [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # true degradation rate
   lambda_prior: 1.0            # weight of anchor prior Σ(β_h − β*)²
 
+  # Alignment plot
+  viz_reduction: pca           # pca | umap | tsne | precomputed
+  viz_input: auto               # auto | repr | feature — matrices to reduce for "before" row
+  viz_before_rna_obsm: null     # e.g. X_pca, X_umap — skip fit for RNA before-panel
+  viz_before_second_obsm: null # e.g. X_pca — skip fit for protein/ATAC before-panel
+  viz_random_state: 42
+  viz_umap_neighbors: 15
+  viz_umap_min_dist: 0.1
+  viz_tsne_perplexity: 30
+
+
+# ---------------------------------------------------------------
+# Per-stage overrides applied by `runner.py --stage <stage>`.
+# (data path, KOT layers, and cache_version are set automatically from --stage/--scale)
+# ---------------------------------------------------------------
+# moscot / scot / linear_ode are deterministic (no seed) → in `models` only, run once.
+stage_overrides:
+  oracle:                       # v2a-oracle: exact ODE, full supervision → implementation gate
+    kot_anchor_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]   # 100% β anchored
+    seeded_models: [kot_oracle, kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, uniport]
+    models:        [kot_oracle, kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, uniport, moscot, scot, linear_ode]
+  clean:                        # v2a-clean: ODE true but non-trivial (dynamic α/κ, noise, partial β)
+    kot_anchor_indices: [0, 1]                            # ~20% β anchored
+    seeded_models: [kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, uniport, glue, totalvi]
+    models:        [kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, uniport, glue, totalvi, moscot, scot, linear_ode]
+  branch:                       # v2b-branch: geometrically ambiguous → dynamics vs pure-OT
+    kot_anchor_indices: [0, 1]                            # ~20% β anchored
+    seeded_models: [kot, kot_nodyn, uniport, glue, totalvi]
+    models:        [kot, kot_nodyn, uniport, glue, totalvi, moscot, scot, linear_ode]
+
 
 # ---------------------------------------------------------------
 # Active datasets — uncomment to run
 # ---------------------------------------------------------------
 datasets:
-  synthetic:
+  synthetic_linked_ode:
+    # Shared settings. Per-stage data path, layers, cache_version, models and
+    # anchors come from `runner.py --stage/--scale` + stage_overrides above.
+    # A bare `python -m scr.training.runner` (no --stage) runs the oracle/mean gate.
     modality_pair: rna_protein
-    preprocessing_cache_version: synthetic_log_velocity_v1
-    add_log_velocity_layer: true
-    log_velocity_scale: 80.0  # synthetic true_velocity is in mean units; counts use RNA_COUNT_SCALE=80
-    velocity_layer: true_velocity_log
+    preprocessing_cache_version: synthetic_linked_ode_v2a_oracle
+    force_preprocess: true
+    add_log_velocity_layer: false
+    velocity_layer: true_velocity_mean
+    kot_rna_layer: spliced_mean
+    kot_protein_layer: protein_mean
+    kot_use_explicit_links: true
+    rna_n_top_genes: 0
+    rna_n_pcs: 11
+    protein_n_pcs: 9
+    phi_spectral_norm: false         # φ settings matched across the KOT ablation family
+    kot_alpha_min: 1.0e-3
+    kot_alpha_max: 1.5
+    use_anchor: true
+    kot_anchor_betas: []
     seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
-    # Diagnostic: bounded/prior kappa, fixed alpha, no spectral norm.
-    seeded_models: [kot_fixedalpha]
-    models:
-      #- totalvi
-      #- kot_unbounded
-      #- kot_unbounded_sn
-      - kot_fixedalpha
-      #- kot
-      #- kot_nodyn
-      #- kot_fixedkappa
-      #- moscot
-      #- scot
-      #- linear_ode
-      #- glue
-      #- uniport
+    seeded_models: [kot_oracle]
+    models: [kot_oracle]
 
   # pbmc:
   #   modality_pair: rna_protein

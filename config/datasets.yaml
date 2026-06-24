@@ -30,6 +30,16 @@ datasets:
     protein_path: cache/synthetic/protein.h5ad
     protein_label: Protein
 
+  synthetic_linked_ode:
+    # Staged v2 synthetic. Generate first, e.g.:
+    #   python -m scr.data.synthetic_linked_ode --stage oracle
+    # To advance stages, swap the word `oracle` below (here AND in training.yaml:
+    # preprocessing_cache_version) for `clean` then `branch`.
+    name: Synthetic Linked ODE
+    rna_path: cache/velocity/synthetic_linked_ode/oracle/rna.h5ad
+    protein_path: cache/synthetic_linked_ode/oracle/protein.h5ad
+    protein_label: Protein
+
   shareseq_skin:
     name: SHARE-seq Skin
     rna_path: cache/velocity/shareseq_skin/shareseq_skin_scvelo_results.h5ad

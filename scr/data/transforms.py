@@ -38,6 +38,9 @@ def normalize_rna(adata, target_sum=1e4, n_top_genes=2000, flavor="seurat_v3"):
     adata.layers["counts"] = adata.X.copy()
     sc.pp.normalize_total(adata, target_sum=target_sum)
     sc.pp.log1p(adata)
+    if not n_top_genes or n_top_genes <= 0 or adata.n_vars < 50:
+        print(f"[preprocess] Skipping RNA HVG selection for {adata.n_vars} genes.")
+        return
     sc.pp.highly_variable_genes(
         adata,
         n_top_genes=min(n_top_genes, adata.n_vars),
@@ -100,14 +103,16 @@ def normalize_atac(adata):
 
 def reduce_rna(adata, n_pcs=30, n_neighbors=30):
     use_hvg = "highly_variable" in adata.var.columns
-    sc.tl.pca(adata, n_comps=min(n_pcs, adata.n_vars - 1), use_highly_variable=use_hvg)
-    sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs)
+    n_comps = min(n_pcs, adata.n_vars - 1, adata.n_obs - 1)
+    sc.tl.pca(adata, n_comps=n_comps, use_highly_variable=use_hvg)
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_comps)
     sc.tl.umap(adata)
     sc.tl.leiden(adata)
 
 
 def reduce_protein(adata, n_pcs=10):
-    sc.tl.pca(adata, n_comps=min(n_pcs, adata.n_vars - 1))
+    n_comps = min(n_pcs, adata.n_vars - 1, adata.n_obs - 1)
+    sc.tl.pca(adata, n_comps=n_comps)
 
 
 def reduce_atac(adata, n_components=30, n_neighbors=30):

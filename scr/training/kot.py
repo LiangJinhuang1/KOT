@@ -52,6 +52,91 @@ def matrix_from_adata(adata, layer_key: str | None, label: str) -> np.ndarray:
     return dense_array(adata.layers[layer_key])
 
 
+def array_debug_stats(values: np.ndarray) -> dict:
+    return {
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
+    }
+
+
+def optional_obsm_debug_stats(adata, key: str) -> dict | None:
+    if key not in adata.obsm:
+        return None
+    return array_debug_stats(np.asarray(adata.obsm[key], dtype=np.float32))
+
+
+def kot_data_debug_summary(
+    rna_adata,
+    rna_layer: str | None,
+    protein_layer: str | None,
+    velocity_layer: str,
+    x: np.ndarray,
+    y: np.ndarray,
+    velocity: np.ndarray,
+    s_model: np.ndarray,
+) -> dict:
+    links = rna_adata.uns.get("rna_protein_links", {})
+    link_count = len(links.get("rna", [])) if isinstance(links, dict) else 0
+    synthetic_meta = dict(rna_adata.uns.get("synthetic_linked_ode", {}))
+    return {
+        "rna_layer": rna_layer or "X",
+        "protein_layer": protein_layer or "X",
+        "velocity_layer": velocity_layer,
+        "rna_shape": [int(v) for v in x.shape],
+        "protein_shape": [int(v) for v in y.shape],
+        "velocity_shape": [int(v) for v in velocity.shape],
+        "s_matrix_shape": [int(v) for v in s_model.shape],
+        "s_matrix_nonzero": int(np.count_nonzero(s_model)),
+        "link_count": int(link_count),
+        "synthetic_linked_ode": synthetic_meta,
+        "true_alpha": optional_obsm_debug_stats(rna_adata, "true_alpha"),
+        "true_beta": optional_obsm_debug_stats(rna_adata, "true_beta"),
+        "true_kappa": optional_obsm_debug_stats(rna_adata, "true_kappa"),
+        "true_protein_velocity": optional_obsm_debug_stats(
+            rna_adata,
+            "true_protein_velocity_mean",
+        ),
+    }
+
+
+def print_kot_data_debug(summary: dict) -> None:
+    print("---- kot data debug ----")
+    print(
+        "  layers:        "
+        f"rna={summary['rna_layer']}  protein={summary['protein_layer']}  "
+        f"velocity={summary['velocity_layer']}"
+    )
+    print(
+        "  shapes:        "
+        f"rna={summary['rna_shape']}  protein={summary['protein_shape']}  "
+        f"velocity={summary['velocity_shape']}"
+    )
+    print(
+        "  S matrix:      "
+        f"shape={summary['s_matrix_shape']}  nonzero={summary['s_matrix_nonzero']}  "
+        f"links={summary['link_count']}"
+    )
+    synthetic_meta = summary["synthetic_linked_ode"]
+    if synthetic_meta:
+        print(
+            "  synthetic:     "
+            f"stage={synthetic_meta.get('stage')}  "
+            f"distractors={synthetic_meta.get('n_distractor_rna_genes')}  "
+            f"native_rna={synthetic_meta.get('native_rna_layer')}  "
+            f"native_protein={synthetic_meta.get('native_protein_layer')}"
+        )
+    for key in ["true_alpha", "true_beta", "true_kappa", "true_protein_velocity"]:
+        stats = summary[key]
+        if stats is not None:
+            print(
+                f"  {key:21s}"
+                f"min={stats['min']:.6g}  max={stats['max']:.6g}  "
+                f"mean={stats['mean']:.6g}  std={stats['std']:.6g}"
+            )
+
+
 class FixedKappa(torch.nn.Module):
     """Constant positive kappa used to test the kinetic objective without kappa collapse."""
 
@@ -422,10 +507,12 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
     # RNA velocity in the same coordinate system as the KOT RNA input.
     V_raw = None
+    selected_velocity_layer = None
     velocity_candidates = [velocity_layer] if velocity_layer else ["true_velocity", "velocity"]
     for key in velocity_candidates:
         if key in rna_adata.layers:
             V_raw = np.nan_to_num(dense_array(rna_adata.layers[key]), nan=0.0)
+            selected_velocity_layer = key
             print(f"[kot] Using velocity layer: '{key}'")
             break
     if velocity_layer and V_raw is None:
@@ -443,6 +530,19 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         raise ValueError(
             f"KOT velocity shape {V_raw.shape} is incompatible with KOT input shape {x.shape}."
         )
+
+    data_debug = kot_data_debug_summary(
+        rna_adata,
+        rna_layer,
+        protein_layer,
+        selected_velocity_layer,
+        x,
+        y,
+        V,
+        S_model,
+    )
+    print_kot_data_debug(data_debug)
+    output_dir = context.get("output_dir")
 
     if "velocity_confidence" in rna_adata.obs.columns:
         conf = np.array(rna_adata.obs["velocity_confidence"].values, dtype=np.float32)
@@ -785,6 +885,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["lambda_kappa_prior"] = float(lambda_kappa_prior)
     diagnostics["kappa_prior_target"] = kappa_prior_target
     diagnostics["g_freeze_epochs"]   = int(g_freeze_epochs)
+    diagnostics["data_debug"]        = data_debug
 
     print("---- end-of-training diagnostics ----")
     print(f"  time_mae:           {diagnostics['time_mae']:.4f}")
@@ -805,7 +906,6 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     print("final beta:", model.beta.detach().cpu().numpy())
     print(f"[kot] stopped at epoch {stop_epoch} / {n_epochs}")
 
-    output_dir = context.get("output_dir")
     if output_dir is not None:
         out = Path(output_dir)
 
