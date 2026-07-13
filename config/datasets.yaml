@@ -24,7 +24,7 @@ datasets:
     protein_label: Protein
 
   synthetic:
-    # run first: python -m scr.data.synthetic
+    # run first: python -m src.data.synthetic
     name: Synthetic
     rna_path: cache/velocity/synthetic/synthetic_scvelo_results.h5ad
     protein_path: cache/synthetic/protein.h5ad
@@ -32,9 +32,9 @@ datasets:
 
   synthetic_linked_ode:
     # Staged v2 synthetic. Generate first, e.g.:
-    #   python -m scr.data.synthetic_linked_ode --stage oracle
-    # To advance stages, swap the word `oracle` below (here AND in training.yaml:
-    # preprocessing_cache_version) for `clean` then `branch`.
+    #   python -m src.data.synthetic_linked_ode --stage oracle
+    # Training stages are selected with runner.py --stage; the runner injects
+    # the stage-specific paths, so these oracle paths are only the default.
     name: Synthetic Linked ODE
     rna_path: cache/velocity/synthetic_linked_ode/oracle/rna.h5ad
     protein_path: cache/synthetic_linked_ode/oracle/protein.h5ad

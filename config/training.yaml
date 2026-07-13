@@ -1,3 +1,34 @@
+# Single training config for the staged synthetic linked-ODE experiments.
+#
+# Pick which models to run with the runner's --models flag — either a named group
+# from `model_groups` below, or a comma-separated list of model names:
+#
+#   python -m src.training.runner --models baselines  --stage clean  --scale mean
+#   python -m src.training.runner --models kot         --stage clean  --scale mean
+#   python -m src.training.runner --models upperbound  --stage clean  --scale mean
+#   python -m src.training.runner --models all         --stage branch --scale mean
+#   python -m src.training.runner --models scot,moscot --stage clean  --scale mean
+#   python tools/run_moscot_sweep.py --stage clean --scale mean
+#
+# With no --models, `default_models` (below) is used. Stochastic models in
+# `seeded_models` run across every seed in the dataset's `seeds`; deterministic
+# baselines (scot, moscot, linear_ode) run once.
+
+# Named model selections for --models.
+model_groups:
+  ot_baselines: [scot, moscot]
+  baselines:    [scot, moscot, glue, uniport, linear_ode]
+  upperbound:   [totalvi]          # paired-latent totalVI — performance ceiling
+  convex:       [linear_ode]       # convex ODE baseline
+  kot_main:     [kot]              # single KOT model; avoids name clash with group `kot`
+  kot:          [kot, kot_anchor, kot_nodyn]
+  kot_ablation: [kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle]
+  kot_oracles:  [kot_oracle, kot_oracle_learnalpha, kot_oracle_learnalpha_kappa]
+  all:          [kot, kot_nodyn, moscot, scot, linear_ode, uniport, glue, totalvi]
+
+# Used when --models is not passed.
+default_models: all
+
 defaults:
   output_root: cache/training
   synthetic_seed: 42
@@ -5,13 +36,20 @@ defaults:
   force_preprocess: false
   add_log_velocity_layer: false
   log_velocity_scale: 1.0
-  model: kot          # fallback when `models` is not set
+  model: kot
   modality_pair: rna_protein
   rna_repr: X_pca
-  second_repr: X_pca         # protein → X_pca  |  ATAC → X_lsi (override below)
+  second_repr: X_pca
 
-  # SCOT hyperparameters
-  proj_method: barycentric   # barycentric | embedding
+  # Stochastic models that should run across every seed. Deterministic baselines
+  # (scot, moscot, linear_ode) are intentionally absent — they run once.
+  seeded_models:
+    [kot, kot_anchor, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle,
+     kot_oracle_learnalpha, kot_oracle_learnalpha_kappa,
+     uniport, glue, totalvi]
+
+  # OT baselines
+  proj_method: barycentric
   k: 110
   eps: 5.0e-3
   rho: 1.0
@@ -24,13 +62,17 @@ defaults:
   out_dim: 30
   lambda: 1.0
 
-  # MOSCOT hyperparameters (TranslationProblem, pure GW)
-  epsilon: 0.1               # entropic regularization
-  tau_a: 1.0                 # source marginal relaxation (1.0 = balanced)
-  tau_b: 1.0                 # target marginal relaxation
+  # MOSCOT
+  epsilon: 0.1
+  tau_a: 1.0
+  tau_b: 1.0
   max_iterations: 100
+  moscot_validate_inputs: true
+  moscot_sweep_epsilons: [0.01, 0.05, 0.1, 0.5]
+  moscot_sweep_max_iterations: [100, 200, 500, 1000]
+  coupling_sparsity_threshold: 1.0e-12
 
-  # GLUE hyperparameters
+  # GLUE
   latent_dim: 50
   max_epochs: 200
   lam_data: 1.0
@@ -39,32 +81,44 @@ defaults:
   lam_align: 0.05
   glue_uniform_fallback: false
 
-  # uniPort hyperparameters (diagonal integration, mode='d')
+  # uniPort
   lambda_s: 0.5
-  lambda_kl: 0.5
+  # Low KL weight to avoid VAE posterior collapse: with the low-dim PCA inputs the
+  # decoder reconstructs trivially, so a strong KL term drives every cell to the
+  # same latent (constant embedding) and FOSCTTM degenerates to a fake 0.0.
+  lambda_kl: 0.05
   lambda_ot: 1.0
   reg: 0.1
   reg_m: 1.0
-  iteration: 30000
-  uniport_n_latent: 20
+  # Fewer iterations: long training compounds the collapse on this easy input.
+  iteration: 10000
+  # Latent must be smaller than the input dims (X_pca is ~11 RNA / ~9 protein),
+  # otherwise the over-sized latent is free to be ignored and collapses.
+  uniport_n_latent: 8
   uniport_hidden_dim: 1024
+  # Keep uniPort on the same runner representations as the other baselines.
+  uniport_rna_rep: X_pca
+  uniport_second_rep: X_pca
+  # Diagonal uniPort is an unpaired baseline; restore original order before FOSCTTM.
+  uniport_permute_second: true
+  # Also rewrite protein obs_names so the sanity test cannot rely on matching IDs.
+  uniport_relabel_second_ids: true
   uniport_sinkhorn_reg: 0.1
   uniport_sinkhorn_iter: 200
   uniport_max_coupling_entries: 25000000
-  # lr and batch_size shared with KOT defaults above
 
-  # totalVI hyperparameters (upper bound — trained on true paired data)
+  # totalVI
   n_latent: 20
   totalvi_max_epochs: 400
 
-  # Linear ODE hyperparameters (our convex baseline)
+  # Linear ODE
   lambda_ode: 1.0
   sinkhorn_reg: 0.1
   n_als_outer: 5
-  anchor_betas: []           # list of D_p degradation rates; empty = all 1.0
-  velocity_layer: null        # optional shared velocity layer for KOT and Linear ODE
+  anchor_betas: []
+  velocity_layer: null
 
-  # KOT hyperparameters
+  # KOT
   lambda_dyn: 1
   lambda_reg: 1.0e-4
   n_epochs: 500
@@ -73,78 +127,60 @@ defaults:
   seed: 42
   phi_dims: [1024, 512, 256]
   kappa_dims: [64, 32]
-  kot_fixed_kappa: null        # null = learn kappa; float = use fixed scalar kappa
-  kot_fixed_alpha: null        # null = learn alpha/g; float/list = fixed translation scale
+  kot_fixed_kappa: null
+  kot_fixed_alpha: null
+  kot_fixed_beta: null
   g_dims: [256, 128]
   phi_init_gain: 0.5
-  phi_spectral_norm: true     # true limits φ Lipschitz; ablate separately after bounds work
-  # --- bounded κ / α (v2: low floor + log-prior, not high floor) ---
-  kot_kappa_min: 0.001         # block κ→0; 0.05 was too high (all seeds stuck at floor in run_001331)
-  kot_kappa_max: 1.5           # cap runaway κ; null = upper-unbounded softplus
-  kot_kappa_prior: 0.6931471805599453  # softplus(0): expected inverse time scale
-  lambda_kappa_prior: 0.01     # pull κ toward prior; 1e-3 was too weak vs dyn loss
-  kot_alpha_min: 0.1e-4          # 0.05 forced α to floor alongside κ
-  kot_alpha_max: 3.0           # cap g(r) absorbing the whole ODE RHS
-  g_freeze_epochs: 0           # 100 hurt: φ/κ trained with wrong frozen α
-  dyn_warmup_epochs: 0         # keep joint training; warmup + bounds conflict
-  early_stopping_patience: 100     # stop if align loss has not improved for N epochs post-warmup
-  # Alternating-phase optimization (v3). 0 = phases off → joint training (current behavior).
-  # When any of phase{1,2,3}_epochs > 0, n_epochs is overridden by their sum.
-  phase1_epochs: 0           # Sinkhorn only, phi trainable, κ/α/β frozen
-  phase2_epochs: 0           # Dynamics only, phi frozen, κ/α/β trainable
-  phase3_epochs: 0           # Joint, all trainable, LR scaled by phase3_lr_scale
+  phi_spectral_norm: true
+  kot_kappa_min: 0.001
+  kot_kappa_max: 1.5
+  kot_kappa_prior: 0.6931471805599453
+  lambda_kappa_prior: 0.01
+  kot_alpha_min: 0.1e-4
+  kot_alpha_max: 3.0
+  g_freeze_epochs: 0
+  dyn_warmup_epochs: 0
+  early_stopping_patience: 100
+  phase1_epochs: 0
+  phase2_epochs: 0
+  phase3_epochs: 0
   phase3_lr_scale: 0.1
   kot_init: xavier
   kot_activation: silu
-  kot_use_feature_space: true # KOT paper objective: RNA/protein feature coordinates, not PCA
-  kot_rna_layer: null         # null/"X" = preprocessed RNA expression (log feature space)
-  kot_protein_layer: null     # null/"X" = preprocessed protein expression
-  kot_use_explicit_links: true  # paper S matrix: target-protein genes when links are available
-  kot_anchor_beta: 0.5          # scalar β* fallback if kot_anchor_indices is set and kot_anchor_betas is empty
-  use_anchor: true              # β-anchor control experiment: pin β to its true value (GAMMA_P=0.5)
-  kot_anchor_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]   # anchor set H = all 10 proteins
-  kot_anchor_betas:   [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # true degradation rate
-  lambda_prior: 1.0            # weight of anchor prior Σ(β_h − β*)²
+  kot_use_feature_space: true
+  kot_rna_layer: null
+  kot_protein_layer: null
+  kot_use_explicit_links: true
+  kot_anchor_beta: 0.5
+  use_anchor: true
+  kot_anchor_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+  lambda_prior: 1.0
 
-  # Alignment plot
-  viz_reduction: pca           # pca | umap | tsne | precomputed
-  viz_input: auto               # auto | repr | feature — matrices to reduce for "before" row
-  viz_before_rna_obsm: null     # e.g. X_pca, X_umap — skip fit for RNA before-panel
-  viz_before_second_obsm: null # e.g. X_pca — skip fit for protein/ATAC before-panel
+  # Visualization
+  viz_reduction: pca
+  viz_input: auto
+  viz_before_rna_obsm: null
+  viz_before_second_obsm: null
   viz_random_state: 42
   viz_umap_neighbors: 15
   viz_umap_min_dist: 0.1
   viz_tsne_perplexity: 30
 
-
-# ---------------------------------------------------------------
-# Per-stage overrides applied by `runner.py --stage <stage>`.
-# (data path, KOT layers, and cache_version are set automatically from --stage/--scale)
-# ---------------------------------------------------------------
-# moscot / scot / linear_ode are deterministic (no seed) → in `models` only, run once.
+# Genuine per-stage differences only (model lists come from --models / model_groups).
 stage_overrides:
-  oracle:                       # v2a-oracle: exact ODE, full supervision → implementation gate
-    kot_anchor_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]   # 100% β anchored
-    seeded_models: [kot_oracle, kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, uniport]
-    models:        [kot_oracle, kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, uniport, moscot, scot, linear_ode]
-  clean:                        # v2a-clean: ODE true but non-trivial (dynamic α/κ, noise, partial β)
-    kot_anchor_indices: [0, 1]                            # ~20% β anchored
-    seeded_models: [kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, uniport, glue, totalvi]
-    models:        [kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, uniport, glue, totalvi, moscot, scot, linear_ode]
-  branch:                       # v2b-branch: geometrically ambiguous → dynamics vs pure-OT
-    kot_anchor_indices: [0, 1]                            # ~20% β anchored
-    seeded_models: [kot, kot_nodyn, uniport, glue, totalvi]
-    models:        [kot, kot_nodyn, uniport, glue, totalvi, moscot, scot, linear_ode]
+  oracle:
+    kot_anchor_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  clean:
+    kot_anchor_indices: [0, 1]
+  branch:
+    kot_anchor_indices: [0, 1]
 
-
-# ---------------------------------------------------------------
-# Active datasets — uncomment to run
-# ---------------------------------------------------------------
 datasets:
   synthetic_linked_ode:
-    # Shared settings. Per-stage data path, layers, cache_version, models and
-    # anchors come from `runner.py --stage/--scale` + stage_overrides above.
-    # A bare `python -m scr.training.runner` (no --stage) runs the oracle/mean gate.
+    # Stage-specific paths, cache version, and KOT feature layers are injected by
+    # runner.py from --stage / --scale.
     modality_pair: rna_protein
     preprocessing_cache_version: synthetic_linked_ode_v2a_oracle
     force_preprocess: true
@@ -156,37 +192,9 @@ datasets:
     rna_n_top_genes: 0
     rna_n_pcs: 11
     protein_n_pcs: 9
-    phi_spectral_norm: false         # φ settings matched across the KOT ablation family
+    phi_spectral_norm: false
     kot_alpha_min: 1.0e-3
     kot_alpha_max: 1.5
     use_anchor: true
     kot_anchor_betas: []
     seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
-    seeded_models: [kot_oracle]
-    models: [kot_oracle]
-
-  # pbmc:
-  #   modality_pair: rna_protein
-
-  # bmmc_cite:
-  #   modality_pair: rna_protein
-
-  # perturb:
-  #   modality_pair: rna_protein
-
-  # --- Secondary / exploratory (not in proposal) ---
-  # bmmc_multiome:
-  #   modality_pair: rna_atac
-  #   second_repr: X_lsi
-
-  # shareseq_skin:
-  #   modality_pair: rna_atac
-  #   second_repr: X_lsi
-
-  # shareseq_brain:
-  #   modality_pair: rna_atac
-  #   second_repr: X_lsi
-
-  # shareseq_lung:
-  #   modality_pair: rna_atac
-  #   second_repr: X_lsi

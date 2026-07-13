@@ -4,7 +4,7 @@ Runs scVelo for every dataset listed in VELOCITY_DATASETS.
 Skips datasets whose _scvelo_results.h5ad already exists.
 """
 from pathlib import Path
-from scr.data.velocity import run_dataset as run_velocity
+from src.data.velocity import run_dataset as run_velocity
 
 VELOCITY_DATASETS = [
     # "bmmc_cite",

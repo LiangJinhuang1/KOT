@@ -3,8 +3,8 @@ Stage 1 — Preprocessing
 Runs load_and_preprocess_cached for every dataset in config/datasets.yaml.
 Results are written to cache/preprocessed/ and reused by all later stages.
 """
-from scr.ultils.io import load_yaml
-from scr.data.preprocessing import load_and_preprocess_cached
+from src.utils.io import load_yaml
+from src.data.preprocessing import load_and_preprocess_cached
 
 datasets = load_yaml("config/datasets.yaml").get("datasets", {})
 

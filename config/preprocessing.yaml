@@ -41,7 +41,7 @@ datasets:
     protein_label: Protein
 
   synthetic:
-    # run: python -m scr.data.synthetic  (generates both files below)
+    # run: python -m src.data.synthetic  (generates both files below)
     rna_path: cache/velocity/synthetic/synthetic_scvelo_results.h5ad
     protein_path: cache/synthetic/protein.h5ad
     protein_label: Protein

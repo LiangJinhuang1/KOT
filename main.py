@@ -2,11 +2,11 @@ from pathlib import Path
 
 import anndata as ad
 
-from scr.data.synthetic import DEFAULT_SYNTHETIC_SEED, save_synthetic
-from scr.ultils.io import load_yaml
-from scr.data.velocity import run_dataset as run_velocity
-from scr.training.runner import run_training
-from scr.visualization.modalities import plot_modalities
+from src.data.synthetic import DEFAULT_SYNTHETIC_SEED, save_synthetic
+from src.utils.io import load_yaml
+from src.data.velocity import run_dataset as run_velocity
+from src.training.runner import run_training
+from src.visualization.modalities import plot_modalities
 
 TRAINING_CONFIG = Path("config/training.yaml")
 SYNTHETIC_RNA = Path("cache/velocity/synthetic/synthetic_scvelo_results.h5ad")

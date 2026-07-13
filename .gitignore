@@ -10,6 +10,7 @@ Datasets/
 # 文档与脚本（本地 / HPC）
 assistant.py
 *.md
+!config/README.md
 *.sh
 *.qmd
 *.ipynb

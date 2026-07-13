@@ -11,8 +11,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scr.data.projection import projection_matrix_from_adatas
-from scr.data.synthetic import PARAMS, build_protein_adata, generate_data
+from src.data.projection import projection_matrix_from_adatas
+from src.data.synthetic import PARAMS, build_protein_adata, generate_data
 
 
 def parse_args() -> argparse.Namespace:
