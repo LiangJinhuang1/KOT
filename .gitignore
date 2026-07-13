@@ -6,6 +6,7 @@ cache/
 logs/
 Datasets/
 /data/
+analysis/
 
 # 文档与脚本（本地 / HPC）
 assistant.py
