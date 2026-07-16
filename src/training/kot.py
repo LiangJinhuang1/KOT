@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch.func import jvp as torch_jvp
@@ -23,6 +24,7 @@ from src.losses.sinkhorn import sinkhorn_divergence
 from src.losses.jvp_physics import kinetics_loss
 from src.data.projection import projection_matrix_from_adatas
 from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
+from src.evaluation.trajectory_dtw import trajectory_dtw
 
 
 def to_tensor(arr: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -244,6 +246,39 @@ def compute_jvp_rhs_diagnostics(
     return out
 
 
+def resolve_pseudotime(rna_obs: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
+    """Pseudotime coordinate for a run.
+
+    Prefers ground-truth 'time' (synthetic); falls back to scVelo
+    'velocity_pseudotime' / 'latent_time' on real datasets. Returns (values, key),
+    or (None, None) when no temporal coordinate is available.
+    """
+    for key in ("time", "velocity_pseudotime", "latent_time"):
+        if key in rna_obs.columns:
+            return np.asarray(rna_obs[key].values, dtype=np.float64), key
+    return None, None
+
+
+def nearest_protein_match(
+    phi: torch.Tensor, protein: torch.Tensor, chunk: int = 4096,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-chunked nearest neighbour of each φ(r) in protein space.
+
+    Returns (argmin index, min distance) per query row without ever materialising
+    the full (n, m) distance matrix, so large-n datasets (e.g. bmmc_cite at ~90k
+    cells, where a dense n×n matrix is ~32 GB) do not OOM.
+    """
+    n = phi.shape[0]
+    idx = torch.empty(n, dtype=torch.long, device=phi.device)
+    vals = torch.empty(n, dtype=phi.dtype, device=phi.device)
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        mins = torch.cdist(phi[start:end], protein).min(dim=1)
+        idx[start:end] = mins.indices
+        vals[start:end] = mins.values
+    return idx, vals
+
+
 def compute_per_cell_diagnostics(
     model,
     R_t: torch.Tensor,
@@ -267,18 +302,25 @@ def compute_per_cell_diagnostics(
     cos_per_cell = F.cosine_similarity(dphi_dv, rhs, dim=1, eps=1e-8).detach().cpu().numpy()
     dyn_per_cell = residual.pow(2).sum(dim=1).detach().cpu().numpy()
 
-    # Nearest-neighbor matching in protein space.
-    dists = torch.cdist(phi_r, P_t)
-    align_per_cell = dists.min(dim=1).values.detach().cpu().numpy()
-    nn_idx = dists.argmin(dim=1).cpu().numpy()
+    # Nearest-neighbor matching in protein space (row-chunked to bound memory).
+    nn_idx_t, min_dists = nearest_protein_match(phi_r, P_t)
+    align_per_cell = min_dists.detach().cpu().numpy()
+    nn_idx = nn_idx_t.cpu().numpy()
 
-    t_true = np.asarray(rna_obs["time"].values, dtype=np.float64)
-    t_pred = t_true[nn_idx]
-    time_err = np.abs(t_true - t_pred)
+    pseudotime, _ = resolve_pseudotime(rna_obs)
+    if pseudotime is not None:
+        time_err = np.abs(pseudotime - pseudotime[nn_idx])
+    else:
+        time_err = np.full(len(nn_idx), np.nan)
 
-    state_true = np.asarray(rna_obs["state"].values)
-    state_pred = state_true[nn_idx]
-    branch_match = (state_true == state_pred).astype(int)
+    if "state" in rna_obs.columns:
+        state_true = np.asarray(rna_obs["state"].values)
+        state_pred = state_true[nn_idx]
+        branch_match = (state_true == state_pred).astype(int)
+    else:
+        state_true = np.array([], dtype="U1")
+        state_pred = np.array([], dtype="U1")
+        branch_match = np.full(len(nn_idx), -1)
 
     phi_np = phi_r.detach().cpu().numpy()
     p_np = P_t.cpu().numpy()
@@ -298,8 +340,6 @@ def compute_per_cell_diagnostics(
 
 def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
     """5-panel figure: FOSCTTM vs branch_match, time error, JVP/RHS cosine, dyn, align."""
-    import matplotlib.pyplot as plt
-
     foscttm      = per_cell["foscttm"]
     time_err     = per_cell["time_err"]
     branch_match = per_cell["branch_match"]
@@ -309,16 +349,20 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
 
     fig, axes = plt.subplots(1, 5, figsize=(25, 5))
 
-    # 1. FOSCTTM by branch match (correct vs incorrect)
-    correct = foscttm[branch_match == 1]
-    wrong   = foscttm[branch_match == 0]
-    axes[0].boxplot([correct, wrong], labels=["Match", "Mismatch"])
-    axes[0].set_ylabel("FOSCTTM")
-    axes[0].set_title(
-        f"FOSCTTM by branch match\n"
-        f"match={len(correct)} ({len(correct)/len(foscttm):.1%}), "
-        f"mismatch={len(wrong)}"
-    )
+    # 1. FOSCTTM by branch match (correct vs incorrect); needs ground-truth branch.
+    if (branch_match >= 0).any():
+        correct = foscttm[branch_match == 1]
+        wrong   = foscttm[branch_match == 0]
+        axes[0].boxplot([correct, wrong], labels=["Match", "Mismatch"])
+        axes[0].set_ylabel("FOSCTTM")
+        axes[0].set_title(
+            f"FOSCTTM by branch match\n"
+            f"match={len(correct)} ({len(correct)/len(foscttm):.1%}), "
+            f"mismatch={len(wrong)}"
+        )
+    else:
+        axes[0].text(0.5, 0.5, "no ground-truth branch", ha="center", va="center")
+        axes[0].set_title("FOSCTTM by branch match")
 
     # 2. FOSCTTM vs time abs error
     axes[1].scatter(foscttm, time_err, alpha=0.3, s=4)
@@ -368,34 +412,58 @@ def compute_full_diagnostics(
         beta = model.beta.detach()
 
     # Nearest-neighbor in protein space → predicted state/time of cell i is taken from the
-    # observed cell whose protein is closest to φ(r_i).
-    dists = torch.cdist(phi_all, P_t)             # (n, n)
-    nn_idx = dists.argmin(dim=1).cpu().numpy()
+    # observed cell whose protein is closest to φ(r_i). Row-chunked to bound memory.
+    nn_idx_t, _ = nearest_protein_match(phi_all, P_t)
+    nn_idx = nn_idx_t.cpu().numpy()
 
-    t_true = np.asarray(rna_obs["time"].values, dtype=np.float64)
-    t_pred = t_true[nn_idx]
-    time_mae = float(np.mean(np.abs(t_true - t_pred)))
-
-    rank_true = pd.Series(t_true).rank().to_numpy()
-    rank_pred = pd.Series(t_pred).rank().to_numpy()
-    if rank_true.std() < 1e-12 or rank_pred.std() < 1e-12:
-        time_spearman = float("nan")
+    # Ground-truth 'time' (synthetic) or scVelo pseudotime (real); None if neither.
+    pseudotime, _ = resolve_pseudotime(rna_obs)
+    if pseudotime is not None:
+        t_true = pseudotime
+        t_pred = t_true[nn_idx]
+        time_mae = float(np.mean(np.abs(t_true - t_pred)))
+        rank_true = pd.Series(t_true).rank().to_numpy()
+        rank_pred = pd.Series(t_pred).rank().to_numpy()
+        if rank_true.std() < 1e-12 or rank_pred.std() < 1e-12:
+            time_spearman = float("nan")
+        else:
+            time_spearman = float(np.corrcoef(rank_true, rank_pred)[0, 1])
     else:
-        time_spearman = float(np.corrcoef(rank_true, rank_pred)[0, 1])
+        t_true = None
+        time_mae = float("nan")
+        time_spearman = float("nan")
 
-    state_true = np.asarray(rna_obs["state"].values)
-    state_pred = state_true[nn_idx]
-    labels = sorted(set(state_true.tolist()))
-    label_to_idx = {label: i for i, label in enumerate(labels)}
-    conf_mat = np.zeros((len(labels), len(labels)), dtype=int)
-    for t_label, p_label in zip(state_true, state_pred):
-        conf_mat[label_to_idx[t_label], label_to_idx[p_label]] += 1
+    # Branch confusion needs ground-truth branch labels (synthetic only).
+    if "state" in rna_obs.columns:
+        state_true = np.asarray(rna_obs["state"].values)
+        state_pred = state_true[nn_idx]
+        labels = sorted(set(state_true.tolist()))
+        label_to_idx = {label: i for i, label in enumerate(labels)}
+        conf = np.zeros((len(labels), len(labels)), dtype=int)
+        for t_label, p_label in zip(state_true, state_pred):
+            conf[label_to_idx[t_label], label_to_idx[p_label]] += 1
+        conf_mat = conf.tolist()
+    else:
+        labels = []
+        conf_mat = []
 
     phi_np = phi_all.cpu().numpy()
     p_np = P_t.cpu().numpy()
     var_phi = float(phi_np.var(axis=0).mean())
     var_p   = float(p_np.var(axis=0).mean())
     phi_var_ratio = var_phi / max(var_p, 1e-12)
+
+    # Trajectory DTW in protein space. `temporal` orders φ(r) by the model's
+    # predicted pseudotime (t_pred) against observed protein ordered by true
+    # pseudotime — it scores recovery of the temporal ordering. `recon` orders
+    # both by true pseudotime — a warp-tolerant reconstruction score. Uses the
+    # resolved pseudotime, so it runs on real data too; NaN only if no time exists.
+    if t_true is not None:
+        traj_dtw_temporal = trajectory_dtw(phi_np, p_np, t_pred, t_true)
+        traj_dtw_recon    = trajectory_dtw(phi_np, p_np, t_true, t_true)
+    else:
+        traj_dtw_temporal = float("nan")
+        traj_dtw_recon    = float("nan")
 
     jvp = compute_jvp_rhs_diagnostics(model, R_t, V_t, S_t, subset=subset)
 
@@ -404,7 +472,9 @@ def compute_full_diagnostics(
     return {
         "time_mae":                  time_mae,
         "time_spearman":             time_spearman,
-        "branch_confusion_matrix":   conf_mat.tolist(),
+        "traj_dtw_temporal":         traj_dtw_temporal,
+        "traj_dtw_recon":            traj_dtw_recon,
+        "branch_confusion_matrix":   conf_mat,
         "branch_confusion_labels":   labels,
         "phi_variance":              var_phi,
         "p_variance":                var_p,
@@ -452,6 +522,12 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     lambda_reg   = float(cfg.get("lambda_reg", 1e-4))
     blur         = float(cfg.get("sinkhorn_reg", 0.1))
     seed         = int(cfg.get("seed",         42))
+    # Cap the alignment Sinkhorn to a random minibatch of this many cells each
+    # epoch. None → full-batch (exact; keeps small/synthetic runs unchanged). Set
+    # it for large real datasets whose n×n distance matrix would not fit in GPU.
+    sinkhorn_max_points = cfg.get("sinkhorn_max_points")
+    if sinkhorn_max_points is not None:
+        sinkhorn_max_points = int(sinkhorn_max_points)
     phi_dims     = list(cfg.get("phi_dims",    [1024, 512, 256]))
     kappa_dims   = list(cfg.get("kappa_dims",  [64, 32]))
     g_dims       = list(cfg.get("g_dims",      [256, 128]))
@@ -730,9 +806,17 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 state = "trainable" if g_train else "frozen"
                 print(f"[kot] g/alpha head is {state} at epoch {epoch}")
 
-        # --- Sinkhorn alignment step (full batch, differentiable through phi) ---
-        phi_all = model.phi(R_t)                        # (n, D_p)
-        loss_align = sinkhorn_divergence(phi_all, P_t, blur=blur)
+        # --- Sinkhorn alignment step (differentiable through phi) ---
+        # Full-batch when small (exact); a fresh random minibatch each epoch when
+        # sinkhorn_max_points caps it, so large real datasets (e.g. bmmc_cite at
+        # ~90k cells) stay within GPU memory instead of building an n×n matrix.
+        if sinkhorn_max_points is not None and n > sinkhorn_max_points:
+            align_idx = torch.randperm(n, device=device)[:sinkhorn_max_points]
+            phi_align = model.phi(R_t[align_idx])
+            loss_align = sinkhorn_divergence(phi_align, P_t[align_idx], blur=blur)
+        else:
+            phi_align = model.phi(R_t)                   # (n, D_p)
+            loss_align = sinkhorn_divergence(phi_align, P_t, blur=blur)
 
         # --- Kinetics step (micro-batches) ---
         loss_dyn_total = torch.tensor(0.0, device=device)
@@ -934,7 +1018,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     print(f"  alpha min/max:      {diagnostics['alpha_min']:.4f} / {diagnostics['alpha_max']:.4f}")
     print(f"  beta mean/std:      {diagnostics['beta_mean']:.4f} / {diagnostics['beta_std']:.4f}")
     print(f"  branch labels:      {diagnostics['branch_confusion_labels']}")
-    print(f"  branch confusion:")
+    print("  branch confusion:")
     for row, label in zip(diagnostics["branch_confusion_matrix"], diagnostics["branch_confusion_labels"]):
         print(f"    {label:>12s}: {row}")
     print("anchor_loss:", loss_anchor_final.item())
@@ -991,6 +1075,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 "mean_foscttm":       mean_f,
                 "time_mae":           d["time_mae"],
                 "time_spearman":      d["time_spearman"],
+                "traj_dtw_temporal":  d["traj_dtw_temporal"],
+                "traj_dtw_recon":     d["traj_dtw_recon"],
                 "phi_variance_ratio": d["phi_variance_ratio"],
                 "jvp_rhs_cos":        d["jvp_rhs_cos"],
                 "jvp_norm":           d["jvp_norm"],

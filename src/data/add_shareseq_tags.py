@@ -9,7 +9,6 @@ Usage:
   python src/data/add_shareseq_tags.py input.bam output.bam
 """
 import argparse
-import sys
 import pysam
 
 

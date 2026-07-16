@@ -27,6 +27,21 @@ STRIP_PATTERNS = [
 ]
 
 
+# CITE-seq ADT markers whose panel name differs from the encoding gene symbol
+# (e.g. CD16 → FCGR3A). Used as a fallback when a protein name does not directly
+# match a gene. Keys and values are compared through normalize_name, so panel
+# suffixes and case are handled uniformly. Markers with no single encoding gene
+# (isotype controls, glycan epitopes like CD15) are intentionally absent.
+CD_MARKER_TO_GENE = {
+    "CD3": "CD3E", "CD8": "CD8A", "CD11a": "ITGAL", "CD11b": "ITGAM",
+    "CD11c": "ITGAX", "CD16": "FCGR3A", "CD20": "MS4A1", "CD25": "IL2RA",
+    "CD45": "PTPRC", "CD45RA": "PTPRC", "CD45RO": "PTPRC", "CD56": "NCAM1",
+    "CD62L": "SELL", "CD127": "IL7R", "CD137": "TNFRSF9", "CD197": "CCR7",
+    "CD278": "ICOS", "CD279": "PDCD1", "CD335": "NCR1", "PD-1": "PDCD1",
+    "HLA-DR": "HLA-DRA",
+}
+
+
 def normalize_name(name: str) -> str:
     name = name.strip()
     for pat in STRIP_PATTERNS:
@@ -49,10 +64,13 @@ def build_projection_matrix(
     S = np.zeros((D_p, D_r), dtype=np.float32)
 
     gene_index = {normalize_name(g): i for i, g in enumerate(rna_var_names)}
+    alias_index = {normalize_name(m): normalize_name(g) for m, g in CD_MARKER_TO_GENE.items()}
 
     matched = 0
     for j, prot in enumerate(protein_var_names):
         key = normalize_name(prot)
+        if key not in gene_index and key in alias_index:
+            key = alias_index[key]   # remap CITE marker name → encoding gene symbol
         if key in gene_index:
             i = gene_index[key]
             w = weights.get(prot, 1.0) if weights else 1.0

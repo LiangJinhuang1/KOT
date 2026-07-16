@@ -161,8 +161,8 @@ class SCOTv2(object):
         for i in range(n_datasets):
             graph_data = (
                 self.graphs[i]
-                + self.graphs[i].T.multiply(self.graphs[i].T > self.graphs[i])
-                - self.graphs[i].multiply(self.graphs[i].T > self.graphs[i])
+                + self.graphs[i].T.multiply(self.graphs[i] < self.graphs[i].T)
+                - self.graphs[i].multiply(self.graphs[i] < self.graphs[i].T)
             )
             W = np.array(graph_data.todense())
             W[W > 0] = 1.0 / W[W > 0]

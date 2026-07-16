@@ -449,6 +449,15 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
             if key in diagnostics:
                 f.write(f"{key}: {diagnostics[key]}\n")
 
+    # FOSCTTM plots are modality-agnostic (distribution degrades to a plain
+    # histogram without ground-truth branches), so they run on real data too.
+    plot_foscttm_distribution(
+        output_dir / "foscttm.csv", rna_adata.obs, output_dir, model_name
+    )
+    plot_foscttm_sorted(output_dir / "foscttm.csv", output_dir, model_name)
+
+    # Coembedding (colours by state/time) and coupling (needs time) require the
+    # synthetic ground-truth columns.
     has_ground_truth = {"state", "time"}.issubset(rna_adata.obs.columns)
     if has_ground_truth:
         viz_x, viz_y = coembedding_input_matrices(x, y, rna_adata, second_adata, run_cfg)
@@ -458,10 +467,6 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
             second_adata=second_adata,
             **coembedding_plot_kwargs(run_cfg),
         )
-        plot_foscttm_distribution(
-            output_dir / "foscttm.csv", rna_adata.obs, output_dir, model_name
-        )
-        plot_foscttm_sorted(output_dir / "foscttm.csv", output_dir, model_name)
         if coupling is not None:
             plot_coupling(coupling, rna_adata.obs["time"].values, output_dir, model_name)
 
@@ -474,11 +479,20 @@ def run_training(
     scale: str | None = None,
     run_dir: Path | None = None,
     models: str | None = None,
+    datasets_filter: str | None = None,
+    set_overrides: dict | None = None,
 ) -> None:
     train_cfg = load_yaml(config_path)
     datasets = load_yaml(DATASETS_CONFIG).get("datasets", {})
     defaults = train_cfg.get("defaults", {})
     stage_overrides_cfg = train_cfg.get("stage_overrides", {})
+    cli_overrides = dict(set_overrides or {})
+
+    # --datasets restricts the run to a comma-separated subset of the config's
+    # `datasets:` section (which otherwise trains every dataset listed there).
+    selected_datasets = (
+        set(name.strip() for name in datasets_filter.split(",")) if datasets_filter else None
+    )
 
     # Resolve which models to run: --models (group name or comma-list) if given,
     # else the config's default_models group. Overrides any per-dataset model list.
@@ -511,12 +525,16 @@ def run_training(
     print(f"[runner] Output root:   {run_root}{'  (resume)' if run_dir is not None else ''}")
     print(f"[runner] Config saved:  {config_snapshot}")
     print(f"[runner] Log file:      {log_path}")
+    if cli_overrides:
+        print(f"[runner] --set overrides: {cli_overrides}")
 
     trained_models = []
     result_seeded_models = set()
     trained_datasets = []
 
     for name, overrides in train_cfg.get("datasets", {}).items():
+        if selected_datasets is not None and name not in selected_datasets:
+            continue
         if name not in datasets:
             raise ValueError(f"Dataset '{name}' is not defined in {DATASETS_CONFIG}.")
         if name not in trained_datasets:
@@ -554,8 +572,11 @@ def run_training(
             use_run_seed = is_multi_seed and model_name in seeded
             seeds = multi_seeds if model_name in seeded else default_seeds
             for seed in seeds:
+                # Order: dataset defaults → --set → per-model overrides (kot_nodyn
+                # still forces lambda_dyn=0 even if --set lambda_dyn=N).
                 run_cfg = {
                     **base_cfg,
+                    **cli_overrides,
                     "model": model_name,
                     "seed": seed,
                     **MODEL_OVERRIDES.get(model_name, {}),
@@ -576,6 +597,40 @@ def run_training(
         )
 
 
+def parse_set_value(raw: str):
+    """Parse a --set value: bool / int / float / else string."""
+    key = raw.strip()
+    low = key.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "none"):
+        return None
+    try:
+        return int(key)
+    except ValueError:
+        pass
+    try:
+        return float(key)
+    except ValueError:
+        return key
+
+
+def parse_set_overrides(items: list[str] | None) -> dict:
+    """Parse repeated --set key=value into a dict (last wins on duplicate keys)."""
+    if not items:
+        return {}
+    out = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"--set expects key=value, got: {item!r}")
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--set missing key in: {item!r}")
+        out[key] = parse_set_value(raw)
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run KOT / baseline training from config.")
     parser.add_argument("--config", type=Path, default=TRAINING_CONFIG,
@@ -592,10 +647,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, default=None,
                         help="Resume into an existing run_* dir: only run (model, seed) "
                              "outputs that are missing, instead of a new timestamped dir.")
+    parser.add_argument("--datasets", type=str, default=None,
+                        help="Comma-separated subset of the config's datasets to run "
+                             "(e.g. bmmc_cite). Defaults to every dataset in the config.")
+    parser.add_argument(
+        "--set",
+        dest="set_overrides",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Override a config key (repeatable), e.g. --set lambda_dyn=10. "
+             "Applied after dataset defaults; per-model overrides (e.g. kot_nodyn "
+             "forces lambda_dyn=0) still win.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_training(config_path=args.config, stage=args.stage, scale=args.scale,
-                 run_dir=args.run_dir, models=args.models)
+    run_training(
+        config_path=args.config,
+        stage=args.stage,
+        scale=args.scale,
+        run_dir=args.run_dir,
+        models=args.models,
+        datasets_filter=args.datasets,
+        set_overrides=parse_set_overrides(args.set_overrides),
+    )

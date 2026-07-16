@@ -70,16 +70,33 @@ MODEL_OVERRIDES = {
 # Loading per-run data + reproducing model architecture
 # ---------------------------------------------------------------------------
 
+def config_path_for_run(run_folder: Path) -> Path:
+    """Config snapshot for a run: training.yaml, or the latest training_resume_*.yaml.
+
+    Resumed runs carry only training_resume_<timestamp>.yaml (identical dataset
+    config), so fall back to the most recent resume snapshot when the original
+    training.yaml is absent.
+    """
+    primary = run_folder / "training.yaml"
+    if primary.exists():
+        return primary
+    resumes = sorted(run_folder.glob("training_resume_*.yaml"))
+    if resumes:
+        return resumes[-1]
+    raise FileNotFoundError(f"No training.yaml or training_resume_*.yaml in {run_folder}")
+
+
 def load_dataset_for_run(run_folder: Path):
     """Load preprocessed RNA + protein AnnData using this run's config snapshot."""
-    cfg = load_yaml(run_folder / "training.yaml")
+    cfg_path = config_path_for_run(run_folder)
+    cfg = load_yaml(cfg_path)
     datasets_meta = load_yaml(DATASETS_CONFIG).get("datasets", {})
 
     defaults = cfg.get("defaults", {})
     datasets_section = cfg.get("datasets", {})
 
     if not datasets_section:
-        raise ValueError(f"{run_folder}/training.yaml has no datasets section")
+        raise ValueError(f"{cfg_path} has no datasets section")
 
     name = next(iter(datasets_section.keys()))
     overrides = datasets_section[name] or {}
@@ -273,6 +290,8 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
                     "mean_foscttm":       diagnostics["mean_foscttm"],
                     "time_mae":           diagnostics["time_mae"],
                     "time_spearman":      diagnostics["time_spearman"],
+                    "traj_dtw_temporal":  diagnostics["traj_dtw_temporal"],
+                    "traj_dtw_recon":     diagnostics["traj_dtw_recon"],
                     "phi_variance_ratio": diagnostics["phi_variance_ratio"],
                     "jvp_rhs_cos":        diagnostics["jvp_rhs_cos"],
                     "jvp_norm":           diagnostics["jvp_norm"],
@@ -355,7 +374,7 @@ def main():
     for run_folder in run_folders:
         try:
             rows = evaluate_run(run_folder, device, args.save_percell)
-        except Exception as e:
+        except Exception:
             print(f"\n[{run_folder.name}] FAILED:")
             traceback.print_exc()
             continue

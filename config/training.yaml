@@ -198,3 +198,31 @@ datasets:
     use_anchor: true
     kot_anchor_betas: []
     seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
+
+  # Real CITE-seq (paired RNA + protein). No ground-truth time/state: KOT
+  # diagnostics fall back to scVelo velocity_pseudotime and skip branch metrics.
+  # Runner trains every dataset listed here, so select one with --datasets.
+  bmmc_cite:
+    modality_pair: rna_protein
+    kot_use_feature_space: true    # genes → ADT: where S and the ODE are meaningful
+    kot_rna_layer: Ms              # RNA state in the SAME space as scVelo velocity
+    velocity_layer: velocity       # dMs/dt → consistent with kot_rna_layer
+    kot_protein_layer: null        # protein_adata.X (CLR-normalized ADT)
+    kot_use_explicit_links: true   # NOTE: only 2/134 ADT map to HVG genes → S near-empty
+    use_anchor: false              # no known β on real data → don't pin it
+    lambda_prior: 0.0
+    kot_alpha_max: 3.0             # keep α bounded (null / unbounded hurt PBMC: 0.50±0.18 vs 0.27)
+    sinkhorn_max_points: 8192      # ~90k cells: minibatch the align Sinkhorn (full n×n OOMs)
+    seeds: [42, 123, 2026]
+
+  pbmc:
+    modality_pair: rna_protein
+    kot_use_feature_space: true
+    kot_rna_layer: Ms
+    velocity_layer: velocity
+    kot_protein_layer: null
+    kot_use_explicit_links: true   # NOTE: only 9/32 ADT map to HVG genes → S mostly empty
+    use_anchor: false
+    lambda_prior: 0.0
+    kot_alpha_max: 3.0             # same bound as successful PBMC run_20260715_190847
+    seeds: [42, 123, 2026]

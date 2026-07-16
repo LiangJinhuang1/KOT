@@ -108,7 +108,6 @@ def plot_coembedding(
     tsne_perplexity: float = 30.0,
 ):
     save_dir = Path(save_dir)
-    n = len(aligned_rna)
     reduce_kwargs = dict(
         random_state=random_state,
         umap_neighbors=umap_neighbors,

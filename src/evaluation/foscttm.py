@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import anndata as ad
+import torch
 from pathlib import Path
 
 PREDICTIONS_DIR = Path("data/predictions")
@@ -10,21 +11,25 @@ def calc_frac_idx(x1_mat: np.ndarray, x2_mat: np.ndarray, batch_size: int = 1000
     """
     Fraction of samples closer than the true match, computed in batches.
 
-    Complexity: O(n * batch_size) memory, O(n²) time — no Python loop over cells.
-    For n=5000: fast. For n=90000: runs in batches to stay within memory.
+    Runs on GPU when available (falls back to CPU) — identical result to the
+    dense NumPy version, but the O(n²) distance work is the bottleneck at large
+    n (e.g. 90k cells), so the device matters. Row-batched to bound memory.
     """
-    n = x1_mat.shape[0]
-    fracs = np.empty(n, dtype=np.float32)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x1 = torch.as_tensor(np.asarray(x1_mat), dtype=torch.float32, device=device)
+    x2 = torch.as_tensor(np.asarray(x2_mat), dtype=torch.float32, device=device)
+    n = x1.shape[0]
+    fracs = torch.empty(n, dtype=torch.float32, device=device)
 
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-        # (batch, n) squared distances from each query row to all x2 rows
-        diff = x1_mat[start:end, None, :] - x2_mat[None, :, :]   # (batch, n, d)
-        dists = np.sqrt((diff ** 2).sum(axis=2))                   # (batch, n)
-        true_dists = dists[np.arange(end - start), np.arange(start, end)]  # (batch,)
-        fracs[start:end] = (dists < true_dists[:, None]).sum(axis=1) / (n - 1)
+        dists = torch.cdist(x1[start:end], x2)                          # (batch, n)
+        rows = torch.arange(end - start, device=device)
+        cols = torch.arange(start, end, device=device)
+        true_dists = dists[rows, cols]                                  # (batch,)
+        fracs[start:end] = (dists < true_dists[:, None]).sum(dim=1).float() / (n - 1)
 
-    return fracs.tolist()
+    return fracs.cpu().tolist()
 
 
 def calc_domainAveraged_FOSCTTM(x1_mat: np.ndarray, x2_mat: np.ndarray) -> list[float]:

@@ -65,17 +65,22 @@ def load_rna_from_h5ad(path, raw_layer=None):
 def load_protein_from_h5ad(path, label="ADT"):
     print(f"Loading protein ({label}) from: {path}")
     adata = sc.read_h5ad(path)
-    adata.var_names_make_unique()
+    # Subset to the protein features BEFORE de-duplicating names: in a joint
+    # RNA+ADT object an ADT marker (e.g. CD86) collides with the gene of the same
+    # name, so make_unique would rename it CD86-1 and break gene→protein matching.
     mask = adata.var["feature_types"] == label
-    return adata[:, mask].copy()
+    protein = adata[:, mask].copy()
+    protein.var_names_make_unique()
+    return protein
 
 
 def load_protein_from_10x_h5(path, label="Antibody Capture"):
     print(f"Loading protein ({label}) from 10x h5: {path}")
     adata = sc.read_10x_h5(path, gex_only=False)
-    adata.var_names_make_unique()
     mask = adata.var["feature_types"] == label
-    return adata[:, mask].copy()
+    protein = adata[:, mask].copy()
+    protein.var_names_make_unique()
+    return protein
 
 
 def load_atac_from_shareseq(path):
@@ -91,9 +96,10 @@ def load_atac_from_shareseq(path):
 def load_atac_from_h5ad(path, label="ATAC"):
     print(f"Loading ATAC ({label}) from: {path}")
     adata = sc.read_h5ad(path)
-    adata.var_names_make_unique()
     mask = adata.var["feature_types"] == label
-    return adata[:, mask].copy()
+    atac = adata[:, mask].copy()
+    atac.var_names_make_unique()
+    return atac
 
 
 def load_protein_from_obsm(rna_adata, obsm_key="protein_counts"):

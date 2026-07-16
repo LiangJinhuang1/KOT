@@ -165,13 +165,6 @@ def _active_dataset_block(datasets: dict) -> dict:
     return {}
 
 
-def iter_dataset_seed_dirs(model_dir: Path):
-    """Yield (dataset_name, seed_dir) for every seed folder under a model run."""
-    for dataset, output_dir, _ in iter_model_outputs(model_dir):
-        if output_dir is not None and output_dir.name.startswith("seed_"):
-            yield dataset, output_dir
-
-
 def iter_model_outputs(model_dir: Path):
     """
     Yield (dataset, output_dir, summary_path) for each finished model output.

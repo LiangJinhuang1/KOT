@@ -87,12 +87,15 @@ class PhiTheta(nn.Module):
         return self.net(r)
 
 
-class KappaPsi(nn.Module):
-    """RNA → scalar kinetic time-scale κ constrained to a positive interval."""
+class BoundedPositiveMLP(nn.Module):
+    """RNA → positive output in [min_value, max_value], or unbounded above (softplus)
+    when max_value is None. Used for the kinetic time-scale κ (out_dim=1) and the
+    per-protein translation efficiency α (out_dim=D_p)."""
 
     def __init__(
         self,
         d_rna: int,
+        out_dim: int,
         hidden_dims: list[int],
         activation: str = "gelu",
         init_method: str = "orthogonal",
@@ -102,41 +105,7 @@ class KappaPsi(nn.Module):
         super().__init__()
         self.net = build_mlp(
             d_rna,
-            1,
-            hidden_dims,
-            init_gain=0.1,
-            activation=activation,
-            init_method=init_method,
-        )
-        self.softplus = nn.Softplus()
-        self.min_value = float(min_value)
-        self.max_value = float(max_value) if max_value is not None else None
-
-    def forward(self, r: torch.Tensor) -> torch.Tensor:
-        raw = self.net(r)
-        if self.max_value is None:
-            return self.softplus(raw) + self.min_value
-        span = self.max_value - self.min_value
-        return self.min_value + span * torch.sigmoid(raw)
-
-
-class GOmega(nn.Module):
-    """RNA → per-protein translation efficiency α constrained to a positive interval."""
-
-    def __init__(
-        self,
-        d_rna: int,
-        d_protein: int,
-        hidden_dims: list[int],
-        activation: str = "gelu",
-        init_method: str = "orthogonal",
-        min_value: float = 1e-6,
-        max_value: float | None = None,
-    ):
-        super().__init__()
-        self.net = build_mlp(
-            d_rna,
-            d_protein,
+            out_dim,
             hidden_dims,
             init_gain=0.1,
             activation=activation,
@@ -193,15 +162,16 @@ class KOTModel(nn.Module):
             init_method=init_method,
             use_spectral_norm=phi_spectral_norm,
         )
-        self.kappa = KappaPsi(
+        self.kappa = BoundedPositiveMLP(
             d_rna,
+            1,
             list(kappa_dims),
             activation=activation,
             init_method=init_method,
             min_value=kappa_min,
             max_value=kappa_max,
         )
-        self.g     = GOmega(
+        self.g     = BoundedPositiveMLP(
             d_rna,
             d_protein,
             list(g_dims),
