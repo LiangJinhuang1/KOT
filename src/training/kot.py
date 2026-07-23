@@ -19,10 +19,13 @@ import torch.nn.functional as F
 from torch.func import jvp as torch_jvp
 from torch.utils.data import TensorDataset, DataLoader
 
+from src.utils.arrays import to_dense
 from src.models.KOT import KOTModel
 from src.losses.sinkhorn import sinkhorn_divergence
 from src.losses.jvp_physics import kinetics_loss
 from src.data.projection import projection_matrix_from_adatas
+from src.data.adt_gene_map import load_mapping_csv
+from src.data.beta_anchor import resolve_beta_anchors
 from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
 from src.evaluation.trajectory_dtw import trajectory_dtw
 
@@ -39,19 +42,13 @@ def build_kot_optimiser(model, lr: float, n_epochs: int, use_phases: bool):
     return optimiser, scheduler
 
 
-def dense_array(matrix) -> np.ndarray:
-    if hasattr(matrix, "toarray"):
-        matrix = matrix.toarray()
-    return np.asarray(matrix, dtype=np.float32)
-
-
 def matrix_from_adata(adata, layer_key: str | None, label: str) -> np.ndarray:
     if layer_key in (None, "", "X"):
-        return dense_array(adata.X)
+        return to_dense(adata.X, np.float32)
     if layer_key not in adata.layers:
         available = list(adata.layers.keys())
         raise ValueError(f"KOT {label} layer '{layer_key}' not found. Available layers: {available}")
-    return dense_array(adata.layers[layer_key])
+    return to_dense(adata.layers[layer_key], np.float32)
 
 
 def array_debug_stats(values: np.ndarray) -> dict:
@@ -104,26 +101,26 @@ def kot_data_debug_summary(
 
 
 def print_kot_data_debug(summary: dict) -> None:
-    print("---- kot data debug ----")
+    print("[kot] data debug:")
     print(
-        "  layers:        "
+        "[kot]   layers:   "
         f"rna={summary['rna_layer']}  protein={summary['protein_layer']}  "
         f"velocity={summary['velocity_layer']}"
     )
     print(
-        "  shapes:        "
+        "[kot]   shapes:   "
         f"rna={summary['rna_shape']}  protein={summary['protein_shape']}  "
         f"velocity={summary['velocity_shape']}"
     )
     print(
-        "  S matrix:      "
+        "[kot]   S matrix: "
         f"shape={summary['s_matrix_shape']}  nonzero={summary['s_matrix_nonzero']}  "
         f"links={summary['link_count']}"
     )
     synthetic_meta = summary["synthetic_linked_ode"]
     if synthetic_meta:
         print(
-            "  synthetic:     "
+            "[kot]   synthetic: "
             f"stage={synthetic_meta.get('stage')}  "
             f"distractors={synthetic_meta.get('n_distractor_rna_genes')}  "
             f"native_rna={synthetic_meta.get('native_rna_layer')}  "
@@ -133,7 +130,7 @@ def print_kot_data_debug(summary: dict) -> None:
         stats = summary[key]
         if stats is not None:
             print(
-                f"  {key:21s}"
+                f"[kot]   {key:21s}"
                 f"min={stats['min']:.6g}  max={stats['max']:.6g}  "
                 f"mean={stats['mean']:.6g}  std={stats['std']:.6g}"
             )
@@ -205,11 +202,13 @@ def compute_jvp_rhs_diagnostics(
     V_t: torch.Tensor,
     S_t: torch.Tensor,
     subset: int = 512,
+    mask: torch.Tensor | None = None,
 ) -> dict:
     """JVP/RHS cosine + norms and kappa stats on a small subset.
 
     JVP requires autograd to be enabled (forward-mode AD). Do not call inside
-    torch.no_grad().
+    torch.no_grad(). When mask is given, the cosine/norms are over the mapped
+    (kinetics) proteins only, so unmapped proteins do not dilute the physics fit.
     """
     was_training = model.training
     model.eval()
@@ -225,6 +224,9 @@ def compute_jvp_rhs_diagnostics(
     beta = model.beta
     rhs = kappa * (alpha * Sr - beta * phi_r)
 
+    if mask is not None:
+        dphi_dv = dphi_dv * mask
+        rhs = rhs * mask
     cos = F.cosine_similarity(dphi_dv, rhs, dim=1, eps=1e-8)
 
     out = {
@@ -286,6 +288,7 @@ def compute_per_cell_diagnostics(
     P_t: torch.Tensor,
     S_t: torch.Tensor,
     rna_obs: pd.DataFrame,
+    mask: torch.Tensor | None = None,
 ) -> dict:
     """Per-cell arrays for FOSCTTM-correlated diagnostic plots."""
     model.eval()
@@ -297,6 +300,9 @@ def compute_per_cell_diagnostics(
     Sr = (S_t @ R_t.T).T
     beta = model.beta
     rhs = kappa * (alpha * Sr - beta * phi_r)
+    if mask is not None:
+        dphi_dv = dphi_dv * mask
+        rhs = rhs * mask
     residual = dphi_dv - rhs
 
     cos_per_cell = F.cosine_similarity(dphi_dv, rhs, dim=1, eps=1e-8).detach().cpu().numpy()
@@ -403,6 +409,7 @@ def compute_full_diagnostics(
     S_t: torch.Tensor,
     rna_obs: pd.DataFrame,
     subset: int = 1024,
+    mask: torch.Tensor | None = None,
 ) -> dict:
     """End-of-training diagnostics: time, branch confusion, variance, plus JVP stats."""
     model.eval()
@@ -465,7 +472,7 @@ def compute_full_diagnostics(
         traj_dtw_temporal = float("nan")
         traj_dtw_recon    = float("nan")
 
-    jvp = compute_jvp_rhs_diagnostics(model, R_t, V_t, S_t, subset=subset)
+    jvp = compute_jvp_rhs_diagnostics(model, R_t, V_t, S_t, subset=subset, mask=mask)
 
     beta_np = beta.cpu().numpy()
 
@@ -539,6 +546,18 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     anchor_beta  = float(cfg.get("kot_anchor_beta",  0.5))
     anchor_indices = list(cfg.get("kot_anchor_indices", []))
     anchor_betas = list(cfg.get("kot_anchor_betas", []))
+    # β-anchor from measured half-lives: overrides the manual indices/betas. Betas
+    # are rescaled to the model's β range (relative degradation pattern).
+    anchor_source = "manual config (kot_anchor_indices)"
+    beta_anchor_csv = cfg.get("beta_anchor_csv")
+    if beta_anchor_csv and Path(beta_anchor_csv).exists():
+        idx, betas, _ = resolve_beta_anchors(
+            beta_anchor_csv, list(second_adata.var_names),
+            target_mean_beta=float(cfg.get("beta_anchor_target", 0.5)),
+        )
+        if idx:
+            anchor_indices, anchor_betas = idx, betas
+            anchor_source = f"paper half-lives {beta_anchor_csv} (rescaled to mean {cfg.get('beta_anchor_target', 0.5)})"
     lambda_prior = float(cfg.get("lambda_prior",     1.0))
     fixed_kappa_value = cfg.get("kot_fixed_kappa")
     fixed_alpha_value = cfg.get("kot_fixed_alpha")
@@ -591,12 +610,24 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
     # Gene→protein S matrix. In feature-space mode this is the paper's S.
     # In representation mode it is projected into the same PCA coordinates as phi.
-    S_np = projection_matrix_from_adatas(
+    mapping_csv = cfg.get("adt_mapping_csv")
+    if mapping_csv and Path(mapping_csv).exists():
+        alias_map = load_mapping_csv(Path(mapping_csv))
+        print(f"[kot] ADT→gene mapping from CSV: {mapping_csv} ({len(alias_map)} links)")
+    else:
+        alias_map = None
+        if mapping_csv:
+            print(f"[kot] adt_mapping_csv '{mapping_csv}' not found — resolving live via HGNC.")
+    S_np, kin_mask = projection_matrix_from_adatas(
         rna_adata,
         second_adata,
         use_mean_expr=False,
         use_explicit_links=use_explicit_links,
+        alias_map=alias_map,
     )
+    # Kinetics mask over the protein axis: only in feature space is each protein a
+    # row of φ; in representation mode the protein-PCA axis mixes proteins, so no
+    # per-protein masking (all components participate).
     if use_feature_space:
         S_model = S_np.copy()
     elif "PCs" in rna_adata.varm:
@@ -615,7 +646,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     velocity_candidates = [velocity_layer] if velocity_layer else ["true_velocity", "velocity"]
     for key in velocity_candidates:
         if key in rna_adata.layers:
-            V_raw = np.nan_to_num(dense_array(rna_adata.layers[key]), nan=0.0)
+            V_raw = np.nan_to_num(to_dense(rna_adata.layers[key], np.float32), nan=0.0)
             selected_velocity_layer = key
             print(f"[kot] Using velocity layer: '{key}'")
             break
@@ -659,6 +690,34 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     V_t    = to_tensor(V,     device)   # (n, D_r)
     S_t    = to_tensor(S_model, device)   # (D_p, D_r)
     conf_t = to_tensor(conf,  device)   # (n,)
+    # Optionally drop proteins whose linked gene has unusable RNA velocity: those
+    # add noise to the JVP but no real dynamics signal. A protein stays active only
+    # if at least one of its linked genes is a scVelo velocity_gene.
+    if bool(cfg.get("kot_kinetics_require_velocity_gene", False)) and "velocity_genes" in rna_adata.var:
+        v_genes = np.asarray(rna_adata.var["velocity_genes"].values, dtype=bool)   # (D_r,)
+        has_stable = (S_np.astype(bool) & v_genes[None, :]).any(axis=1)
+        dropped = int((kin_mask & ~has_stable).sum())
+        kin_mask = kin_mask & has_stable
+        print(f"[kot] velocity-gene filter: dropped {dropped} proteins with no stable-velocity gene")
+
+    # Kinetics mask (default on in feature space): only linked proteins enter L_dyn.
+    # Set kot_use_kinetics_mask=false to restore the pre-mask residual over all D_p.
+    use_kinetics_mask = bool(cfg.get("kot_use_kinetics_mask", True)) and use_feature_space
+    if use_kinetics_mask:
+        mask_t = to_tensor(kin_mask.astype(np.float32), device)   # (D_p,)
+    else:
+        mask_t = None
+    print(f"[kot] kinetics_mask={'on' if mask_t is not None else 'off'} "
+          f"| active={int(kin_mask.sum()) if use_feature_space else D_p}/{D_p}")
+    # Optional per-protein normalisation (off by default). The scale is floored at
+    # the median std so it only DOWN-weights high-abundance proteins; without the
+    # floor, near-constant proteins get a tiny std and their residual explodes.
+    if bool(cfg.get("kot_kinetics_normalize", False)):
+        std = P_t.std(dim=0)
+        protein_scale = std.clamp(min=float(std.median()) + 1e-6)   # (D_p,)
+    else:
+        protein_scale = None
+    print(f"[kot] kinetics_normalize={'on' if protein_scale is not None else 'off'}")
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -719,24 +778,26 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             anchor_target = torch.tensor(anchor_betas, dtype=torch.float32, device=device)
         else:
             anchor_target = torch.full((anchor_idx_t.numel(),), anchor_beta, device=device)
-        print(f"[kot] Anchor prior enabled for {anchor_idx_t.numel()} proteins.")
 
-    print("model:", model_name)
-    print("use_anchor:", use_anchor)
-    print("anchor_indices:", anchor_indices)
-    print("anchor_target:", anchor_target.cpu().numpy() if anchor_target is not None else None)
-    print("lambda_prior:", lambda_prior)
-    print("fixed_kappa:", fixed_kappa_value)
-    print("fixed_alpha:", fixed_alpha_value)
-    print("fixed_beta:", fixed_beta_value)
-    print("kappa_bounds:", (kappa_min, kappa_max))
-    print("alpha_bounds:", (alpha_min, alpha_max))
-    print("lambda_kappa_prior:", lambda_kappa_prior)
-    print("kappa_prior_target:", kappa_prior_target)
-    print("g_freeze_epochs:", g_freeze_epochs)
-    print("phi_spectral_norm:", phi_spectral_norm)
-    print("initial beta:", initial_beta)
-    print(f"[kot] dyn_warmup_epochs={dyn_warmup_epochs} | early_stopping_patience={early_stopping_patience}")
+    print(f"[kot] model: {model_name}")
+    print(f"[kot] bounds: κ∈{(kappa_min, kappa_max)}  α∈{(alpha_min, alpha_max)}")
+    print(f"[kot] κ-prior: target={kappa_prior_target} λ_κ={lambda_kappa_prior}  |  "
+          f"φ_spectral_norm={phi_spectral_norm}  g_freeze={g_freeze_epochs}  "
+          f"dyn_warmup={dyn_warmup_epochs}  early_stop_patience={early_stopping_patience}")
+    if any(v is not None for v in (fixed_kappa_value, fixed_alpha_value, fixed_beta_value)):
+        print(f"[kot] fixed params: κ={fixed_kappa_value}  α={fixed_alpha_value}  β={fixed_beta_value}")
+    print(f"[kot] use_anchor: {use_anchor}")
+    if use_anchor:
+        protein_names = list(second_adata.var_names)
+        targets = anchor_target.cpu().numpy()
+        print(f"[kot]   anchor source: {anchor_source}")
+        print(f"[kot]   anchoring {len(anchor_indices)} proteins toward β target "
+              f"(mean {float(targets.mean()):.3f}, λ_prior={lambda_prior}):")
+        for j, b in zip(anchor_indices, targets):
+            print(f"[kot]     [{j:>3}] {protein_names[j]:<18} β*={b:.4f}")
+    else:
+        print(f"[kot]   anchor disabled (λ_prior={lambda_prior})")
+    print(f"[kot] initial β: {initial_beta}")
 
     loss_history = {
         "epoch": [], "align": [], "dyn": [], "anchor": [], "kappa_prior": [], "reg": [], "total": [],
@@ -823,7 +884,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         for r_b, v_b, c_b, _ in loader:
             loss_dyn_total = loss_dyn_total + kinetics_loss(
                 model.phi, model.kappa, model.g,
-                r_b, v_b, S_t, model.beta, c_b,
+                r_b, v_b, S_t, model.beta, c_b, mask=mask_t, scale=protein_scale,
             )
         loss_dyn_total = loss_dyn_total / len(loader)
 
@@ -891,7 +952,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         loss_history["rhs_norm"].append(diag["rhs_norm"])
 
         if epoch % 50 == 0 or epoch == 1:
-            print(f"  epoch {epoch:4d}  align={loss_align.item():.6f}  "
+            print(f"[kot] epoch {epoch:4d}  align={loss_align.item():.6f}  "
                   f"dyn={loss_dyn_total.item():.6f}  anchor={loss_anchor.item():.6f}  "
                   f"kprior={loss_kappa_prior.item():.6f}  "
                   f"λ_dyn={effective_lambda_dyn:.3f}  lr={optimiser.param_groups[0]['lr']:.2e}  "
@@ -954,17 +1015,17 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         ("final",      final_state,      stop_epoch,       final_losses),
     ]
 
-    print("[kot] Best checkpoints:")
+    print("[kot] best checkpoints:")
     for name, state, ep, lo in checkpoints:
         if state is None:
-            print(f"  {name:>10s}: (not recorded)")
+            print(f"[kot]   {name:>10s}: (not recorded)")
         else:
-            print(f"  {name:>10s}: epoch {ep:4d}  "
+            print(f"[kot]   {name:>10s}: epoch {ep:4d}  "
                   f"align={lo['align']:.6f}  dyn={lo['dyn']:.6f}  total={lo['total']:.6f}")
 
     if best_align_state is not None:
         model.load_state_dict(best_align_state)
-        print(f"[kot] Restored best_align state from epoch {best_align_epoch} (align={best_align:.6f})")
+        print(f"[kot] restored best_align state from epoch {best_align_epoch} (align={best_align:.6f})")
 
     # Final aligned representations
     model.eval()
@@ -979,7 +1040,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
     # End-of-training diagnostics: time, branch confusion, variance, JVP/RHS.
     diagnostics = compute_full_diagnostics(
-        model, R_t, V_t, P_t, S_t, rna_adata.obs, subset=1024,
+        model, R_t, V_t, P_t, S_t, rna_adata.obs, subset=1024, mask=mask_t,
     )
     diagnostics["anchor_loss_final"] = float(loss_anchor_final.item())
     diagnostics["stop_epoch"]        = int(stop_epoch)
@@ -1006,23 +1067,22 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["g_freeze_epochs"]   = int(g_freeze_epochs)
     diagnostics["data_debug"]        = data_debug
 
-    print("---- end-of-training diagnostics ----")
-    print(f"  time_mae:           {diagnostics['time_mae']:.4f}")
-    print(f"  time_spearman:      {diagnostics['time_spearman']:.4f}")
-    print(f"  phi_variance_ratio: {diagnostics['phi_variance_ratio']:.4f}")
-    print(f"  jvp_rhs_cos:        {diagnostics['jvp_rhs_cos']:.4f}")
-    print(f"  jvp_norm / rhs_norm:{diagnostics['jvp_norm']:.4f} / {diagnostics['rhs_norm']:.4f}")
-    print(f"  kappa mean/std:     {diagnostics['kappa_mean']:.4f} / {diagnostics['kappa_std']:.4f}")
-    print(f"  kappa min/max:      {diagnostics['kappa_min']:.4f} / {diagnostics['kappa_max']:.4f}")
-    print(f"  alpha mean/std:     {diagnostics['alpha_mean']:.4f} / {diagnostics['alpha_std']:.4f}")
-    print(f"  alpha min/max:      {diagnostics['alpha_min']:.4f} / {diagnostics['alpha_max']:.4f}")
-    print(f"  beta mean/std:      {diagnostics['beta_mean']:.4f} / {diagnostics['beta_std']:.4f}")
-    print(f"  branch labels:      {diagnostics['branch_confusion_labels']}")
-    print("  branch confusion:")
+    print("[kot] end-of-training diagnostics:")
+    print(f"[kot]   time MAE / Spearman: {diagnostics['time_mae']:.4f} / {diagnostics['time_spearman']:.4f}")
+    print(f"[kot]   φ variance ratio:    {diagnostics['phi_variance_ratio']:.4f}")
+    print(f"[kot]   JVP·RHS cos:         {diagnostics['jvp_rhs_cos']:.4f}")
+    print(f"[kot]   |JVP| / |RHS|:       {diagnostics['jvp_norm']:.4f} / {diagnostics['rhs_norm']:.4f}")
+    print(f"[kot]   κ mean/std [min,max]: {diagnostics['kappa_mean']:.4f} / {diagnostics['kappa_std']:.4f}  "
+          f"[{diagnostics['kappa_min']:.4f}, {diagnostics['kappa_max']:.4f}]")
+    print(f"[kot]   α mean/std [min,max]: {diagnostics['alpha_mean']:.4f} / {diagnostics['alpha_std']:.4f}  "
+          f"[{diagnostics['alpha_min']:.4f}, {diagnostics['alpha_max']:.4f}]")
+    print(f"[kot]   β mean/std:          {diagnostics['beta_mean']:.4f} / {diagnostics['beta_std']:.4f}")
+    print(f"[kot]   anchor loss:         {loss_anchor_final.item():.6f}")
+    print(f"[kot]   branch labels:       {diagnostics['branch_confusion_labels']}")
+    print("[kot]   branch confusion:")
     for row, label in zip(diagnostics["branch_confusion_matrix"], diagnostics["branch_confusion_labels"]):
-        print(f"    {label:>12s}: {row}")
-    print("anchor_loss:", loss_anchor_final.item())
-    print("final beta:", model.beta.detach().cpu().numpy())
+        print(f"[kot]     {label:>12s}: {row}")
+    print(f"[kot]   final β: {model.beta.detach().cpu().numpy()}")
     print(f"[kot] stopped at epoch {stop_epoch} / {n_epochs}")
 
     if output_dir is not None:
@@ -1057,8 +1117,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             if state is None:
                 continue
             model.load_state_dict(state)
-            d  = compute_full_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs)
-            pc = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs)
+            d  = compute_full_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t)
+            pc = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t)
             mean_f = float(np.mean(pc["foscttm"]))
             d["mean_foscttm"]      = mean_f
             d["checkpoint"]        = name
@@ -1108,7 +1168,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             model.load_state_dict(best_align_state)
 
         # 5. Per-cell arrays + the FOSCTTM-vs-diagnostics scatter panel for best_align.
-        per_cell = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs)
+        per_cell = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t)
         per_cell_path = out / "per_cell_diagnostics.npz"
         np.savez(per_cell_path, **per_cell)
         plot_path = out / "foscttm_diagnostics.png"

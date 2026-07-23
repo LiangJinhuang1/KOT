@@ -1,13 +1,8 @@
 import numpy as np
 from sklearn.preprocessing import normalize
 
+from src.utils.arrays import to_dense
 from src.models.LinearODE import solve_linear_ode
-
-
-def dense_array(matrix) -> np.ndarray:
-    if hasattr(matrix, "toarray"):
-        matrix = matrix.toarray()
-    return np.asarray(matrix)
 
 
 def sinkhorn_coupling(x: np.ndarray, y: np.ndarray, reg: float = 0.1, n_iter: int = 100) -> np.ndarray:
@@ -48,7 +43,7 @@ def run_linear_ode(context: dict, cfg: dict) -> tuple[list, np.ndarray]:
     velocity_candidates = [velocity_layer] if velocity_layer else ["velocity", "true_velocity"]
     for key in velocity_candidates:
         if key in rna_adata.layers:
-            V_raw = np.nan_to_num(dense_array(rna_adata.layers[key]), nan=0.0)
+            V_raw = np.nan_to_num(to_dense(rna_adata.layers[key]), nan=0.0)
             print(f"[linear_ode] Using velocity layer: '{key}'")
             break
     if velocity_layer and V_raw is None:

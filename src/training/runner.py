@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import time
@@ -19,7 +20,7 @@ from src.training.uniport import run_uniport
 from src.training.totalvi import run_totalvi
 from src.training.linear_ode import run_linear_ode
 from src.training.kot import run_kot, matrix_from_adata
-from src.evaluation.foscttm import evaluate_and_save
+from src.evaluation.foscttm import evaluate_and_save, calc_domainAveraged_FOSCTTM
 from src.visualization.alignment import (
     coembedding_plot_kwargs,
     plot_coembedding,
@@ -268,6 +269,61 @@ def split_model_result(result):
     return aligned, coupling, loss_df, diagnostics
 
 
+# O(n²) OT baselines that cannot solve the full 90k-cell problem. When
+# align_batch_key is set they are run within each biological batch instead.
+BATCH_SPLIT_MODELS = {"scot", "moscot", "linear_ode"}
+
+
+def aggregate_batch_diagnostics(batch_diags: list[dict]) -> dict:
+    """Mean of the numeric diagnostics across per-batch runs."""
+    out = {}
+    keys = set().union(*[d.keys() for d in batch_diags]) if batch_diags else set()
+    for k in keys:
+        vals = [d[k] for d in batch_diags if isinstance(d.get(k), (int, float, bool))]
+        if vals:
+            out[k] = float(np.mean(vals))
+    out["n_batches"] = len(batch_diags)
+    return out
+
+
+def run_alignment_per_batch(align_fn, x, y, rna_adata, second_adata,
+                            second_label, modality_pair, run_cfg, batch_labels, output_dir):
+    """
+    Run an alignment adapter independently within each batch and reassemble.
+
+    FOSCTTM is computed per batch (a global score across independently-aligned
+    batches would be meaningless) and returned as one per-cell array in the
+    original cell order. Coupling / loss traces are not combined across batches
+    (adapter trace files reflect the last batch).
+    """
+    n = x.shape[0]
+    aligned_rna = None
+    aligned_second = None
+    foscttm = np.empty(n, dtype=np.float64)
+    batch_diags = []
+
+    for b in np.unique(batch_labels):
+        idx = np.where(batch_labels == b)[0]
+        sub_context = build_context(
+            x[idx], y[idx], rna_adata[idx].copy(), second_adata[idx].copy(),
+            second_label, modality_pair,
+        )
+        sub_context["output_dir"] = output_dir
+        aligned_b, _, _, diag_b = split_model_result(align_fn(sub_context, run_cfg))
+        rb = np.asarray(aligned_b[0], dtype=np.float32)
+        pb = np.asarray(aligned_b[1], dtype=np.float32)
+        if aligned_rna is None:
+            aligned_rna = np.zeros((n, rb.shape[1]), dtype=np.float32)
+            aligned_second = np.zeros((n, pb.shape[1]), dtype=np.float32)
+        aligned_rna[idx] = rb
+        aligned_second[idx] = pb
+        foscttm[idx] = np.asarray(calc_domainAveraged_FOSCTTM(rb, pb))
+        batch_diags.append(diag_b)
+        print(f"    [batch {b}] {len(idx)} cells | FOSCTTM={foscttm[idx].mean():.4f}")
+
+    return [aligned_rna, aligned_second], foscttm.tolist(), aggregate_batch_diagnostics(batch_diags)
+
+
 def model_names_from_cfg(run_cfg: dict) -> list[str]:
     models = run_cfg.get("models")
     if models is None:
@@ -394,17 +450,33 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
     else:
         raise ValueError(f"Unknown modality_pair: '{modality_pair}'. Use 'rna_protein' or 'rna_atac'.")
 
-    print(f"RNA repr ({rna_repr_key}): {x.shape}")
-    print(f"{second_label.upper()} repr ({second_repr_key}): {y.shape}")
+    print(f"[runner] RNA repr ({rna_repr_key}): {x.shape}")
+    print(f"[runner] {second_label.upper()} repr ({second_repr_key}): {y.shape}")
 
     context = build_context(x, y, rna_adata, second_adata, second_label, modality_pair)
     context["output_dir"] = output_dir
 
     align_fn = MODELS[model_name]
+    batch_key = run_cfg.get("align_batch_key")
+    per_batch = (
+        batch_key is not None
+        and model_name in BATCH_SPLIT_MODELS
+        and batch_key in rna_adata.obs.columns
+    )
     start_time = time.perf_counter()
-    result = align_fn(context, run_cfg)
+    if per_batch:
+        batch_labels = np.asarray(rna_adata.obs[batch_key].values)
+        print(f"[{model_name}] per-batch alignment over '{batch_key}' "
+              f"({len(np.unique(batch_labels))} batches)")
+        aligned, batch_foscttm, diagnostics = run_alignment_per_batch(
+            align_fn, x, y, rna_adata, second_adata, second_label, modality_pair,
+            run_cfg, batch_labels, output_dir,
+        )
+        coupling, loss_df = None, None
+    else:
+        aligned, coupling, loss_df, diagnostics = split_model_result(align_fn(context, run_cfg))
+        batch_foscttm = None
     runtime_seconds = time.perf_counter() - start_time
-    aligned, coupling, loss_df, diagnostics = split_model_result(result)
     diagnostics = {
         "dataset": name,
         "model": model_name,
@@ -419,6 +491,7 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
         aligned, result_name, output_dir, second_label,
         model_name=model_name,
         obs_names=rna_adata.obs_names,
+        foscttm_scores=batch_foscttm,
     )
     diagnostics["mean_foscttm"] = float(mean_foscttm)
     save_diagnostics(output_dir, diagnostics)
@@ -470,7 +543,7 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
         if coupling is not None:
             plot_coupling(coupling, rna_adata.obs["time"].values, output_dir, model_name)
 
-    print(f"Results saved to {output_dir}/")
+    print(f"[runner] results saved to {output_dir}/")
 
 
 def run_training(
@@ -597,6 +670,10 @@ def run_training(
         )
 
 
+INT_PATTERN = re.compile(r"[+-]?\d+$")
+FLOAT_PATTERN = re.compile(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?$")
+
+
 def parse_set_value(raw: str):
     """Parse a --set value: bool / int / float / else string."""
     key = raw.strip()
@@ -605,14 +682,11 @@ def parse_set_value(raw: str):
         return low == "true"
     if low in ("null", "none"):
         return None
-    try:
+    if INT_PATTERN.match(key):
         return int(key)
-    except ValueError:
-        pass
-    try:
+    if FLOAT_PATTERN.match(key):
         return float(key)
-    except ValueError:
-        return key
+    return key
 
 
 def parse_set_overrides(items: list[str] | None) -> dict:

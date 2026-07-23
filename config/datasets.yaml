@@ -6,6 +6,13 @@ datasets:
     protein_path: Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
     protein_label: ADT
 
+  bmmc_cite_retained:
+    name: BMMC CITE-seq (ADT-genes retained)
+    rna_path: cache/velocity/bmmc_cite/bmmc_cite_scvelo_results_retained.h5ad
+    rna_raw_layer: counts
+    protein_path: Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
+    protein_label: ADT
+
   bmmc_multiome:
     name: BMMC Multiome
     rna_path: cache/velocity/bmmc_multiome/bmmc_multiome_scvelo_results.h5ad
@@ -16,6 +23,13 @@ datasets:
     name: PBMC CITE-seq
     rna_path: cache/velocity/pbmc/pbmc_scvelo_results.h5ad
     rna_raw_layer: counts   # file X is already log-normalized; start from raw counts
+    protein_path: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
+    protein_label: Antibody Capture
+
+  pbmc_retained:
+    name: PBMC CITE-seq (ADT-genes retained)
+    rna_path: cache/velocity/pbmc/pbmc_scvelo_results_retained.h5ad
+    rna_raw_layer: counts
     protein_path: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
     protein_label: Antibody Capture
 

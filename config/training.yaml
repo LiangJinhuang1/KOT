@@ -208,11 +208,19 @@ datasets:
     kot_rna_layer: Ms              # RNA state in the SAME space as scVelo velocity
     velocity_layer: velocity       # dMs/dt → consistent with kot_rna_layer
     kot_protein_layer: null        # protein_adata.X (CLR-normalized ADT)
-    kot_use_explicit_links: true   # NOTE: only 2/134 ADT map to HVG genes → S near-empty
-    use_anchor: false              # no known β on real data → don't pin it
-    lambda_prior: 0.0
+    kot_use_explicit_links: true
+    adt_mapping_csv: cache/results/mapping/adt_mapping_bmmc_cite.csv   # ADT→gene links (build first)
+    # Weak β-anchor as a training stabiliser (β=0.5 is a plausible prior, NOT ground
+    # truth on real data) — keep lambda_prior small so it steadies β without biasing.
+    use_anchor: true
+    kot_anchor_indices: [0, 1, 2, 3, 4]
+    kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
+    lambda_prior: 0.1
+    kot_kinetics_require_velocity_gene: true   # drop proteins whose gene lacks usable velocity
+    kot_kinetics_normalize: true               # per-protein normalisation (floored at median std)
     kot_alpha_max: 3.0             # keep α bounded (null / unbounded hurt PBMC: 0.50±0.18 vs 0.27)
     sinkhorn_max_points: 8192      # ~90k cells: minibatch the align Sinkhorn (full n×n OOMs)
+    align_batch_key: batch         # OT baselines (scot/moscot/linear_ode) run per biological batch
     seeds: [42, 123, 2026]
 
   pbmc:
@@ -221,8 +229,66 @@ datasets:
     kot_rna_layer: Ms
     velocity_layer: velocity
     kot_protein_layer: null
-    kot_use_explicit_links: true   # NOTE: only 9/32 ADT map to HVG genes → S mostly empty
-    use_anchor: false
-    lambda_prior: 0.0
+    kot_use_explicit_links: true
+    adt_mapping_csv: cache/results/mapping/adt_mapping_pbmc.csv   # ADT→gene links (build first)
+    use_anchor: true               # weak β-anchor training stabiliser (β=0.5 is a prior, not truth)
+    kot_anchor_indices: [0, 1, 2, 3, 4]
+    kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
+    lambda_prior: 0.1
+    kot_kinetics_require_velocity_gene: true
+    kot_kinetics_normalize: true
     kot_alpha_max: 3.0             # same bound as successful PBMC run_20260715_190847
+    seeds: [42, 123, 2026]
+
+  # #3 variants: same config, but read the ADT-gene-retained velocity file so S
+  # coverage jumps (PBMC 17→29, BMMC 51→115). Same mapping CSV — present-in-RNA
+  # is re-checked live against the retained genes.
+  pbmc_retained:
+    modality_pair: rna_protein
+    kot_use_feature_space: true
+    kot_rna_layer: Ms
+    velocity_layer: velocity
+    kot_protein_layer: null
+    kot_use_explicit_links: true
+    adt_mapping_csv: cache/results/mapping/adt_mapping_pbmc.csv
+    use_anchor: true
+    # β-anchor from measured half-lives (Mathieson 2018). When this file exists it
+    # overrides kot_anchor_indices/kot_anchor_betas with every matched panel protein,
+    # rescaled to mean = beta_anchor_target. The manual pair below is the fallback
+    # used only if the CSV is missing or matches 0 proteins.
+    beta_anchor_csv: config/beta_anchors_pbmc.csv
+    beta_anchor_target: 0.5
+    kot_anchor_indices: [0, 1, 2, 3, 4]
+    kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
+    lambda_prior: 0.1
+    # #3 keeps ADT-target genes through HVG; do NOT re-filter them out on velocity
+    # fit-quality here, or the retained coverage gain is thrown away (29→13).
+    kot_kinetics_require_velocity_gene: false
+    kot_kinetics_normalize: true
+    kot_alpha_max: 3.0
+    seeds: [42, 123, 2026]
+
+  bmmc_cite_retained:
+    modality_pair: rna_protein
+    kot_use_feature_space: true
+    kot_rna_layer: Ms
+    velocity_layer: velocity
+    kot_protein_layer: null
+    kot_use_explicit_links: true
+    adt_mapping_csv: cache/results/mapping/adt_mapping_bmmc_cite.csv
+    use_anchor: true
+    # β-anchor from measured half-lives (Mathieson 2018); overrides the manual pair
+    # below with every matched panel protein when the CSV exists (see pbmc_retained).
+    beta_anchor_csv: config/beta_anchors_bmmc_cite.csv
+    beta_anchor_target: 0.5
+    kot_anchor_indices: [0, 1, 2, 3, 4]
+    kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
+    lambda_prior: 0.1
+    # #3 keeps ADT-target genes through HVG; do NOT re-filter them out on velocity
+    # fit-quality here, or the retained coverage gain is thrown away (115→33).
+    kot_kinetics_require_velocity_gene: false
+    kot_kinetics_normalize: true
+    kot_alpha_max: 3.0
+    sinkhorn_max_points: 8192
+    align_batch_key: batch
     seeds: [42, 123, 2026]

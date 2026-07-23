@@ -18,11 +18,19 @@ def kinetics_loss(
     S: torch.Tensor,
     beta: torch.Tensor,
     confidence: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Weighted ODE residual.
+    Velocity-confidence-weighted ODE residual, averaged over the active proteins.
 
-    L = (1/B) Σ_i c_i · ‖ J_φ(r_i)·v_i − κ(r_i)·(α(r_i) ⊙ S·r_i − β ⊙ φ(r_i)) ‖²
+    L = (1/B) Σ_i c_i · mean_{j: m_j=1} ( [ J_φ(r_i)·v_i − κ(α⊙Sr_i − β⊙φ_i) ]_j / s_j )²
+
+    Only proteins with mask==1 (a gene→protein link, i.e. usable for kinetics)
+    enter the loss; the residual is averaged over those active proteins (not
+    summed) so the term is comparable across datasets with different numbers of
+    mapped proteins. Dividing by the per-protein scale s_j keeps high-abundance
+    proteins from dominating.
 
     Parameters
     ----------
@@ -34,6 +42,10 @@ def kinetics_loss(
     S          : (D_p, D_r) gene-to-protein projection  (fixed, not learned)
     beta       : (D_p,)    degradation rates  (anchor-fixed)
     confidence : (B,)      scVelo velocity_confidence in [0, 1]
+    mask       : (D_p,)    1 for proteins used in kinetics, 0 for alignment-only.
+                           None = every protein is active.
+    scale      : (D_p,)    per-protein normaliser (e.g. observed-protein std).
+                           None = no per-protein normalisation.
     """
     # JVP: phi_r = φ(r),  dphi_dv = J_φ(r)·v   — one forward pass
     phi_r, dphi_dv = torch_jvp(phi_theta, (r,), (v,))
@@ -46,6 +58,13 @@ def kinetics_loss(
 
     rhs = kappa * (alpha * Sr - beta * phi_r)  # (B, D_p)
     residual = dphi_dv - rhs                   # (B, D_p)
+    if scale is not None:
+        residual = residual / scale            # per-protein normalisation
+    if mask is not None:
+        residual = residual * mask             # keep only active (mapped) proteins
+        n_active = mask.sum().clamp(min=1.0)
+    else:
+        n_active = float(residual.shape[1])
 
-    per_cell = residual.norm(dim=1).pow(2)     # (B,)
+    per_cell = residual.pow(2).sum(dim=1) / n_active   # mean over active proteins
     return (confidence * per_cell).mean()

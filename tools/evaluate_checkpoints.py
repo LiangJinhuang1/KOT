@@ -41,6 +41,7 @@ import torch
 from src.utils.io import load_yaml
 from src.data.preprocessing import load_and_preprocess_cached
 from src.data.projection import projection_matrix_from_adatas
+from src.data.adt_gene_map import load_mapping_csv
 from src.models.KOT import KOTModel
 from src.training.kot import (
     FixedKappa,
@@ -139,10 +140,13 @@ def build_model_and_tensors(
     D_r = x.shape[1]
     D_p = y.shape[1]
 
-    S_np = projection_matrix_from_adatas(
+    mapping_csv = run_cfg.get("adt_mapping_csv")
+    alias_map = load_mapping_csv(Path(mapping_csv)) if (mapping_csv and Path(mapping_csv).exists()) else None
+    S_np, kin_mask = projection_matrix_from_adatas(
         rna_adata, protein_adata,
         use_mean_expr=False,
         use_explicit_links=use_explicit_links,
+        alias_map=alias_map,
     )
     if use_feature_space:
         S_model = S_np.copy()
@@ -173,6 +177,8 @@ def build_model_and_tensors(
     P_t = to_tensor(y, device)
     V_t = to_tensor(V, device)
     S_t = to_tensor(S_model, device)
+    kin_mask_np = kin_mask.astype(np.float32) if use_feature_space else np.ones(S_model.shape[0], dtype=np.float32)
+    mask_t = to_tensor(kin_mask_np, device)
 
     phi_dims        = list(run_cfg.get("phi_dims", [1024, 512, 256]))
     kappa_dims      = list(run_cfg.get("kappa_dims", [64, 32]))
@@ -199,14 +205,14 @@ def build_model_and_tensors(
     if fixed_kappa_value is not None:
         model.kappa = FixedKappa(float(fixed_kappa_value)).to(device)
 
-    return model, R_t, V_t, P_t, S_t, rna_adata.obs
+    return model, R_t, V_t, P_t, S_t, rna_adata.obs, mask_t
 
 
 # ---------------------------------------------------------------------------
 # Per-checkpoint evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_one_checkpoint(model, ckpt_path: Path, R_t, V_t, P_t, S_t, rna_obs):
+def evaluate_one_checkpoint(model, ckpt_path: Path, R_t, V_t, P_t, S_t, rna_obs, mask_t=None):
     """Load checkpoint into model, recompute diagnostics + per-cell arrays."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
@@ -215,8 +221,8 @@ def evaluate_one_checkpoint(model, ckpt_path: Path, R_t, V_t, P_t, S_t, rna_obs)
     state_dict = {k: v.to(target_device) for k, v in ckpt["state_dict"].items()}
     model.load_state_dict(state_dict)
 
-    diagnostics = compute_full_diagnostics(model, R_t, V_t, P_t, S_t, rna_obs)
-    per_cell    = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_obs)
+    diagnostics = compute_full_diagnostics(model, R_t, V_t, P_t, S_t, rna_obs, mask=mask_t)
+    per_cell    = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_obs, mask=mask_t)
     mean_foscttm = float(np.mean(per_cell["foscttm"]))
 
     diagnostics["checkpoint_epoch"]  = int(ckpt["epoch"])
@@ -245,7 +251,7 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
             continue
 
         try:
-            model, R_t, V_t, P_t, S_t, rna_obs = build_model_and_tensors(
+            model, R_t, V_t, P_t, S_t, rna_obs, mask_t = build_model_and_tensors(
                 run_cfg, rna_adata, protein_adata, model_name, device,
             )
         except Exception as e:
@@ -253,10 +259,10 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
             continue
 
         for seed_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")):
-            try:
-                seed = int(seed_dir.name.split("_", 1)[1])
-            except ValueError:
+            tail = seed_dir.name.split("_", 1)[1]
+            if not tail.isdigit():
                 continue
+            seed = int(tail)
 
             for ckpt_name in CHECKPOINT_NAMES:
                 ckpt_path = seed_dir / f"checkpoint_{ckpt_name}.pt"
@@ -265,7 +271,7 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
 
                 try:
                     diagnostics, per_cell = evaluate_one_checkpoint(
-                        model, ckpt_path, R_t, V_t, P_t, S_t, rna_obs,
+                        model, ckpt_path, R_t, V_t, P_t, S_t, rna_obs, mask_t,
                     )
                 except Exception as e:
                     print(f"  [{model_name}/seed_{seed}/{ckpt_name}] eval FAILED: {e}")

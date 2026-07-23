@@ -88,7 +88,7 @@ def dtw_for_run(run_folder: Path, device, n_bins: int) -> list[dict]:
         if not dataset_dir.exists():
             continue
 
-        model, R_t, V_t, P_t, S_t, rna_obs = build_model_and_tensors(
+        model, R_t, V_t, P_t, S_t, rna_obs, _ = build_model_and_tensors(
             run_cfg, rna_adata, protein_adata, model_name, device,
         )
 

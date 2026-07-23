@@ -18,6 +18,7 @@ datasets:
     label: bmmc_cite
     umap_key: GEX_X_umap
     n_top_genes: 2000
+    retain_genes_csv: cache/results/mapping/adt_mapping_bmmc_cite.csv   # #3: force-retain ADT-target genes
 
   bmmc_multiome:
     mode: starsolo_h5ad
@@ -34,6 +35,7 @@ datasets:
     loom: Datasets/PBMC/pbmc_final_sorted_B4NII.loom
     label: pbmc
     n_top_genes: 2000
+    retain_genes_csv: cache/results/mapping/adt_mapping_pbmc.csv   # #3: force-retain ADT-target genes
 
   perturb:
     # TODO: set mode once STARsolo alignment is complete for Perturb-CITE-seq.

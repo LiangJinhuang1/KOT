@@ -152,7 +152,7 @@ def models_for_plot(df: pd.DataFrame) -> list[str]:
 # Loading
 # ---------------------------------------------------------------------------
 
-def _active_dataset_block(datasets: dict) -> dict:
+def active_dataset_block(datasets: dict) -> dict:
     """Return the first active dataset block from training.yaml."""
     if not datasets:
         return {}
@@ -210,10 +210,7 @@ def parse_summary_txt(path: Path) -> dict:
         k, v = line.split(":", 1)
         out[k.strip()] = v.strip()
     if "mean_foscttm" in out:
-        try:
-            out["mean_foscttm"] = float(out["mean_foscttm"])
-        except ValueError:
-            out["mean_foscttm"] = np.nan
+        out["mean_foscttm"] = to_float(out["mean_foscttm"])
     return out
 
 
@@ -227,20 +224,20 @@ def load_run_hyperparams(run_folder: Path) -> dict:
     cfg = yaml.safe_load(yaml_path.read_text())
     defaults = cfg.get("defaults", {}) or {}
     datasets = cfg.get("datasets", {}) or {}
-    syn = _active_dataset_block(datasets)
+    syn = active_dataset_block(datasets)
     return {
-        "lr":                 _to_float(defaults.get("lr")),
-        "sinkhorn_reg":       _to_float(defaults.get("sinkhorn_reg")),
-        "lambda_dyn":         _to_float(defaults.get("lambda_dyn")),
-        "phi_init_gain":      _to_float(defaults.get("phi_init_gain")),
-        "dyn_warmup_epochs":  _to_int(defaults.get("dyn_warmup_epochs")),
+        "lr":                 to_float(defaults.get("lr")),
+        "sinkhorn_reg":       to_float(defaults.get("sinkhorn_reg")),
+        "lambda_dyn":         to_float(defaults.get("lambda_dyn")),
+        "phi_init_gain":      to_float(defaults.get("phi_init_gain")),
+        "dyn_warmup_epochs":  to_int(defaults.get("dyn_warmup_epochs")),
         "use_anchor":         syn.get("use_anchor", defaults.get("use_anchor")),
-        "lambda_prior":       _to_float(defaults.get("lambda_prior")),
-        "kot_fixed_kappa":    _to_float(defaults.get("kot_fixed_kappa")),
-        "phase1_epochs":      _to_int(defaults.get("phase1_epochs", 0)),
-        "phase2_epochs":      _to_int(defaults.get("phase2_epochs", 0)),
-        "phase3_epochs":      _to_int(defaults.get("phase3_epochs", 0)),
-        "phase3_lr_scale":    _to_float(defaults.get("phase3_lr_scale")),
+        "lambda_prior":       to_float(defaults.get("lambda_prior")),
+        "kot_fixed_kappa":    to_float(defaults.get("kot_fixed_kappa")),
+        "phase1_epochs":      to_int(defaults.get("phase1_epochs", 0)),
+        "phase2_epochs":      to_int(defaults.get("phase2_epochs", 0)),
+        "phase3_epochs":      to_int(defaults.get("phase3_epochs", 0)),
+        "phase3_lr_scale":    to_float(defaults.get("phase3_lr_scale")),
         "kot_rna_layer":      syn.get("kot_rna_layer", defaults.get("kot_rna_layer")),
         "kot_protein_layer":  syn.get("kot_protein_layer", defaults.get("kot_protein_layer")),
         "velocity_layer":     syn.get("velocity_layer"),
@@ -295,15 +292,13 @@ def infer_stage(
 
 def parse_seed_from_output(output_dir: Path | None, summary: dict) -> int | float:
     if "seed" in summary:
-        try:
-            return int(summary["seed"])
-        except (TypeError, ValueError):
-            pass
+        seed = str(summary["seed"]).strip()
+        if seed.lstrip("+-").isdigit():
+            return int(seed)
     if output_dir is not None and output_dir.name.startswith("seed_"):
-        try:
-            return int(output_dir.name.split("_", 1)[1])
-        except ValueError:
-            pass
+        tail = output_dir.name.split("_", 1)[1]
+        if tail.isdigit():
+            return int(tail)
     return np.nan
 
 
@@ -490,18 +485,27 @@ def write_metric_exports(df: pd.DataFrame, output_dir: Path) -> None:
     )
 
 
-def _to_float(x):
-    try:
-        return float(x) if x is not None else np.nan
-    except (TypeError, ValueError):
+NUMERIC_PATTERN = re.compile(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?$")
+
+
+def to_float(x):
+    if x is None:
         return np.nan
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    return float(s) if NUMERIC_PATTERN.match(s) else np.nan
 
 
-def _to_int(x):
-    try:
-        return int(x) if x is not None else 0
-    except (TypeError, ValueError):
+def to_int(x):
+    if x is None:
         return 0
+    if isinstance(x, bool):
+        return int(x)
+    if isinstance(x, (int, float)):
+        return int(x)
+    s = str(x).strip()
+    return int(float(s)) if NUMERIC_PATTERN.match(s) else 0
 
 
 def is_meanscale_run(hp: dict) -> bool:

@@ -83,9 +83,13 @@ def evaluate_and_save(
     second_label: str,
     model_name: str = None,
     obs_names=None,
+    foscttm_scores=None,
 ) -> float:
     degenerate = is_degenerate_embedding(aligned[0]) or is_degenerate_embedding(aligned[1])
-    foscttm_scores = calc_domainAveraged_FOSCTTM(aligned[0], aligned[1])
+    # foscttm_scores may be precomputed (e.g. per-batch alignment, where a global
+    # FOSCTTM across independently-aligned batches would be meaningless).
+    if foscttm_scores is None:
+        foscttm_scores = calc_domainAveraged_FOSCTTM(aligned[0], aligned[1])
     mean_foscttm = float(np.mean(foscttm_scores))
     if degenerate:
         print(

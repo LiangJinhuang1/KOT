@@ -4,16 +4,11 @@ import numpy as np
 import anndata as ad
 import pandas as pd
 import scvi
-import scipy.sparse as sp
+
+from src.utils.arrays import to_dense
 
 
 PROTEIN_OBSM_KEY = "protein_expression"
-
-
-def dense_float32(matrix) -> np.ndarray:
-    if sp.issparse(matrix):
-        matrix = matrix.toarray()
-    return np.asarray(matrix, dtype=np.float32)
 
 
 def attach_protein_expression(
@@ -80,8 +75,8 @@ def run_totalvi(context: dict, cfg: dict) -> tuple[list, np.ndarray | None]:
         raise ValueError("totalVI is only defined for RNA + protein/CITE-seq data.")
 
     seed = int(cfg.get("seed", 42))
-    rna_counts = dense_float32(rna_adata.layers["counts"])
-    prot_counts = dense_float32(second_adata.layers["counts"])
+    rna_counts = to_dense(rna_adata.layers["counts"], np.float32)
+    prot_counts = to_dense(second_adata.layers["counts"], np.float32)
     return run_totalvi_latent_oracle(
         rna_adata, second_adata, rna_counts, prot_counts, cfg, seed
     )

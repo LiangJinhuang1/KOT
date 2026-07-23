@@ -140,7 +140,7 @@ def build_guidance_graph(
                 added += 1
 
     print(
-        "[GLUE] Guidance graph: "
+        "[glue] Guidance graph: "
         f"{len(rna_features)} RNA features, {len(second_features)} second-modality "
         f"features, {added} cross-feature edges."
     )

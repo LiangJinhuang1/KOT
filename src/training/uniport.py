@@ -16,17 +16,13 @@ if VENDOR_UNIPORT_PATH.exists():
 
 import uniport as up
 
+from src.utils.arrays import to_dense
+
 UNIPORT_INPUT_KEY = "uniport_input"
 
 
-def dense_float32(matrix) -> np.ndarray:
-    if hasattr(matrix, "toarray"):
-        matrix = matrix.toarray()
-    return np.asarray(matrix, dtype=np.float32)
-
-
 def minmax01(matrix) -> np.ndarray:
-    values = dense_float32(matrix)
+    values = to_dense(matrix, np.float32)
     mins = np.nanmin(values, axis=0, keepdims=True)
     maxs = np.nanmax(values, axis=0, keepdims=True)
     denom = maxs - mins
@@ -79,8 +75,8 @@ def sinkhorn_coupling(
     reg: float = 0.1,
     n_iter: int = 200,
 ) -> np.ndarray:
-    x = dense_float32(x)
-    y = dense_float32(y)
+    x = to_dense(x, np.float32)
+    y = to_dense(y, np.float32)
     n, m = x.shape[0], y.shape[0]
     cost = np.sum((x[:, None, :] - y[None, :, :]) ** 2, axis=-1, dtype=np.float32)
     cost_max = float(np.max(cost))
@@ -146,11 +142,11 @@ def run_uniport(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, dict
     second_adata.obs["source"]    = second_label
     rna_adata.obsm[UNIPORT_INPUT_KEY] = uniport_input_matrix(rna_adata, rna_rep)
     second_adata.obsm[UNIPORT_INPUT_KEY] = uniport_input_matrix(second_adata, second_rep)
-    print(f"[uniPort] Input reps: RNA={rna_rep}, {second_label}={second_rep}")
+    print(f"[uniport] Input reps: RNA={rna_rep}, {second_label}={second_rep}")
     if inverse_second_permutation is not None:
-        print("[uniPort] Permuted second modality before diagonal integration.")
+        print("[uniport] Permuted second modality before diagonal integration.")
     if relabel_second_ids and inverse_second_permutation is not None:
-        print("[uniPort] Rewrote second modality obs_names for ID-leakage sanity check.")
+        print("[uniport] Rewrote second modality obs_names for ID-leakage sanity check.")
 
     with tempfile.TemporaryDirectory(prefix="uniport_") as outdir:
         up.Run(
@@ -189,7 +185,7 @@ def run_uniport(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, dict
         )
     else:
         print(
-            "[uniPort] Skipping dense final coupling: "
+            "[uniport] Skipping dense final coupling: "
             f"{n_entries:,} entries exceeds uniport_max_coupling_entries="
             f"{max_coupling_entries:,}."
         )
