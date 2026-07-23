@@ -48,3 +48,4 @@ venv/
 STAR
 samtools*/
 references/
+HGNC_set.txt
