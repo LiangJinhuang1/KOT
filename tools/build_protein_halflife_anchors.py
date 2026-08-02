@@ -16,17 +16,24 @@ Primary source: Mathieson et al., Nat Commun 2018 Supplementary Data 2
   high-quality sheet: Datasets/references/mathieson2018_supp_data2.csv
   (original xlsx: static-content.springer.com .../41467_2018_3106_MOESM5_ESM.xlsx).
 
-Optional T-cell source: processed half-life table from Savitski et al., Cell 2018
-  (PXD008630 is raw MS only — use the paper's supplementary xlsx/csv, not PRIDE).
-  Pass with --tcell-table; expected columns include a gene name and half-life
-  (hours), optionally an R² column. See --tcell-* flags.
+Optional T-cell source: Savitski et al., Cell 2018 processed half-life CSV
+  (PXD008630 is raw MS only — do not use PRIDE). Expected CSV columns:
+  gene_name, half_life (hours), optional R_sq. Example path:
+    cache/references/halflife/savitski2018_tcells.csv
 
-Usage (on the cluster, after ADT mapping exists):
-  python tools/build_adt_mapping.py --datasets pbmc
+Usage — write Mathieson and T-cell CSVs separately (do not mix in one file):
+
+  # Mathieson only (B / NK / Monocytes)
   python tools/build_protein_halflife_anchors.py \\
       --adt-mapping cache/results/mapping/adt_mapping_pbmc.csv \\
-      --mathieson Datasets/references/mathieson2018_supp_data2.csv \\
-      --out cache/results/mapping/pbmc_protein_halflife_anchors.csv
+      --mathieson cache/references/halflife/mathieson2018_supp_data2.csv \\
+      --out config/beta_anchors_pbmc_mathieson.csv
+
+  # T-cell only (Savitski 2018)
+  python tools/build_protein_halflife_anchors.py \\
+      --adt-mapping cache/results/mapping/adt_mapping_pbmc.csv \\
+      --tcell-table cache/references/halflife/savitski2018_tcells.csv \\
+      --out config/beta_anchors_pbmc_tcell.csv
 """
 
 from __future__ import annotations
@@ -85,7 +92,9 @@ def load_adt_mapping(path: Path) -> pd.DataFrame:
 
 
 def load_mathieson(path: Path) -> pd.DataFrame:
-    # CSV export of the high-quality sheet (first sheet of the Nature xlsx).
+    path = Path(path)
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        return pd.read_excel(path, sheet_name=0)
     return pd.read_csv(path)
 
 
@@ -118,8 +127,18 @@ def load_tcell_table(
     half_life_col: str,
     r2_col: str | None,
 ) -> dict[str, dict]:
-    """Map gene_symbol.upper() → {half_life_hours, quality_score_or_R2, anchor_weight}."""
-    df = pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
+    """Map gene_symbol.upper() → {half_life_hours, quality_score_or_R2, anchor_weight}.
+
+    Expects a CSV (not xlsx). Convert Supplementary Dataset 8 with
+    tools/export_tcell_halflife_csv.py if needed.
+    """
+    path = Path(path)
+    if path.suffix.lower() != ".csv":
+        raise ValueError(
+            f"T-cell table must be a CSV, got {path}. "
+            "Expected columns: gene_name, half_life [, R_sq]."
+        )
+    df = pd.read_csv(path)
     if gene_col not in df.columns or half_life_col not in df.columns:
         raise ValueError(
             f"T-cell table needs columns '{gene_col}' and '{half_life_col}'. "
@@ -148,7 +167,7 @@ def load_tcell_table(
 
 def build_rows(
     adt_df: pd.DataFrame,
-    math_df: pd.DataFrame,
+    math_df: pd.DataFrame | None,
     cell_types: list[str],
     tcell_by_gene: dict[str, dict] | None,
     kinetics_only: bool,
@@ -164,19 +183,20 @@ def build_rows(
         hgnc = adt.get("hgnc_id") or ""
         uniprot = adt.get("uniprot_id") or ""
 
-        for m in mathieson_rows_for_gene(math_df, gene, cell_types):
-            rows.append({
-                "protein_name": protein,
-                "hgnc_id": hgnc,
-                "gene_symbol": gene,
-                "uniprot_id": uniprot,
-                "cell_type": m["cell_type"],
-                "half_life_hours": round(m["half_life_hours"], 4),
-                "beta_per_hour": round(LN2 / m["half_life_hours"], 8),
-                "quality_score_or_R2": m["quality_score_or_R2"],
-                "source": m["source"],
-                "anchor_weight": m["anchor_weight"],
-            })
+        if math_df is not None:
+            for m in mathieson_rows_for_gene(math_df, gene, cell_types):
+                rows.append({
+                    "protein_name": protein,
+                    "hgnc_id": hgnc,
+                    "gene_symbol": gene,
+                    "uniprot_id": uniprot,
+                    "cell_type": m["cell_type"],
+                    "half_life_hours": round(m["half_life_hours"], 4),
+                    "beta_per_hour": round(LN2 / m["half_life_hours"], 8),
+                    "quality_score_or_R2": m["quality_score_or_R2"],
+                    "source": m["source"],
+                    "anchor_weight": m["anchor_weight"],
+                })
 
         if tcell_by_gene is not None:
             t = tcell_by_gene.get(gene.upper())
@@ -214,10 +234,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adt-mapping", type=Path, required=True,
                         help="ADT mapping CSV from tools/build_adt_mapping.py")
-    parser.add_argument("--mathieson", type=Path, required=True,
-                        help="Mathieson 2018 Supplementary Data 2 CSV (high-quality sheet)")
+    parser.add_argument("--mathieson", type=Path, default=None,
+                        help="Mathieson 2018 Supp Data 2 CSV (omit for T-cell-only)")
     parser.add_argument("--out", type=Path, required=True,
-                        help="Output anchor half-life CSV")
+                        help="Output anchor half-life CSV "
+                             "(use distinct names, e.g. *_mathieson.csv / *_tcell.csv)")
     parser.add_argument(
         "--cell-types",
         type=str,
@@ -226,7 +247,8 @@ def main() -> None:
              f"(choices: {','.join(MATHIESON_CELL_TYPES)})",
     )
     parser.add_argument("--tcell-table", type=Path, default=None,
-                        help="Optional processed T-cell half-life csv/xlsx")
+                        help="Savitski T-cell half-life CSV "
+                             "(gene_name, half_life [, R_sq]); omit for Mathieson-only")
     parser.add_argument("--tcell-gene-col", type=str, default="gene_name")
     parser.add_argument("--tcell-halflife-col", type=str, default="half_life")
     parser.add_argument("--tcell-r2-col", type=str, default="R_sq")
@@ -234,13 +256,20 @@ def main() -> None:
                         help="Also keep ADTs with use_for_kinetics=false")
     args = parser.parse_args()
 
+    if args.mathieson is None and args.tcell_table is None:
+        raise ValueError("Provide at least one of --mathieson or --tcell-table")
+
     cell_types = [c.strip() for c in args.cell_types.split(",") if c.strip()]
     unknown = [c for c in cell_types if c not in MATHIESON_CELL_TYPES]
     if unknown:
         raise ValueError(f"Unknown cell types {unknown}; choose from {list(MATHIESON_CELL_TYPES)}")
 
     adt_df = load_adt_mapping(args.adt_mapping)
-    math_df = load_mathieson(args.mathieson)
+
+    math_df = None
+    if args.mathieson is not None:
+        math_df = load_mathieson(args.mathieson)
+        print(f"[mathieson] loaded {args.mathieson}")
 
     tcell_by_gene = None
     if args.tcell_table is not None:
@@ -259,7 +288,6 @@ def main() -> None:
         tcell_by_gene=tcell_by_gene,
         kinetics_only=not args.include_alignment_only,
     )
-    # Stable order: protein panel order, then cell type
     ct_order = {c: i for i, c in enumerate(cell_types + ["Tcells"])}
     prot_order = {n: i for i, n in enumerate(adt_df["adt_name"].tolist())}
     rows.sort(key=lambda r: (prot_order.get(r["protein_name"], 10**9), ct_order.get(r["cell_type"], 99)))
@@ -268,12 +296,15 @@ def main() -> None:
 
     n_prot = len({r["protein_name"] for r in rows})
     n_adt = int((adt_df["gene_symbol"].astype(str).str.len() > 0).sum())
+    by_source = {}
+    by_ct = {}
+    for r in rows:
+        by_source[r["source"]] = by_source.get(r["source"], 0) + 1
+        by_ct[r["cell_type"]] = by_ct.get(r["cell_type"], 0) + 1
     print(f"[anchors] wrote {len(rows)} rows for {n_prot} proteins → {args.out}")
     print(f"[anchors] ADTs with gene symbol: {n_adt}/{len(adt_df)}; "
           f"with ≥1 half-life: {n_prot}")
-    by_ct = {}
-    for r in rows:
-        by_ct[r["cell_type"]] = by_ct.get(r["cell_type"], 0) + 1
+    print(f"[anchors] rows by source: {by_source}")
     print(f"[anchors] rows by cell_type: {by_ct}")
 
 

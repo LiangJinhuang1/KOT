@@ -252,17 +252,23 @@ datasets:
     kot_use_explicit_links: true
     adt_mapping_csv: cache/results/mapping/adt_mapping_pbmc.csv
     use_anchor: true
-    # β-anchor from measured half-lives (Mathieson 2018). When this file exists it
-    # overrides kot_anchor_indices/kot_anchor_betas with every matched panel protein,
-    # rescaled to mean = beta_anchor_target. The manual pair below is the fallback
-    # used only if the CSV is missing or matches 0 proteins.
-    beta_anchor_csv: config/beta_anchors_pbmc.csv
+    # Pick ONE source CSV (do not mix Mathieson + T-cell in the same file).
+    # Switch with --set beta_anchor_csv=config/beta_anchors_pbmc_tcell.csv
+    beta_anchor_csv: config/beta_anchors_pbmc_mathieson.csv
+    # beta_anchor_csv: config/beta_anchors_pbmc_tcell.csv
     beta_anchor_target: 0.5
+    # Soft prior over paper β (not hard-fixed). median across cell types; optional
+    # stable_cv_max drops proteins whose half-life CV across cell types is high.
+    beta_anchor_prior: log_normal
+    beta_anchor_aggregate: median
+    beta_anchor_stable_cv_max: 0.5
+    beta_anchor_sigma_floor: 0.25
     kot_anchor_indices: [0, 1, 2, 3, 4]
     kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
     lambda_prior: 0.1
-    # #3 keeps ADT-target genes through HVG; do NOT re-filter them out on velocity
-    # fit-quality here, or the retained coverage gain is thrown away (29→13).
+    # Retained velocity already force-keeps ADT-target genes; default OFF so kinetic
+    # active ≈ matched S. Override with --set kot_kinetics_require_velocity_gene=true
+    # to require scVelo velocity_genes.
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0
@@ -277,15 +283,18 @@ datasets:
     kot_use_explicit_links: true
     adt_mapping_csv: cache/results/mapping/adt_mapping_bmmc_cite.csv
     use_anchor: true
-    # β-anchor from measured half-lives (Mathieson 2018); overrides the manual pair
-    # below with every matched panel protein when the CSV exists (see pbmc_retained).
-    beta_anchor_csv: config/beta_anchors_bmmc_cite.csv
+    # Pick ONE source CSV (Mathieson vs T-cell kept separate).
+    beta_anchor_csv: config/beta_anchors_bmmc_cite_mathieson.csv
+    # beta_anchor_csv: config/beta_anchors_bmmc_cite_tcell.csv
     beta_anchor_target: 0.5
+    beta_anchor_prior: log_normal
+    beta_anchor_aggregate: median
+    beta_anchor_stable_cv_max: 0.5
+    beta_anchor_sigma_floor: 0.25
     kot_anchor_indices: [0, 1, 2, 3, 4]
     kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
     lambda_prior: 0.1
-    # #3 keeps ADT-target genes through HVG; do NOT re-filter them out on velocity
-    # fit-quality here, or the retained coverage gain is thrown away (115→33).
+    # Same as pbmc_retained: filter OFF by default on retained velocity.
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0

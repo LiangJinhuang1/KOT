@@ -8,9 +8,9 @@ gene i encodes protein j.  Used in the KOT ODE constraint:
 
 For CITE-seq datasets a protein matches a gene by normalized name, or via the
 HGNC-backed ADT→gene map (src/data/adt_gene_map.py) when the panel name differs
-from the gene symbol (CD16 → FCGR3A). If no match is found the implementation
-falls back to a uniform projection so the kinetic term still receives a stable
-input.
+from the gene symbol (CD16 → FCGR3A). Proteins with no gene match keep an
+all-zero S row and mask[j]=False, so they still feed Sinkhorn alignment but are
+excluded from the kinetic term — there is no uniform-projection fallback.
 """
 from __future__ import annotations
 

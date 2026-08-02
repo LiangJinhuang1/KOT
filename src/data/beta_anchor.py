@@ -2,15 +2,21 @@
 β degradation-rate anchor from measured protein half-lives.
 
 Reads a CSV with (at least) protein_name and either half_life_hours or
-beta_per_hour, and resolves it against the protein panel to (anchor indices,
-target β, weights). Half-life gives β = ln 2 / t_half (per hour).
+beta_per_hour (optionally cell_type, quality_score_or_R2, anchor_weight), and
+resolves it against the protein panel.
 
-Modelling note: KOT's ODE runs in *pseudotime*, not hours, so absolute per-hour
-rates are not directly comparable to the model's β. We therefore rescale the
-targets so their mean equals `target_mean_beta` — the anchor then imposes the
-*relative* degradation pattern (which proteins are fast vs slow) at KOT's own β
-scale, and the learned κ absorbs the pseudotime↔time conversion.
+Aggregation across cell-type rows (supervisor):
+  - median (default) or mean of β_per_hour
+  - optional stability filter: keep only proteins whose CV across cell types
+    is ≤ stable_cv_max
+  - per-protein σ from cross-cell-type dispersion (for soft Gaussian /
+    log-normal priors); single-measurement proteins get prior_sigma_floor
+
+Modelling note: KOT's ODE runs in pseudotime, so absolute per-hour rates are
+rescaled so mean(β) = target_mean_beta. Relative fast/slow structure is kept;
+learned κ absorbs the time-unit conversion.
 """
+
 from __future__ import annotations
 
 import csv
@@ -47,21 +53,48 @@ def load_beta_anchor_csv(path: Path) -> list[dict]:
                 "protein_name": protein,
                 "beta_per_hour": beta_val,
                 "weight": float(r.get("anchor_weight") or 1.0),
+                "cell_type": (r.get("cell_type") or "").strip(),
             })
     return rows
 
 
-def resolve_beta_anchors(path, protein_var_names, target_mean_beta: float = 0.5):
-    """
-    Map a β-anchor CSV to (indices, betas, weights) against the protein panel.
+def aggregate_values(values: list[float], how: str) -> float:
+    if how == "mean":
+        return sum(values) / len(values)
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
 
-    Betas are rescaled so their mean equals target_mean_beta (relative anchoring).
-    Proteins in the CSV that are not in the panel are skipped.
+
+def sample_std(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    m = sum(values) / len(values)
+    var = sum((v - m) ** 2 for v in values) / (len(values) - 1)
+    return math.sqrt(var)
+
+
+def resolve_beta_anchors(
+    path,
+    protein_var_names,
+    target_mean_beta: float = 0.5,
+    aggregate: str = "median",
+    stable_cv_max: float | None = None,
+    prior_sigma_floor: float = 0.25,
+):
     """
+    Map a β-anchor CSV to (indices, betas, weights, sigmas).
+
+    sigmas are on the same scale as the rescaled model β (absolute), floored at
+    prior_sigma_floor * target so single-cell-type anchors still have width.
+    """
+    if aggregate not in ("median", "mean"):
+        raise ValueError(f"aggregate must be 'median' or 'mean', got {aggregate!r}")
+
     rows = load_beta_anchor_csv(Path(path))
     index = {normalize_protein_name(p): j for j, p in enumerate(protein_var_names)}
-    # The anchor CSV may hold several rows per protein (one per cell type); collapse
-    # them to a single β/weight per protein so each anchor is counted once.
     per_protein: dict[int, list[tuple[float, float]]] = {}
     for r in rows:
         j = index.get(normalize_protein_name(r["protein_name"]))
@@ -69,11 +102,35 @@ def resolve_beta_anchors(path, protein_var_names, target_mean_beta: float = 0.5)
             continue
         per_protein.setdefault(j, []).append((r["beta_per_hour"], r["weight"]))
     if not per_protein:
-        return [], [], []
-    idx = sorted(per_protein)
-    betas = [sum(b for b, _ in per_protein[j]) / len(per_protein[j]) for j in idx]
-    weights = [sum(w for _, w in per_protein[j]) / len(per_protein[j]) for j in idx]
+        return [], [], [], []
+
+    kept: list[tuple[int, float, float, float]] = []
+    for j in sorted(per_protein):
+        betas_h = [b for b, _ in per_protein[j]]
+        weights = [w for _, w in per_protein[j]]
+        center = aggregate_values(betas_h, aggregate)
+        if center <= 0:
+            continue
+        cv = sample_std(betas_h) / center if center > 0 else 0.0
+        if stable_cv_max is not None and len(betas_h) >= 2 and cv > stable_cv_max:
+            continue
+        weight = aggregate_values(weights, "mean")
+        # Relative dispersion → absolute σ after later rescaling (apply scale below).
+        rel_sigma = max(cv, prior_sigma_floor) if len(betas_h) >= 2 else prior_sigma_floor
+        kept.append((j, center, weight, rel_sigma))
+
+    if not kept:
+        return [], [], [], []
+
+    idx = [j for j, _, _, _ in kept]
+    betas = [b for _, b, _, _ in kept]
+    weights = [w for _, _, w, _ in kept]
+    rel_sigmas = [s for _, _, _, s in kept]
+
     mean_beta = sum(betas) / len(betas)
-    if mean_beta > 0:
-        betas = [b / mean_beta * target_mean_beta for b in betas]
-    return idx, betas, weights
+    scale = (float(target_mean_beta) / mean_beta) if mean_beta > 0 else 1.0
+    betas = [b * scale for b in betas]
+    # rel_sigma is CV-like (unitless); σ_model ≈ rel × β_model, floored.
+    floor = prior_sigma_floor * float(target_mean_beta)
+    sigmas = [max(rel * beta, floor) for rel, beta in zip(rel_sigmas, betas)]
+    return idx, betas, weights, sigmas

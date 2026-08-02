@@ -34,6 +34,39 @@ def to_tensor(arr: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.tensor(arr, dtype=torch.float32, device=device)
 
 
+def beta_anchor_prior_loss(
+    beta: torch.Tensor,
+    indices: torch.Tensor,
+    targets: torch.Tensor,
+    sigmas: torch.Tensor | None,
+    weights: torch.Tensor | None,
+    lambda_prior: float,
+    prior_kind: str,
+) -> torch.Tensor:
+    """Soft β prior: l2 | gaussian | log_normal (supervisor: not hard-fixed)."""
+    pred = beta[indices]
+    if prior_kind == "l2":
+        resid = pred - targets
+        if weights is not None:
+            resid = resid * weights.sqrt()
+        return lambda_prior * resid.pow(2).sum()
+    if sigmas is None:
+        raise ValueError(f"prior_kind={prior_kind!r} requires per-anchor sigmas")
+    if prior_kind == "gaussian":
+        resid = (pred - targets) / sigmas.clamp(min=1e-6)
+    elif prior_kind == "log_normal":
+        # σ stored on β-scale → approximate log-space width as σ/β*
+        log_sigma = (sigmas / targets.clamp(min=1e-6)).clamp(min=1e-3)
+        resid = (
+            torch.log(pred.clamp(min=1e-6)) - torch.log(targets.clamp(min=1e-6))
+        ) / log_sigma
+    else:
+        raise ValueError(f"Unknown beta_anchor_prior {prior_kind!r}; use l2|gaussian|log_normal")
+    if weights is not None:
+        resid = resid * weights.sqrt()
+    return lambda_prior * 0.5 * resid.pow(2).sum()
+
+
 def build_kot_optimiser(model, lr: float, n_epochs: int, use_phases: bool):
     optimiser = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = None if use_phases else torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -547,17 +580,35 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     anchor_indices = list(cfg.get("kot_anchor_indices", []))
     anchor_betas = list(cfg.get("kot_anchor_betas", []))
     # β-anchor from measured half-lives: overrides the manual indices/betas. Betas
-    # are rescaled to the model's β range (relative degradation pattern).
+    # are rescaled to the model's β range (relative degradation pattern). Soft prior
+    # (l2 / gaussian / log_normal) — never hard-fixed unless kot_fixed_beta is set.
     anchor_source = "manual config (kot_anchor_indices)"
+    anchor_sigmas_list: list[float] = []
+    anchor_weights_list: list[float] = []
     beta_anchor_csv = cfg.get("beta_anchor_csv")
+    beta_anchor_prior = str(cfg.get("beta_anchor_prior", "log_normal")).lower()
+    beta_anchor_aggregate = str(cfg.get("beta_anchor_aggregate", "median")).lower()
+    stable_cv_cfg = cfg.get("beta_anchor_stable_cv_max")
+    stable_cv_max = float(stable_cv_cfg) if stable_cv_cfg is not None else None
+    prior_sigma_floor = float(cfg.get("beta_anchor_sigma_floor", 0.25))
     if beta_anchor_csv and Path(beta_anchor_csv).exists():
-        idx, betas, _ = resolve_beta_anchors(
-            beta_anchor_csv, list(second_adata.var_names),
+        idx, betas, weights, sigmas = resolve_beta_anchors(
+            beta_anchor_csv,
+            list(second_adata.var_names),
             target_mean_beta=float(cfg.get("beta_anchor_target", 0.5)),
+            aggregate=beta_anchor_aggregate,
+            stable_cv_max=stable_cv_max,
+            prior_sigma_floor=prior_sigma_floor,
         )
         if idx:
             anchor_indices, anchor_betas = idx, betas
-            anchor_source = f"paper half-lives {beta_anchor_csv} (rescaled to mean {cfg.get('beta_anchor_target', 0.5)})"
+            anchor_weights_list = weights
+            anchor_sigmas_list = sigmas
+            anchor_source = (
+                f"paper half-lives {beta_anchor_csv} "
+                f"(aggregate={beta_anchor_aggregate}, prior={beta_anchor_prior}, "
+                f"stable_cv_max={stable_cv_max}, rescaled mean={cfg.get('beta_anchor_target', 0.5)})"
+            )
     lambda_prior = float(cfg.get("lambda_prior",     1.0))
     fixed_kappa_value = cfg.get("kot_fixed_kappa")
     fixed_alpha_value = cfg.get("kot_fixed_alpha")
@@ -766,6 +817,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
     anchor_idx_t = None
     anchor_target = None
+    anchor_sigma_t = None
+    anchor_weight_t = None
     if use_anchor:
         if not anchor_indices:
             raise ValueError("use_anchor=true requires at least one kot_anchor_indices entry.")
@@ -778,6 +831,13 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             anchor_target = torch.tensor(anchor_betas, dtype=torch.float32, device=device)
         else:
             anchor_target = torch.full((anchor_idx_t.numel(),), anchor_beta, device=device)
+        if anchor_sigmas_list and len(anchor_sigmas_list) == len(anchor_indices):
+            anchor_sigma_t = torch.tensor(anchor_sigmas_list, dtype=torch.float32, device=device)
+        else:
+            floor = prior_sigma_floor * float(cfg.get("beta_anchor_target", anchor_beta))
+            anchor_sigma_t = torch.full((anchor_idx_t.numel(),), floor, device=device)
+        if anchor_weights_list and len(anchor_weights_list) == len(anchor_indices):
+            anchor_weight_t = torch.tensor(anchor_weights_list, dtype=torch.float32, device=device)
 
     print(f"[kot] model: {model_name}")
     print(f"[kot] bounds: κ∈{(kappa_min, kappa_max)}  α∈{(alpha_min, alpha_max)}")
@@ -790,11 +850,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     if use_anchor:
         protein_names = list(second_adata.var_names)
         targets = anchor_target.cpu().numpy()
+        sigmas_np = anchor_sigma_t.cpu().numpy()
         print(f"[kot]   anchor source: {anchor_source}")
-        print(f"[kot]   anchoring {len(anchor_indices)} proteins toward β target "
-              f"(mean {float(targets.mean()):.3f}, λ_prior={lambda_prior}):")
-        for j, b in zip(anchor_indices, targets):
-            print(f"[kot]     [{j:>3}] {protein_names[j]:<18} β*={b:.4f}")
+        print(
+            f"[kot]   anchoring {len(anchor_indices)} proteins "
+            f"(prior={beta_anchor_prior}, λ_prior={lambda_prior}, "
+            f"mean β*={float(targets.mean()):.3f}):"
+        )
+        for j, b, s in zip(anchor_indices, targets, sigmas_np):
+            print(f"[kot]     [{j:>3}] {protein_names[j]:<18} β*={b:.4f}  σ={s:.4f}")
     else:
         print(f"[kot]   anchor disabled (λ_prior={lambda_prior})")
     print(f"[kot] initial β: {initial_beta}")
@@ -889,7 +953,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         loss_dyn_total = loss_dyn_total / len(loader)
 
         loss_anchor = (
-            lambda_prior * (model.beta[anchor_idx_t] - anchor_target).pow(2).sum()
+            beta_anchor_prior_loss(
+                model.beta,
+                anchor_idx_t,
+                anchor_target,
+                anchor_sigma_t,
+                anchor_weight_t,
+                lambda_prior,
+                beta_anchor_prior,
+            )
             if anchor_target is not None
             else torch.tensor(0.0, device=device)
         )
@@ -1033,7 +1105,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         phi_final = model.phi(R_t).cpu().numpy()        # (n, D_p)
         p_np = y                                         # (n, D_p) observed
         loss_anchor_final = (
-            lambda_prior * (model.beta[anchor_idx_t] - anchor_target).pow(2).sum()
+            beta_anchor_prior_loss(
+                model.beta,
+                anchor_idx_t,
+                anchor_target,
+                anchor_sigma_t,
+                anchor_weight_t,
+                lambda_prior,
+                beta_anchor_prior,
+            )
             if anchor_target is not None
             else torch.tensor(0.0, device=device)
         )
@@ -1043,6 +1123,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         model, R_t, V_t, P_t, S_t, rna_adata.obs, subset=1024, mask=mask_t,
     )
     diagnostics["anchor_loss_final"] = float(loss_anchor_final.item())
+    diagnostics["beta_anchor_prior"] = beta_anchor_prior if use_anchor else None
+    diagnostics["beta_anchor_aggregate"] = beta_anchor_aggregate if use_anchor else None
+    diagnostics["beta_anchor_n"] = int(len(anchor_indices)) if use_anchor else 0
     diagnostics["stop_epoch"]        = int(stop_epoch)
     diagnostics["best_align_epoch"]  = int(best_align_epoch)
     diagnostics["best_align"]        = float(best_align)
