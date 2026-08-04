@@ -1126,6 +1126,32 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["beta_anchor_prior"] = beta_anchor_prior if use_anchor else None
     diagnostics["beta_anchor_aggregate"] = beta_anchor_aggregate if use_anchor else None
     diagnostics["beta_anchor_n"] = int(len(anchor_indices)) if use_anchor else 0
+    # Per-anchor recovery: judge the anchor on the proteins it constrains, not the
+    # global beta_mean (which averages the ~130 unanchored proteins and hides whether
+    # anchored β actually moved toward its target).
+    if use_anchor:
+        final_beta_np = model.beta.detach().cpu().numpy()
+        anchor_targets_np = anchor_target.cpu().numpy()
+        anchor_final_np = final_beta_np[anchor_indices]
+        protein_names = list(second_adata.var_names)
+        anchor_abs_err = [
+            abs(float(f) - float(t)) for f, t in zip(anchor_final_np, anchor_targets_np)
+        ]
+        diagnostics["beta_anchor_indices"] = [int(j) for j in anchor_indices]
+        diagnostics["beta_anchor_names"] = [protein_names[j] for j in anchor_indices]
+        diagnostics["beta_anchor_targets"] = [float(t) for t in anchor_targets_np]
+        diagnostics["beta_anchor_final"] = [float(f) for f in anchor_final_np]
+        diagnostics["beta_anchor_abs_err"] = anchor_abs_err
+        diagnostics["beta_anchor_mean_abs_err"] = float(sum(anchor_abs_err) / len(anchor_abs_err))
+        diagnostics["beta_anchor_final_mean"] = float(anchor_final_np.mean())
+    else:
+        diagnostics["beta_anchor_indices"] = []
+        diagnostics["beta_anchor_names"] = []
+        diagnostics["beta_anchor_targets"] = []
+        diagnostics["beta_anchor_final"] = []
+        diagnostics["beta_anchor_abs_err"] = []
+        diagnostics["beta_anchor_mean_abs_err"] = None
+        diagnostics["beta_anchor_final_mean"] = None
     diagnostics["stop_epoch"]        = int(stop_epoch)
     diagnostics["best_align_epoch"]  = int(best_align_epoch)
     diagnostics["best_align"]        = float(best_align)
@@ -1166,6 +1192,19 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     for row, label in zip(diagnostics["branch_confusion_matrix"], diagnostics["branch_confusion_labels"]):
         print(f"[kot]     {label:>12s}: {row}")
     print(f"[kot]   final β: {model.beta.detach().cpu().numpy()}")
+    if use_anchor:
+        print(
+            f"[kot]   anchor recovery: mean|β−β*|={diagnostics['beta_anchor_mean_abs_err']:.4f}  "
+            f"anchored β mean={diagnostics['beta_anchor_final_mean']:.4f}  "
+            f"(target mean={float(anchor_target.cpu().numpy().mean()):.4f})"
+        )
+        for name, tgt, fin, err in zip(
+            diagnostics["beta_anchor_names"],
+            diagnostics["beta_anchor_targets"],
+            diagnostics["beta_anchor_final"],
+            diagnostics["beta_anchor_abs_err"],
+        ):
+            print(f"[kot]     {name:<18} β*={tgt:.4f}  β={fin:.4f}  |Δ|={err:.4f}")
     print(f"[kot] stopped at epoch {stop_epoch} / {n_epochs}")
 
     if output_dir is not None:

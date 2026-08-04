@@ -87,8 +87,9 @@ def resolve_beta_anchors(
     """
     Map a β-anchor CSV to (indices, betas, weights, sigmas).
 
-    sigmas are on the same scale as the rescaled model β (absolute), floored at
-    prior_sigma_floor * target so single-cell-type anchors still have width.
+    sigmas are relative: σ_i = rel_sigma_i × β*_i with rel_sigma floored at
+    prior_sigma_floor, so the log-normal width log_σ = σ/β* is constant across
+    proteins and low-β* anchors are not artificially weakened.
     """
     if aggregate not in ("median", "mean"):
         raise ValueError(f"aggregate must be 'median' or 'mean', got {aggregate!r}")
@@ -130,7 +131,10 @@ def resolve_beta_anchors(
     mean_beta = sum(betas) / len(betas)
     scale = (float(target_mean_beta) / mean_beta) if mean_beta > 0 else 1.0
     betas = [b * scale for b in betas]
-    # rel_sigma is CV-like (unitless); σ_model ≈ rel × β_model, floored.
-    floor = prior_sigma_floor * float(target_mean_beta)
-    sigmas = [max(rel * beta, floor) for rel, beta in zip(rel_sigmas, betas)]
+    # σ is purely relative: σ_i = rel_sigma_i × β*_i, where rel_sigma is already
+    # floored at prior_sigma_floor. This keeps the log-normal width (log_σ = σ/β*)
+    # constant across proteins, so a low-β* anchor gets the same pull as a high-β*
+    # one. An absolute floor (prior_sigma_floor × target_mean) would inflate the
+    # relative width of small-β* anchors and make them toothless.
+    sigmas = [rel * beta for rel, beta in zip(rel_sigmas, betas)]
     return idx, betas, weights, sigmas

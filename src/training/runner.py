@@ -561,6 +561,27 @@ def run_training(
     stage_overrides_cfg = train_cfg.get("stage_overrides", {})
     cli_overrides = dict(set_overrides or {})
 
+    # Reject typo'd --set keys: a plain dict merge would silently inject dead keys
+    # (e.g. `beta_anchor_prio=gaussian`), so validate against every key that appears
+    # in the config's defaults, per-dataset overrides, stage overrides, and the
+    # runtime keys the runner sets itself.
+    known_keys = set(defaults)
+    for ov in train_cfg.get("datasets", {}).values():
+        known_keys.update((ov or {}).keys())
+    for ov in stage_overrides_cfg.values():
+        known_keys.update((ov or {}).keys())
+    for layers in SCALE_LAYERS.values():
+        known_keys.update(layers.keys())
+    for ov in MODEL_OVERRIDES.values():
+        known_keys.update(ov.keys())
+    known_keys.update({"model", "seed", "run_seed", "models", "preprocessing_cache_version"})
+    unknown = set(cli_overrides) - known_keys
+    if unknown:
+        raise ValueError(
+            f"--set has unknown config key(s): {sorted(unknown)}. "
+            f"Check for typos; known keys include: {sorted(known_keys)}"
+        )
+
     # --datasets restricts the run to a comma-separated subset of the config's
     # `datasets:` section (which otherwise trains every dataset listed there).
     selected_datasets = (
@@ -627,6 +648,15 @@ def run_training(
             print(f"[runner] stage={stage} scale={eff_scale} | rna={rna_path}")
 
         base_cfg = {**defaults, **overrides}
+
+        # Fail fast on a missing anchor CSV: a wrong path (e.g. a typo'd filename)
+        # would otherwise fall through to a silent no-anchor run.
+        effective_csv = cli_overrides.get("beta_anchor_csv", base_cfg.get("beta_anchor_csv"))
+        if effective_csv and not Path(effective_csv).exists():
+            raise FileNotFoundError(
+                f"beta_anchor_csv for dataset '{name}' does not exist: {effective_csv}"
+            )
+
         if selected_models is not None:
             base_cfg["models"] = selected_models
         all_models = model_names_from_cfg(base_cfg)

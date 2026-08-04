@@ -1,0 +1,5 @@
+protein_name,hgnc_id,gene_symbol,uniprot_id,cell_type,half_life_hours,beta_per_hour,quality_score_or_R2,source,anchor_weight
+CD8,HGNC:1706,CD8A,nan,Tcells,53.3647,0.01298888,0.994,Savitski2018_Cell_Tcells,0.994
+CD27,HGNC:11922,CD27,nan,Tcells,123.6003,0.00560797,0.219,Savitski2018_Cell_Tcells,0.219
+CD29,HGNC:6153,ITGB1,nan,Tcells,34.807,0.01991402,0.991,Savitski2018_Cell_Tcells,0.991
+CD82,HGNC:6210,CD82,nan,Tcells,68.4283,0.01012953,0.973,Savitski2018_Cell_Tcells,0.973
