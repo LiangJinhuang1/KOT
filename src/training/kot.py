@@ -24,7 +24,7 @@ from src.models.KOT import KOTModel
 from src.losses.sinkhorn import sinkhorn_divergence
 from src.losses.jvp_physics import kinetics_loss
 from src.data.projection import projection_matrix_from_adatas
-from src.data.adt_gene_map import load_mapping_csv
+from src.data.adt_gene_map import load_mapping_records
 from src.data.beta_anchor import resolve_beta_anchors
 from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
 from src.evaluation.trajectory_dtw import trajectory_dtw
@@ -591,6 +591,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     stable_cv_cfg = cfg.get("beta_anchor_stable_cv_max")
     stable_cv_max = float(stable_cv_cfg) if stable_cv_cfg is not None else None
     prior_sigma_floor = float(cfg.get("beta_anchor_sigma_floor", 0.25))
+    beta_warmstart = bool(cfg.get("kot_beta_warmstart_from_anchor", False))
     if beta_anchor_csv and Path(beta_anchor_csv).exists():
         idx, betas, weights, sigmas = resolve_beta_anchors(
             beta_anchor_csv,
@@ -609,6 +610,14 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 f"(aggregate={beta_anchor_aggregate}, prior={beta_anchor_prior}, "
                 f"stable_cv_max={stable_cv_max}, rescaled mean={cfg.get('beta_anchor_target', 0.5)})"
             )
+    # Control: permute the target values across the anchored proteins (same set of
+    # β* values, wrong assignment). If β still sits at these shuffled targets and
+    # FOSCTTM is unchanged, the dynamics does not constrain β (we are asserting, not
+    # recovering); if β drifts back or FOSCTTM worsens, the data prefers the true pattern.
+    if bool(cfg.get("kot_beta_anchor_shuffle", False)) and anchor_betas:
+        perm = np.random.default_rng(int(cfg.get("seed", 42))).permutation(len(anchor_betas))
+        anchor_betas = [anchor_betas[i] for i in perm]
+        print(f"[kot] SHUFFLED anchor targets (control): β* permuted across {len(anchor_betas)} proteins")
     lambda_prior = float(cfg.get("lambda_prior",     1.0))
     fixed_kappa_value = cfg.get("kot_fixed_kappa")
     fixed_alpha_value = cfg.get("kot_fixed_alpha")
@@ -662,19 +671,19 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # Gene→protein S matrix. In feature-space mode this is the paper's S.
     # In representation mode it is projected into the same PCA coordinates as phi.
     mapping_csv = cfg.get("adt_mapping_csv")
+    mapping_records = None
     if mapping_csv and Path(mapping_csv).exists():
-        alias_map = load_mapping_csv(Path(mapping_csv))
-        print(f"[kot] ADT→gene mapping from CSV: {mapping_csv} ({len(alias_map)} links)")
-    else:
-        alias_map = None
-        if mapping_csv:
-            print(f"[kot] adt_mapping_csv '{mapping_csv}' not found — resolving live via HGNC.")
-    S_np, kin_mask = projection_matrix_from_adatas(
+        mapping_records = load_mapping_records(Path(mapping_csv))   # validated, source of truth
+        print(f"[kot] ADT→gene mapping from CSV (source of truth): {mapping_csv} "
+              f"({len(mapping_records)} rows)")
+    elif mapping_csv:
+        print(f"[kot] adt_mapping_csv '{mapping_csv}' not found — resolving live via HGNC.")
+    S_np, align_mask, kin_mask, mapping_report = projection_matrix_from_adatas(
         rna_adata,
         second_adata,
+        mapping_records=mapping_records,
         use_mean_expr=False,
         use_explicit_links=use_explicit_links,
-        alias_map=alias_map,
     )
     # Kinetics mask over the protein axis: only in feature space is each protein a
     # row of φ; in representation mode the protein-PCA axis mixes proteins, so no
@@ -730,6 +739,14 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     print_kot_data_debug(data_debug)
     output_dir = context.get("output_dir")
 
+    # Per-protein mapping report: mapped gene, mapping type, alignment / kinetic
+    # flags, RNA presence, and exclusion reason — one row per panel protein.
+    if output_dir is not None and mapping_report:
+        report_path = Path(output_dir) / "mapping_report.csv"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(mapping_report).to_csv(report_path, index=False)
+        print(f"[kot] wrote mapping report: {report_path}")
+
     if "velocity_confidence" in rna_adata.obs.columns:
         conf = np.array(rna_adata.obs["velocity_confidence"].values, dtype=np.float32)
     else:
@@ -751,15 +768,28 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         kin_mask = kin_mask & has_stable
         print(f"[kot] velocity-gene filter: dropped {dropped} proteins with no stable-velocity gene")
 
-    # Kinetics mask (default on in feature space): only linked proteins enter L_dyn.
-    # Set kot_use_kinetics_mask=false to restore the pre-mask residual over all D_p.
-    use_kinetics_mask = bool(cfg.get("kot_use_kinetics_mask", True)) and use_feature_space
+    # Kinetics mask (default on in feature space): only kinetic_mask=True proteins
+    # enter L_dyn. When a mapping CSV is the source of truth, its use_for_kinetics
+    # decisions are authoritative — the mask always comes from the CSV, and
+    # kot_use_kinetics_mask cannot silently widen the residual back to all D_p.
+    csv_source_of_truth = mapping_records is not None
+    use_kinetics_mask = (
+        bool(cfg.get("kot_use_kinetics_mask", True)) or csv_source_of_truth
+    ) and use_feature_space
     if use_kinetics_mask:
         mask_t = to_tensor(kin_mask.astype(np.float32), device)   # (D_p,)
     else:
         mask_t = None
-    print(f"[kot] kinetics_mask={'on' if mask_t is not None else 'off'} "
+    mask_source = "mapping CSV (use_for_kinetics)" if csv_source_of_truth else "name/link matching"
+    print(f"[kot] kinetics_mask={'on' if mask_t is not None else 'off'} (source: {mask_source}) "
           f"| active={int(kin_mask.sum()) if use_feature_space else D_p}/{D_p}")
+    # Alignment mask over the protein axis: Sinkhorn compares only use_for_alignment
+    # proteins; φ still predicts the full panel. Per-protein only in feature space.
+    if use_feature_space and not align_mask.all():
+        align_cols = torch.as_tensor(np.nonzero(align_mask)[0], dtype=torch.long, device=device)
+        print(f"[kot] alignment_mask on | {int(align_mask.sum())}/{D_p} proteins in Sinkhorn")
+    else:
+        align_cols = None
     # Optional per-protein normalisation (off by default). The scale is floored at
     # the median std so it only DOWN-weights high-abundance proteins; without the
     # floor, near-constant proteins get a tiny std and their residual explodes.
@@ -799,6 +829,17 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     if fixed_beta_value is not None:
         fixed_beta_target = set_fixed_beta(model, fixed_beta_value, D_p, device)
         print(f"[kot] Fixed beta enabled: {fixed_beta_target.detach().cpu().numpy()}")
+
+    # Warm-start β at the resolved anchor targets: β starts where the anchor wants
+    # it (β = softplus(β_raw)+1e-6), stays trainable, and the soft prior holds it
+    # there. This sidesteps the bounded travel of β from its default ~0.72 init,
+    # which the diagnostics showed the prior alone cannot overcome.
+    if beta_warmstart and use_anchor and fixed_beta_value is None and anchor_indices and anchor_betas:
+        with torch.no_grad():
+            ws_idx = torch.tensor(anchor_indices, dtype=torch.long, device=device)
+            ws_tgt = torch.tensor(anchor_betas, dtype=torch.float32, device=device)
+            model.beta_raw[ws_idx] = inverse_softplus((ws_tgt - 1e-6).clamp(min=1e-6))
+        print(f"[kot] warm-started β at {len(anchor_indices)} anchor targets (β stays trainable)")
 
     initial_beta = model.beta.detach().cpu().numpy().copy()
 
@@ -937,11 +978,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         # ~90k cells) stay within GPU memory instead of building an n×n matrix.
         if sinkhorn_max_points is not None and n > sinkhorn_max_points:
             align_idx = torch.randperm(n, device=device)[:sinkhorn_max_points]
-            phi_align = model.phi(R_t[align_idx])
-            loss_align = sinkhorn_divergence(phi_align, P_t[align_idx], blur=blur)
+            phi_align = model.phi(R_t[align_idx])        # (b, D_p), φ predicts full panel
+            P_align = P_t[align_idx]
         else:
             phi_align = model.phi(R_t)                   # (n, D_p)
-            loss_align = sinkhorn_divergence(phi_align, P_t, blur=blur)
+            P_align = P_t
+        if align_cols is not None:                       # compare only use_for_alignment proteins
+            phi_align = phi_align[:, align_cols]
+            P_align = P_align[:, align_cols]
+        loss_align = sinkhorn_divergence(phi_align, P_align, blur=blur)
 
         # --- Kinetics step (micro-batches) ---
         loss_dyn_total = torch.tensor(0.0, device=device)

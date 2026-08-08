@@ -142,7 +142,7 @@ def build_model_and_tensors(
 
     mapping_csv = run_cfg.get("adt_mapping_csv")
     alias_map = load_mapping_csv(Path(mapping_csv)) if (mapping_csv and Path(mapping_csv).exists()) else None
-    S_np, kin_mask = projection_matrix_from_adatas(
+    S_np, _align_mask, kin_mask, _report = projection_matrix_from_adatas(
         rna_adata, protein_adata,
         use_mean_expr=False,
         use_explicit_links=use_explicit_links,

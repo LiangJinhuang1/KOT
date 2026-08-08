@@ -99,32 +99,104 @@ def adt_to_gene(protein_names, hgnc_path: Path = HGNC_PATH) -> dict[str, str]:
     return mapping
 
 
+# Canonical column order of an ADT→gene mapping CSV (from build_mapping_rows).
+MAPPING_COLUMNS = [
+    "adt_name", "hgnc_id", "gene_symbol", "uniprot_id", "mapping_type",
+    "present_in_rna", "use_for_alignment", "use_for_kinetics", "excluded_because",
+]
+
+
+def parse_bool(value) -> bool | None:
+    """Parse a CSV cell to bool; '' → None (unknown, e.g. present_in_rna)."""
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    if s == "":
+        return None
+    raise ValueError(f"cannot parse boolean from {value!r}")
+
+
+def validate_mapping_records(records: list[dict]) -> None:
+    """
+    Assert the invariants an ADT→gene mapping table must satisfy, failing loud on
+    a malformed CSV rather than letting it silently distort alignment / kinetics:
+
+      * adt_name is unique across rows;
+      * use_for_kinetics=True implies a non-empty gene_symbol;
+      * an isotype control is never used for kinetics;
+      * every row excluded from kinetics carries an exclusion reason.
+    """
+    names = [r["adt_name"] for r in records]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    assert not dupes, f"duplicate adt_name(s) in mapping: {dupes}"
+    for r in records:
+        name = r["adt_name"]
+        assert name, "empty adt_name in mapping row"
+        if r["use_for_kinetics"]:
+            assert r["gene_symbol"], f"{name}: use_for_kinetics=True but gene_symbol is empty"
+        else:
+            assert r["excluded_because"], f"{name}: excluded from kinetics but no excluded_because reason"
+        if r["mapping_type"] == "isotype":
+            assert not r["use_for_kinetics"], f"{name}: isotype control must not have use_for_kinetics=True"
+
+
+def load_mapping_records(path: Path) -> list[dict]:
+    """
+    Load the full ADT→gene mapping CSV: one normalized record per row with every
+    column (decision flags parsed to bool), validated by validate_mapping_records.
+
+    Unlike load_mapping_csv (which returns only the gene alias), this preserves
+    mapping_type, present_in_rna, use_for_alignment, use_for_kinetics and
+    excluded_because so the projection can honour the curated decisions.
+    """
+    records: list[dict] = []
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        missing = [c for c in MAPPING_COLUMNS if c not in (reader.fieldnames or [])]
+        assert not missing, f"{path} missing mapping columns: {missing}"
+        for row in reader:
+            records.append({
+                "adt_name":          (row.get("adt_name") or "").strip(),
+                "hgnc_id":           (row.get("hgnc_id") or "").strip(),
+                "gene_symbol":       (row.get("gene_symbol") or "").strip(),
+                "uniprot_id":        (row.get("uniprot_id") or "").strip(),
+                "mapping_type":      (row.get("mapping_type") or "").strip(),
+                "present_in_rna":    parse_bool(row.get("present_in_rna")),
+                "use_for_alignment": bool(parse_bool(row.get("use_for_alignment"))),
+                "use_for_kinetics":  bool(parse_bool(row.get("use_for_kinetics"))),
+                "excluded_because":  (row.get("excluded_because") or "").strip(),
+            })
+    validate_mapping_records(records)
+    return records
+
+
 def load_mapping_csv(path: Path) -> dict[str, str]:
     """
-    {adt_name: gene_symbol} from a mapping CSV written by build_adt_mapping.
+    {adt_name: gene_symbol} from a validated mapping CSV (see load_mapping_records).
 
-    Every row carrying a gene symbol is included; whether that gene is actually
-    present in the RNA matrix (hence whether the protein enters kinetics) is
-    decided live in build_projection_matrix, so the CSV stays valid even if the
-    RNA gene set changes (e.g. after a velocity re-run).
+    Backward-compatible alias loader; loading now also validates the whole table,
+    so a malformed CSV is caught here before it reaches training.
     """
-    mapping: dict[str, str] = {}
-    with open(path) as f:
-        for row in csv.DictReader(f):
-            gene = (row.get("gene_symbol") or "").strip()
-            if gene:
-                mapping[row["adt_name"]] = gene
-    return mapping
+    return {
+        r["adt_name"]: r["gene_symbol"]
+        for r in load_mapping_records(path)
+        if r["gene_symbol"]
+    }
 
 
 def build_mapping_rows(protein_names, rna_symbols=None, hgnc_path: Path = HGNC_PATH) -> list[dict]:
     """
     One row per ADT marker with its gene resolution and usage flags.
 
-    use_for_alignment is always True (every measured protein feeds the Sinkhorn
-    alignment). use_for_kinetics is True only when the marker resolves to a gene
-    that is present in the RNA matrix — those are the proteins the ODE / S term
-    can constrain. rna_symbols=None leaves present_in_rna blank (resolution only).
+    use_for_alignment is True for every measured protein except isotype controls,
+    which are background and must not inform the Sinkhorn alignment. use_for_kinetics
+    is True only when the marker resolves to a gene that is present in the RNA matrix
+    — those are the proteins the ODE / S term can constrain. rna_symbols=None leaves
+    present_in_rna blank (resolution only).
     """
     records = load_hgnc_records(hgnc_path) if hgnc_path.exists() else {}
     manual = {alnum(k): v for k, v in MANUAL_ADT_TO_GENE.items()}
@@ -149,8 +221,9 @@ def build_mapping_rows(protein_names, rna_symbols=None, hgnc_path: Path = HGNC_P
             "uniprot_id":        "",   # not present in this HGNC export
             "mapping_type":      mapping_type,
             "present_in_rna":    "" if present is None else bool(present),
-            "use_for_alignment": True,
+            "use_for_alignment": mapping_type != "isotype",   # isotype controls do not inform alignment
             "use_for_kinetics":  gene is not None and present is not False,
             "excluded_because":  excluded,
         })
+    validate_mapping_records(rows)   # fail loud if the built table breaks an invariant
     return rows

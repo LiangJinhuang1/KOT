@@ -136,7 +136,7 @@ def main() -> None:
     delayed_spliced = delayed_spliced_values(time, state, scalar_spliced)
     scalar_delayed_rhs = PARAMS["K_S"] * delayed_spliced - PARAMS["GAMMA_P"] * scalar_protein
 
-    S = projection_matrix_from_adatas(adata, protein_adata, use_explicit_links=True)
+    S, _align_mask, _kin_mask, _report = projection_matrix_from_adatas(adata, protein_adata, use_explicit_links=True)
     Sr = (S @ spliced_mean.T).T
     feature_kot_rhs = PARAMS["K_S"] * Sr - PARAMS["GAMMA_P"] * protein_mean
 

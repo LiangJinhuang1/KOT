@@ -46,19 +46,47 @@ def rna_var_names(meta: dict) -> list[str]:
     return list(ad.read_h5ad(meta["rna_path"], backed="r").var_names)
 
 
+def dedupe_preserve_order(names: list[str]) -> tuple[list[str], list[str]]:
+    """Drop duplicate ADT names (keep first occurrence); return (unique, dropped)."""
+    seen: set[str] = set()
+    unique, dropped = [], []
+    for n in names:
+        if n in seen:
+            dropped.append(n)
+        else:
+            seen.add(n)
+            unique.append(n)
+    return unique, dropped
+
+
 def write_mapping(name: str, meta: dict) -> None:
-    rows = build_mapping_rows(protein_var_names(meta), rna_var_names(meta))
+    prot_names = protein_var_names(meta)
+    unique_names, dropped = dedupe_preserve_order(prot_names)
+    if dropped:
+        print(f"[{name}] WARNING: dropped {len(dropped)} duplicate ADT name(s): "
+              f"{sorted(set(dropped))}")
+
+    rows = build_mapping_rows(unique_names, rna_var_names(meta))   # validated: names unique
     df = pd.DataFrame(rows)
+    assert df["adt_name"].is_unique, f"[{name}] duplicate adt_name in output table"
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"adt_mapping_{name}.csv"
     df.to_csv(out, index=False)
 
-    n = len(df)
-    kin = int(df["use_for_kinetics"].sum())
-    by_type = df["mapping_type"].value_counts().to_dict()
-    print(f"[{name}] {n} ADTs → {out}")
-    print(f"    mapping_type: {by_type}")
-    print(f"    use_for_alignment: {n}/{n}  |  use_for_kinetics: {kin}/{n}")
+    # Short summary for a manual double-check.
+    n        = len(df)
+    align    = int(df["use_for_alignment"].sum())
+    kin      = int(df["use_for_kinetics"].sum())
+    present  = int(sum(v is True for v in df["present_in_rna"]))
+    excluded = int((df["excluded_because"].astype(str).str.len() > 0).sum())
+    by_type  = df["mapping_type"].value_counts().to_dict()
+    print(f"[{name}] {n} unique ADTs → {out}")
+    print(f"    mapping_type:      {by_type}")
+    print(f"    use_for_alignment: {align}/{n}")
+    print(f"    use_for_kinetics:  {kin}/{n}")
+    print(f"    present_in_rna:    {present}/{n}")
+    print(f"    excluded:          {excluded}/{n}")
 
 
 def main() -> None:

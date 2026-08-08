@@ -15,7 +15,7 @@ from scipy import sparse
 from scipy.io import mmread
 
 from src.data.transforms import reduce_rna
-from src.data.adt_gene_map import load_mapping_csv
+from src.data.adt_gene_map import load_mapping_records
 from src.utils.io import load_yaml
 
 DEFAULT_CONFIG = Path("config/velocity.yaml")
@@ -357,13 +357,73 @@ def select_hvgs(adata, n_top_genes: int, hvg_flavor: str, retain_genes=None):
     return adata[:, keep].copy()
 
 
+def gene_layer_presence(adata, layer: str) -> set[str]:
+    """Genes with > 0 total counts in a layer (i.e. present in that modality)."""
+    if layer not in adata.layers:
+        return set()
+    M = adata.layers[layer]
+    totals = np.asarray(M.sum(axis=0)).ravel() if sparse.issparse(M) else np.asarray(M).sum(axis=0)
+    return {str(g) for g, t in zip(adata.var_names, totals) if t > 0}
+
+
+def build_velocity_gene_diagnostics(retain_genes, raw_names, spliced, unspliced, final_adata):
+    """
+    One row per force-retained gene, tracing it through the velocity pipeline:
+    requested_for_retention, present_in_raw_rna, present_in_spliced,
+    present_in_unspliced, passed_count_qc, velocity_estimated, velocity_gene,
+    final_kinetics_eligible (survived QC and got a scVelo velocity fit).
+    """
+    retain = {str(g) for g in (retain_genes or [])}
+    final_names = {str(g) for g in final_adata.var_names}
+    vgenes = set()
+    if "velocity_genes" in final_adata.var:
+        flags = final_adata.var["velocity_genes"].to_numpy().astype(bool)
+        vgenes = {str(g) for g, f in zip(final_adata.var_names, flags) if f}
+    vel_est = set()
+    if "velocity" in final_adata.layers:
+        V = final_adata.layers["velocity"]
+        arr = V.toarray() if sparse.issparse(V) else np.asarray(V)
+        has_v = np.isfinite(arr).any(axis=0) & (np.nan_to_num(arr) != 0).any(axis=0)
+        vel_est = {str(g) for g, f in zip(final_adata.var_names, has_v) if f}
+
+    rows = []
+    for g in sorted(retain):
+        passed_qc = g in final_names
+        is_vgene = g in vgenes
+        rows.append({
+            "gene":                    g,
+            "requested_for_retention": True,
+            "present_in_raw_rna":      g in raw_names,
+            "present_in_spliced":      g in spliced,
+            "present_in_unspliced":    g in unspliced,
+            "passed_count_qc":         passed_qc,
+            "velocity_estimated":      g in vel_est,
+            "velocity_gene":           is_vgene,
+            "final_kinetics_eligible": bool(passed_qc and is_vgene),
+        })
+    return rows
+
+
 def run_scvelo(adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neighbors,
                velocity_mode, dynamics_n_jobs, retain_genes=None):
     if not has_splicing_layers(adata):
         raise ValueError("Missing spliced/unspliced layers; cannot calculate RNA velocity.")
     scv.utils.show_proportions(adata)
+    # Snapshot raw presence BEFORE HVG / count filtering, so the diagnostics can
+    # trace every retained gene through each stage of the pipeline.
+    raw_names     = {str(g) for g in adata.var_names}
+    raw_spliced   = gene_layer_presence(adata, "spliced")
+    raw_unspliced = gene_layer_presence(adata, "unspliced")
+
     adata = select_hvgs(adata, n_top_genes, hvg_flavor, retain_genes=retain_genes)
-    scv.pp.filter_and_normalize(adata, min_shared_counts=min_shared_counts)
+    # Preserve the retained (use_for_kinetics) genes through count filtering: scVelo
+    # honours retain_genes and keeps them even below min_shared_counts, so the union
+    # HVG ∪ retain is not silently eroded by filter_and_normalize.
+    scv.pp.filter_and_normalize(
+        adata,
+        min_shared_counts=min_shared_counts,
+        retain_genes=sorted(retain_genes) if retain_genes else None,
+    )
     actual_n_pcs = min(n_pcs, adata.n_obs - 1, adata.n_vars - 1)
     if actual_n_pcs < 1:
         raise ValueError(f"Too few features ({adata.n_vars}) after filtering — cannot run PCA.")
@@ -382,6 +442,16 @@ def run_scvelo(adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neigh
     scv.tl.velocity_pseudotime(adata)
     if velocity_mode == "dynamical":
         scv.tl.latent_time(adata)
+
+    if retain_genes:
+        diag = build_velocity_gene_diagnostics(
+            retain_genes, raw_names, raw_spliced, raw_unspliced, adata
+        )
+        adata.uns["velocity_gene_diagnostics"] = pd.DataFrame(diag)
+        n_elig = int(sum(r["final_kinetics_eligible"] for r in diag))
+        n_lost = int(sum(not r["passed_count_qc"] for r in diag))
+        print(f"[velocity] retained-gene trace: {n_elig}/{len(diag)} finally kinetics-eligible "
+              f"({n_lost} dropped at count QC)")
     return adata
 
 
@@ -515,8 +585,15 @@ def execute_run(run_config: dict) -> None:
     retain_genes = None
     retain_csv = run_config.get("retain_genes_csv")
     if retain_csv and Path(retain_csv).exists():
-        retain_genes = set(load_mapping_csv(Path(retain_csv)).values())
-        print(f"[velocity] force-retaining {len(retain_genes)} ADT-target genes from {retain_csv}")
+        # Retain only genes for proteins that are actually use_for_kinetics — not
+        # every mapped gene. Alignment-only / excluded proteins must not force a
+        # gene into the velocity model.
+        retain_genes = {
+            r["gene_symbol"]
+            for r in load_mapping_records(Path(retain_csv))
+            if r["use_for_kinetics"] and r["gene_symbol"]
+        }
+        print(f"[velocity] force-retaining {len(retain_genes)} use_for_kinetics genes from {retain_csv}")
 
     adata = run_scvelo(
         adata,
@@ -536,6 +613,10 @@ def execute_run(run_config: dict) -> None:
     # Retained runs write to a separate _retained file so the original velocity
     # result (and its downstream runs) stay reproducible.
     suffix = "_retained" if retain_genes else ""
+    if "velocity_gene_diagnostics" in adata.uns:
+        diag_path = output_dir / f"{label}_velocity_gene_diagnostics{suffix}.csv"
+        adata.uns["velocity_gene_diagnostics"].to_csv(diag_path, index=False)
+        print(f"Wrote {diag_path}")
     result_path = output_dir / f"{label}_scvelo_results{suffix}.h5ad"
     adata.write_h5ad(result_path)
     print(f"Wrote {result_path}")
