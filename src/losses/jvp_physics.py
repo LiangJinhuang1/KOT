@@ -20,6 +20,7 @@ def kinetics_loss(
     confidence: torch.Tensor,
     mask: torch.Tensor | None = None,
     scale: torch.Tensor | None = None,
+    velocity_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Velocity-confidence-weighted ODE residual, averaged over the active proteins.
@@ -46,9 +47,18 @@ def kinetics_loss(
                            None = every protein is active.
     scale      : (D_p,)    per-protein normaliser (e.g. observed-protein std).
                            None = no per-protein normalisation.
+    velocity_weight : (D_r,)  RNA-side reliability, e.g. 1 for velocity_genes and 0
+                           otherwise. Masking only the protein OUTPUT is not enough:
+                           J_φ(r)·v mixes every RNA coordinate, so velocity noise from
+                           genes without a usable fit leaks into the predicted protein
+                           derivative. Zeroing those coordinates in v removes the leak.
+                           None = use v unweighted.
     """
-    # JVP: phi_r = φ(r),  dphi_dv = J_φ(r)·v   — one forward pass
-    phi_r, dphi_dv = torch_jvp(phi_theta, (r,), (v,))
+    # RNA-side reliability: down-weight/zero velocity of genes without a usable fit
+    # BEFORE the Jacobian push-forward, so their noise cannot contaminate dφ/dt.
+    v_in = v if velocity_weight is None else v * velocity_weight
+    # JVP: phi_r = φ(r),  dphi_dv = J_φ(r)·v_in   — one forward pass
+    phi_r, dphi_dv = torch_jvp(phi_theta, (r,), (v_in,))
 
     kappa = kappa_psi(r)               # (B, 1)
     alpha = g_omega(r)                 # (B, D_p)

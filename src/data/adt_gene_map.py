@@ -188,32 +188,49 @@ def load_mapping_csv(path: Path) -> dict[str, str]:
     }
 
 
-def build_mapping_rows(protein_names, rna_symbols=None, hgnc_path: Path = HGNC_PATH) -> list[dict]:
+def build_mapping_rows(protein_names, rna_symbols=None, hgnc_path: Path = HGNC_PATH,
+                       kinetic_complex_allow=None) -> list[dict]:
     """
     One row per ADT marker with its gene resolution and usage flags.
 
-    use_for_alignment is True for every measured protein except isotype controls,
-    which are background and must not inform the Sinkhorn alignment. use_for_kinetics
-    is True only when the marker resolves to a gene that is present in the RNA matrix
-    — those are the proteins the ODE / S term can constrain. rna_symbols=None leaves
-    present_in_rna blank (resolution only).
+    use_for_alignment is True for every measured protein except isotype controls
+    (background, must not inform Sinkhorn). use_for_kinetics is INTENT and, so the
+    mapping_type actually means something, distinguishes confidence:
+
+      * one_to_one       → kinetics-eligible automatically (high-confidence 1:1).
+      * complex_curated  → a representative-chain approximation (e.g. CD3→CD3E,
+                           HLA-DR→HLA-DRA). NOT eligible automatically — only if its
+                           marker name or gene is in kinetic_complex_allow. This keeps
+                           the 1:1-vs-approximation distinction a deliberate choice.
+      * isotype / unmapped → never eligible.
+
+    Eligibility is intent (independent of any RNA matrix) so velocity retention can
+    recover a dropped gene; present_in_rna records matrix presence separately.
+    kinetic_complex_allow: iterable of ADT names or gene symbols allowed for kinetics
+    despite being complex_curated. rna_symbols=None leaves present_in_rna blank.
     """
     records = load_hgnc_records(hgnc_path) if hgnc_path.exists() else {}
     manual = {alnum(k): v for k, v in MANUAL_ADT_TO_GENE.items()}
     rna_set = {s.upper() for s in rna_symbols} if rna_symbols is not None else None
+    allow = {alnum(strip_adt_suffix(str(x))) for x in (kinetic_complex_allow or [])}
 
     rows = []
     for name in protein_names:
         gene, hgnc_id, mapping_type = resolve_marker(name, records, manual)
         present = None if (rna_set is None or gene is None) else (gene.upper() in rna_set)
+        allowed_complex = (
+            mapping_type == "complex_curated"
+            and (alnum(strip_adt_suffix(name)) in allow or (gene and alnum(gene) in allow))
+        )
+        use_for_kinetics = (mapping_type == "one_to_one") or allowed_complex
         if mapping_type == "isotype":
             excluded = "isotype control (no target gene)"
         elif mapping_type == "unmapped":
             excluded = "no single HGNC gene (complex / not found)"
-        elif present is False:
-            excluded = "gene absent from RNA matrix"
+        elif mapping_type == "complex_curated" and not allowed_complex:
+            excluded = "complex / representative-chain approximation — not kinetics-eligible unless allow-listed"
         else:
-            excluded = ""
+            excluded = ""   # eligible; absence in a matrix is not an exclusion
         rows.append({
             "adt_name":          name,
             "hgnc_id":           hgnc_id,
@@ -222,7 +239,7 @@ def build_mapping_rows(protein_names, rna_symbols=None, hgnc_path: Path = HGNC_P
             "mapping_type":      mapping_type,
             "present_in_rna":    "" if present is None else bool(present),
             "use_for_alignment": mapping_type != "isotype",   # isotype controls do not inform alignment
-            "use_for_kinetics":  gene is not None and present is not False,
+            "use_for_kinetics":  use_for_kinetics,   # intent; complex needs allow-listing
             "excluded_because":  excluded,
         })
     validate_mapping_records(rows)   # fail loud if the built table breaks an invariant

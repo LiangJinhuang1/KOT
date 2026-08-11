@@ -34,7 +34,12 @@ used at training time exactly.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd
 import torch
@@ -79,42 +84,59 @@ def dtw_for_checkpoint(model, ckpt_path: Path, R_t, P_t, rna_obs, n_bins: int):
 def dtw_for_run(run_folder: Path, device, n_bins: int) -> list[dict]:
     """Compute trajectory DTW for every checkpoint under one run folder."""
     print(f"\n=== {run_folder.name} ===")
-    rna_adata, protein_adata, run_cfg, dataset_name = load_dataset_for_run(run_folder)
 
     rows = []
+    data_cache = {}
     for model_dir in sorted(p for p in run_folder.iterdir() if p.is_dir()):
         model_name = model_dir.name
-        dataset_dir = model_dir / dataset_name
-        if not dataset_dir.exists():
+        if model_name in {"cache", "results"} or model_name.startswith("."):
             continue
 
-        model, R_t, V_t, P_t, S_t, rna_obs, _ = build_model_and_tensors(
-            run_cfg, rna_adata, protein_adata, model_name, device,
-        )
-
-        for seed_dir in sorted(
-            p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")
-        ):
-            seed = int(seed_dir.name.split("_", 1)[1])
-            for ckpt_name in CHECKPOINT_NAMES:
-                ckpt_path = seed_dir / f"checkpoint_{ckpt_name}.pt"
-                if not ckpt_path.exists():
+        for dataset_dir in sorted(p for p in model_dir.iterdir() if p.is_dir()):
+            dataset_name = dataset_dir.name
+            if dataset_name not in data_cache:
+                try:
+                    data_cache[dataset_name] = load_dataset_for_run(run_folder, dataset_name)
+                except Exception as e:
+                    print(f"  [{dataset_name}] load_dataset FAILED: {e}")
                     continue
+            rna_adata, protein_adata, run_cfg, _ = data_cache[dataset_name]
 
-                epoch, temporal, recon = dtw_for_checkpoint(
-                    model, ckpt_path, R_t, P_t, rna_obs, n_bins,
+            try:
+                model, R_t, _V_t, P_t, _S_t, rna_obs, _mask_t, _align_cols = build_model_and_tensors(
+                    run_cfg, rna_adata, protein_adata, model_name, device,
                 )
-                rows.append({
-                    "run":                run_folder.name,
-                    "model":              model_name,
-                    "seed":               seed,
-                    "checkpoint":         ckpt_name,
-                    "checkpoint_epoch":   epoch,
-                    "traj_dtw_temporal":  temporal,
-                    "traj_dtw_recon":     recon,
-                })
-                print(f"  ✓ {model_name}/seed_{seed:>4}/{ckpt_name:<11} "
-                      f"DTW_temporal={temporal:.4f}  DTW_recon={recon:.4f}")
+            except Exception as e:
+                print(f"  [{model_name}/{dataset_name}] build_model FAILED: {e}")
+                continue
+
+            for seed_dir in sorted(
+                p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")
+            ):
+                tail = seed_dir.name.split("_", 1)[1]
+                if not tail.isdigit():
+                    continue
+                seed = int(tail)
+                for ckpt_name in CHECKPOINT_NAMES:
+                    ckpt_path = seed_dir / f"checkpoint_{ckpt_name}.pt"
+                    if not ckpt_path.exists():
+                        continue
+
+                    epoch, temporal, recon = dtw_for_checkpoint(
+                        model, ckpt_path, R_t, P_t, rna_obs, n_bins,
+                    )
+                    rows.append({
+                        "run":                run_folder.name,
+                        "model":              model_name,
+                        "dataset":            dataset_name,
+                        "seed":               seed,
+                        "checkpoint":         ckpt_name,
+                        "checkpoint_epoch":   epoch,
+                        "traj_dtw_temporal":  temporal,
+                        "traj_dtw_recon":     recon,
+                    })
+                    print(f"  ✓ {model_name}/{dataset_name}/seed_{seed:>4}/{ckpt_name:<11} "
+                          f"DTW_temporal={temporal:.4f}  DTW_recon={recon:.4f}")
 
     if rows:
         per_run_out = run_folder / "trajectory_dtw_summary.csv"
@@ -166,7 +188,7 @@ def main():
     print(f"✓ Wrote {len(df)} rows to {out_path}")
     print("Preview (best traj_dtw_temporal per checkpoint):")
     preview = df.sort_values("traj_dtw_temporal").groupby("checkpoint").head(3)
-    print(preview[["run", "model", "seed", "checkpoint", "checkpoint_epoch",
+    print(preview[["run", "model", "dataset", "seed", "checkpoint", "checkpoint_epoch",
                    "traj_dtw_temporal", "traj_dtw_recon"]].to_string(index=False))
 
 

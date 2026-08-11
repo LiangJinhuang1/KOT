@@ -29,26 +29,35 @@ The summary CSV has one row per (run, model, seed, checkpoint) and includes:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import re
+import sys
 import traceback
 from glob import glob
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import pandas as pd
 import torch
 
 from src.utils.io import load_yaml
+from src.utils.arrays import to_dense
 from src.data.preprocessing import load_and_preprocess_cached
 from src.data.projection import projection_matrix_from_adatas
-from src.data.adt_gene_map import load_mapping_csv
+from src.data.adt_gene_map import load_mapping_records
 from src.models.KOT import KOTModel
 from src.training.kot import (
+    FixedAlpha,
     FixedKappa,
     compute_full_diagnostics,
     compute_per_cell_diagnostics,
-    dense_array,
     matrix_from_adata,
+    set_fixed_beta,
     to_tensor,
 )
 
@@ -59,11 +68,119 @@ DEFAULT_OUTPUT = Path("cache/results/checkpoint_eval_summary.csv")
 
 CHECKPOINT_NAMES = ["best_align", "best_dyn", "best_total", "final"]
 
-# Mirror runner.MODEL_OVERRIDES so we apply the right kappa for kot_fixedkappa.
+# Mirror the KOT-specific runner.MODEL_OVERRIDES so checkpoint architecture
+# matches the saved state dict.
 MODEL_OVERRIDES = {
-    "kot_nodyn":      {"lambda_dyn": 0.0},
-    "kot_fixedkappa": {"kot_fixed_kappa": 0.6931471805599453},
-    "kot_anchor":     {"use_anchor": True},
+    "kot_nodyn": {"lambda_dyn": 0.0},
+    "kot_fixedkappa": {
+        "kot_fixed_kappa": 0.6931471805599453,
+        "kot_fixed_alpha": None,
+        "kot_alpha_min": 1.0e-3,
+        "kot_alpha_max": 1.5,
+        "lambda_kappa_prior": 0.0,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": False,
+        "g_dims": [256, 128],
+    },
+    "kot_fixedalpha": {
+        "kot_fixed_alpha": 0.6931471805599453,
+        "kot_fixed_kappa": None,
+        "kot_kappa_min": 1.0e-3,
+        "kot_kappa_max": 1.5,
+        "kot_kappa_prior": 0.6931471805599453,
+        "lambda_kappa_prior": 0.01,
+        "kot_alpha_min": 1.0e-6,
+        "kot_alpha_max": None,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": False,
+        "g_dims": [256, 128],
+    },
+    "kot_oracle": {
+        "kot_fixed_alpha": 1.0,
+        "kot_fixed_kappa": 1.0,
+        "kot_fixed_beta": 0.5,
+        "kot_kappa_min": 1.0,
+        "kot_kappa_max": 1.0,
+        "use_anchor": False,
+        "kot_anchor_indices": [],
+        "kot_anchor_betas": [],
+        "lambda_prior": 0.0,
+        "lambda_kappa_prior": 0.0,
+        "kot_alpha_min": 1.0,
+        "kot_alpha_max": 1.0,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": False,
+        "g_dims": [256, 128],
+    },
+    "kot_oracle_learnalpha": {
+        "kot_fixed_alpha": None,
+        "kot_fixed_kappa": 1.0,
+        "kot_fixed_beta": 0.5,
+        "kot_kappa_min": 1.0,
+        "kot_kappa_max": 1.0,
+        "use_anchor": False,
+        "kot_anchor_indices": [],
+        "kot_anchor_betas": [],
+        "lambda_prior": 0.0,
+        "lambda_kappa_prior": 0.0,
+        "kot_alpha_min": 1.0e-3,
+        "kot_alpha_max": 1.5,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": False,
+        "g_dims": [256, 128],
+    },
+    "kot_oracle_learnalpha_kappa": {
+        "kot_fixed_alpha": None,
+        "kot_fixed_kappa": None,
+        "kot_fixed_beta": 0.5,
+        "kot_kappa_min": 1.0e-3,
+        "kot_kappa_max": 1.5,
+        "use_anchor": False,
+        "kot_anchor_indices": [],
+        "kot_anchor_betas": [],
+        "lambda_prior": 0.0,
+        "lambda_kappa_prior": 0.0,
+        "kot_alpha_min": 1.0e-3,
+        "kot_alpha_max": 1.5,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": False,
+        "g_dims": [256, 128],
+    },
+    "kot_unbounded": {
+        "kot_kappa_min": 1.0e-6,
+        "kot_kappa_max": None,
+        "kot_alpha_min": 1.0e-6,
+        "kot_alpha_max": None,
+        "lambda_kappa_prior": 0.0,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": False,
+        "g_dims": [256, 128],
+    },
+    "kot_unbounded_sn": {
+        "kot_kappa_min": 1.0e-6,
+        "kot_kappa_max": None,
+        "kot_alpha_min": 1.0e-6,
+        "kot_alpha_max": None,
+        "lambda_kappa_prior": 0.0,
+        "g_freeze_epochs": 0,
+        "phi_spectral_norm": True,
+        "g_dims": [256, 128],
+    },
+    "kot_anchor": {"use_anchor": True},
+}
+
+STAGED_DATASET = "synthetic_linked_ode"
+SCALE_LAYERS = {
+    "mean": {
+        "kot_rna_layer":     "spliced_mean",
+        "kot_protein_layer": "protein_mean",
+        "velocity_layer":    "true_velocity_mean",
+    },
+    "log": {
+        "kot_rna_layer":     "spliced_log1p",
+        "kot_protein_layer": "protein_log1p",
+        "velocity_layer":    "true_velocity_log1p",
+    },
 }
 
 
@@ -87,22 +204,107 @@ def config_path_for_run(run_folder: Path) -> Path:
     raise FileNotFoundError(f"No training.yaml or training_resume_*.yaml in {run_folder}")
 
 
-def load_dataset_for_run(run_folder: Path):
-    """Load preprocessed RNA + protein AnnData using this run's config snapshot."""
+def stage_data_paths(stage: str) -> tuple[str, str]:
+    """Stage-specific paths used by src.training.runner at training time."""
+    rna = f"cache/velocity/synthetic_linked_ode/{stage}/rna.h5ad"
+    protein = f"cache/synthetic_linked_ode/{stage}/protein.h5ad"
+    return rna, protein
+
+
+def staged_run_args(run_folder: Path) -> tuple[str | None, str | None]:
+    """Recover --stage/--scale from run.log or resume logs, last entry wins."""
+    log_paths = [run_folder / "run.log", *sorted(run_folder.glob("run_resume_*.log"))]
+    stage = None
+    scale = None
+    for log_path in log_paths:
+        if not log_path.exists():
+            continue
+        for line in log_path.read_text(errors="replace").splitlines():
+            match = re.search(r"\[runner\]\s+stage=([^\s]+)\s+scale=([^\s]+)", line)
+            if match:
+                stage, scale = match.group(1), match.group(2)
+                continue
+            match = re.search(
+                r"synthetic_linked_ode/(oracle|clean|branch)/rna\.h5ad",
+                line,
+            )
+            if match:
+                stage = match.group(1)
+    return stage, scale
+
+
+def parse_cli_overrides(run_folder: Path) -> dict:
+    """Recover runner --set overrides from original/resume logs, last value wins."""
+    overrides = {}
+    log_paths = [run_folder / "run.log", *sorted(run_folder.glob("run_resume_*.log"))]
+    for log_path in log_paths:
+        if not log_path.exists():
+            continue
+        for line in log_path.read_text(errors="replace").splitlines():
+            match = re.search(r"--set overrides:\s*(\{.*\})", line)
+            if match:
+                overrides.update(ast.literal_eval(match.group(1)))
+    return overrides
+
+
+def apply_staged_dataset_overrides(
+    run_folder: Path,
+    dataset_name: str,
+    dataset_meta: dict,
+    run_cfg: dict,
+    cfg: dict,
+) -> tuple[dict, dict]:
+    """Mirror runner.py's runtime --stage/--scale injection for saved runs."""
+    if dataset_name != STAGED_DATASET:
+        return dataset_meta, run_cfg
+
+    stage, scale = staged_run_args(run_folder)
+    if not stage:
+        return dataset_meta, run_cfg
+    eff_scale = scale or "mean"
+    if eff_scale not in SCALE_LAYERS:
+        raise ValueError(f"Unsupported synthetic scale in {run_folder}: {eff_scale!r}")
+
+    rna_path, protein_path = stage_data_paths(stage)
+    dataset_meta = {**dataset_meta, "rna_path": rna_path, "protein_path": protein_path}
+    run_cfg = dict(run_cfg)
+    run_cfg.update((cfg.get("stage_overrides") or {}).get(stage, {}))
+    run_cfg.update(SCALE_LAYERS[eff_scale])
+    run_cfg["preprocessing_cache_version"] = f"synthetic_linked_ode_{stage}_{eff_scale}"
+    return dataset_meta, run_cfg
+
+
+def dataset_config_for_run(run_folder: Path, dataset_name: str):
+    """Merged training config + dataset metadata for one dataset in a run."""
     cfg_path = config_path_for_run(run_folder)
     cfg = load_yaml(cfg_path)
     datasets_meta = load_yaml(DATASETS_CONFIG).get("datasets", {})
 
     defaults = cfg.get("defaults", {})
     datasets_section = cfg.get("datasets", {})
-
-    if not datasets_section:
-        raise ValueError(f"{cfg_path} has no datasets section")
-
-    name = next(iter(datasets_section.keys()))
-    overrides = datasets_section[name] or {}
+    if dataset_name not in datasets_section:
+        raise ValueError(f"{cfg_path} has no dataset block for {dataset_name!r}")
+    if dataset_name not in datasets_meta:
+        raise ValueError(f"{DATASETS_CONFIG} has no dataset metadata for {dataset_name!r}")
+    overrides = datasets_section[dataset_name] or {}
     run_cfg = {**defaults, **overrides}
-    dataset_meta = datasets_meta[name]
+    dataset_meta, run_cfg = apply_staged_dataset_overrides(
+        run_folder, dataset_name, datasets_meta[dataset_name], run_cfg, cfg,
+    )
+    run_cfg.update(parse_cli_overrides(run_folder))
+    return run_cfg, dataset_meta, dataset_name
+
+
+def load_dataset_for_run(run_folder: Path, dataset_name: str | None = None):
+    """Load preprocessed RNA + protein AnnData using this run's config snapshot."""
+    if dataset_name is None:
+        cfg = load_yaml(config_path_for_run(run_folder))
+        datasets_section = cfg.get("datasets", {})
+        if not datasets_section:
+            raise ValueError(f"{config_path_for_run(run_folder)} has no datasets section")
+        dataset_name = next(iter(datasets_section.keys()))
+
+    run_cfg, dataset_meta, name = dataset_config_for_run(run_folder, dataset_name)
 
     rna_adata, protein_adata, _ = load_and_preprocess_cached(
         rna_path=dataset_meta["rna_path"],
@@ -114,16 +316,30 @@ def load_dataset_for_run(run_folder: Path):
         rna_umap_path=dataset_meta.get("rna_umap_path"),
         force_recompute=False,
         cache_version=run_cfg.get("preprocessing_cache_version"),
+        rna_min_cells=int(run_cfg.get("rna_min_cells", 3)),
+        rna_n_top_genes=int(run_cfg.get("rna_n_top_genes", 2000)),
+        rna_n_pcs=int(run_cfg.get("rna_n_pcs", 30)),
+        rna_n_neighbors=int(run_cfg.get("rna_n_neighbors", 30)),
         add_log_velocity_layer=bool(run_cfg.get("add_log_velocity_layer", False)),
         log_velocity_scale=float(run_cfg.get("log_velocity_scale", 1.0)),
+        protein_min_cells=int(run_cfg.get("protein_min_cells", 1)),
+        protein_n_pcs=int(run_cfg.get("protein_n_pcs", 10)),
+        atac_min_cells=int(run_cfg.get("atac_min_cells", 3)),
+        atac_n_components=int(run_cfg.get("atac_n_components", 30)),
+        atac_n_neighbors=int(run_cfg.get("atac_n_neighbors", 30)),
     )
     return rna_adata, protein_adata, run_cfg, name
+
+
+def cfg_with_model_overrides(run_cfg: dict, model_name: str) -> dict:
+    return {**run_cfg, **MODEL_OVERRIDES.get(model_name, {})}
 
 
 def build_model_and_tensors(
     run_cfg: dict, rna_adata, protein_adata, model_name: str, device,
 ):
     """Reproduce KOTModel architecture + input tensors (R, V, P, S) for evaluation."""
+    run_cfg = cfg_with_model_overrides(run_cfg, model_name)
     use_feature_space = bool(run_cfg.get("kot_use_feature_space", False))
     rna_layer = run_cfg.get("kot_rna_layer")
     protein_layer = run_cfg.get("kot_protein_layer")
@@ -140,13 +356,23 @@ def build_model_and_tensors(
     D_r = x.shape[1]
     D_p = y.shape[1]
 
+    mapping_records = None
     mapping_csv = run_cfg.get("adt_mapping_csv")
-    alias_map = load_mapping_csv(Path(mapping_csv)) if (mapping_csv and Path(mapping_csv).exists()) else None
-    S_np, _align_mask, kin_mask, _report = projection_matrix_from_adatas(
-        rna_adata, protein_adata,
+    if mapping_csv:
+        if not Path(mapping_csv).exists():
+            raise FileNotFoundError(f"adt_mapping_csv missing: {mapping_csv}")
+        mapping_records = load_mapping_records(Path(mapping_csv))
+    require_full_panel = (
+        bool(run_cfg.get("kot_require_full_panel_mapping", True))
+        and mapping_records is not None
+    )
+    S_np, align_mask, kin_mask, _report = projection_matrix_from_adatas(
+        rna_adata,
+        protein_adata,
+        mapping_records=mapping_records,
         use_mean_expr=False,
         use_explicit_links=use_explicit_links,
-        alias_map=alias_map,
+        require_full_panel=require_full_panel,
     )
     if use_feature_space:
         S_model = S_np.copy()
@@ -161,7 +387,7 @@ def build_model_and_tensors(
     velocity_candidates = [velocity_layer] if velocity_layer else ["true_velocity", "velocity"]
     for key in velocity_candidates:
         if key in rna_adata.layers:
-            V_raw = np.nan_to_num(dense_array(rna_adata.layers[key]), nan=0.0)
+            V_raw = np.nan_to_num(to_dense(rna_adata.layers[key], np.float32), nan=0.0)
             break
     if V_raw is None:
         raise ValueError(f"No velocity layer found (tried {velocity_candidates})")
@@ -173,12 +399,26 @@ def build_model_and_tensors(
     else:
         raise ValueError(f"Velocity shape {V_raw.shape} incompatible with RNA {x.shape}")
 
+    if bool(run_cfg.get("kot_kinetics_require_velocity_gene", False)) and "velocity_genes" in rna_adata.var:
+        v_genes = np.asarray(rna_adata.var["velocity_genes"].values, dtype=bool)
+        has_stable = (S_np.astype(bool) & v_genes[None, :]).any(axis=1)
+        kin_mask = kin_mask & has_stable
+
+    csv_source_of_truth = mapping_records is not None
+    use_kinetics_mask = (
+        bool(run_cfg.get("kot_use_kinetics_mask", True)) or csv_source_of_truth
+    ) and use_feature_space
+    kin_mask_np = kin_mask.astype(np.float32) if use_kinetics_mask else None
+
+    align_cols = None
+    if use_feature_space and not align_mask.all():
+        align_cols = torch.as_tensor(np.nonzero(align_mask)[0], dtype=torch.long, device=device)
+
     R_t = to_tensor(x, device)
     P_t = to_tensor(y, device)
     V_t = to_tensor(V, device)
     S_t = to_tensor(S_model, device)
-    kin_mask_np = kin_mask.astype(np.float32) if use_feature_space else np.ones(S_model.shape[0], dtype=np.float32)
-    mask_t = to_tensor(kin_mask_np, device)
+    mask_t = to_tensor(kin_mask_np, device) if kin_mask_np is not None else None
 
     phi_dims        = list(run_cfg.get("phi_dims", [1024, 512, 256]))
     kappa_dims      = list(run_cfg.get("kappa_dims", [64, 32]))
@@ -187,6 +427,12 @@ def build_model_and_tensors(
     activation      = str(run_cfg.get("kot_activation", "gelu"))
     init_method     = str(run_cfg.get("kot_init", "orthogonal"))
     phi_spectral_norm = bool(run_cfg.get("phi_spectral_norm", False))
+    kappa_min = float(run_cfg.get("kot_kappa_min", 1e-6))
+    kappa_max_cfg = run_cfg.get("kot_kappa_max")
+    kappa_max = float(kappa_max_cfg) if kappa_max_cfg is not None else None
+    alpha_min = float(run_cfg.get("kot_alpha_min", 1e-6))
+    alpha_max_cfg = run_cfg.get("kot_alpha_max")
+    alpha_max = float(alpha_max_cfg) if alpha_max_cfg is not None else None
 
     model = KOTModel(
         D_r, D_p,
@@ -197,22 +443,40 @@ def build_model_and_tensors(
         activation=activation,
         init_method=init_method,
         phi_spectral_norm=phi_spectral_norm,
+        kappa_min=kappa_min,
+        kappa_max=kappa_max,
+        alpha_min=alpha_min,
+        alpha_max=alpha_max,
     ).to(device)
 
-    # Apply model-specific overrides (matches runner.MODEL_OVERRIDES)
-    overrides = MODEL_OVERRIDES.get(model_name, {})
-    fixed_kappa_value = overrides.get("kot_fixed_kappa", run_cfg.get("kot_fixed_kappa"))
+    fixed_kappa_value = run_cfg.get("kot_fixed_kappa")
     if fixed_kappa_value is not None:
         model.kappa = FixedKappa(float(fixed_kappa_value)).to(device)
+    fixed_alpha_value = run_cfg.get("kot_fixed_alpha")
+    if fixed_alpha_value is not None:
+        model.g = FixedAlpha(fixed_alpha_value, D_p).to(device)
+    fixed_beta_value = run_cfg.get("kot_fixed_beta")
+    if fixed_beta_value is not None:
+        set_fixed_beta(model, fixed_beta_value, D_p, device)
 
-    return model, R_t, V_t, P_t, S_t, rna_adata.obs, mask_t
+    return model, R_t, V_t, P_t, S_t, rna_adata.obs, mask_t, align_cols
 
 
 # ---------------------------------------------------------------------------
 # Per-checkpoint evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_one_checkpoint(model, ckpt_path: Path, R_t, V_t, P_t, S_t, rna_obs, mask_t=None):
+def evaluate_one_checkpoint(
+    model,
+    ckpt_path: Path,
+    R_t,
+    V_t,
+    P_t,
+    S_t,
+    rna_obs,
+    mask_t=None,
+    align_cols=None,
+):
     """Load checkpoint into model, recompute diagnostics + per-cell arrays."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
@@ -222,7 +486,16 @@ def evaluate_one_checkpoint(model, ckpt_path: Path, R_t, V_t, P_t, S_t, rna_obs,
     model.load_state_dict(state_dict)
 
     diagnostics = compute_full_diagnostics(model, R_t, V_t, P_t, S_t, rna_obs, mask=mask_t)
-    per_cell    = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_obs, mask=mask_t)
+    per_cell = compute_per_cell_diagnostics(
+        model,
+        R_t,
+        V_t,
+        P_t,
+        S_t,
+        rna_obs,
+        mask=mask_t,
+        align_cols=align_cols,
+    )
     mean_foscttm = float(np.mean(per_cell["foscttm"]))
 
     diagnostics["checkpoint_epoch"]  = int(ckpt["epoch"])
@@ -238,87 +511,102 @@ def evaluate_one_checkpoint(model, ckpt_path: Path, R_t, V_t, P_t, S_t, rna_obs,
 def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
     """Evaluate all checkpoints across all (model, seed) folders in one run."""
     print(f"\n=== {run_folder.name} ===")
-    rna_adata, protein_adata, run_cfg, dataset_name = load_dataset_for_run(run_folder)
 
     rows = []
+    data_cache = {}
     for model_dir in sorted(p for p in run_folder.iterdir() if p.is_dir()):
         model_name = model_dir.name
-        if model_name in {"cache"}:
+        if model_name in {"cache", "results"} or model_name.startswith("."):
             continue
 
-        dataset_dir = model_dir / dataset_name
-        if not dataset_dir.exists():
-            continue
-
-        try:
-            model, R_t, V_t, P_t, S_t, rna_obs, mask_t = build_model_and_tensors(
-                run_cfg, rna_adata, protein_adata, model_name, device,
-            )
-        except Exception as e:
-            print(f"  [{model_name}] build_model FAILED: {e}")
-            continue
-
-        for seed_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")):
-            tail = seed_dir.name.split("_", 1)[1]
-            if not tail.isdigit():
-                continue
-            seed = int(tail)
-
-            for ckpt_name in CHECKPOINT_NAMES:
-                ckpt_path = seed_dir / f"checkpoint_{ckpt_name}.pt"
-                if not ckpt_path.exists():
-                    continue
-
+        for dataset_dir in sorted(p for p in model_dir.iterdir() if p.is_dir()):
+            dataset_name = dataset_dir.name
+            if dataset_name not in data_cache:
                 try:
-                    diagnostics, per_cell = evaluate_one_checkpoint(
-                        model, ckpt_path, R_t, V_t, P_t, S_t, rna_obs, mask_t,
-                    )
+                    data_cache[dataset_name] = load_dataset_for_run(run_folder, dataset_name)
                 except Exception as e:
-                    print(f"  [{model_name}/seed_{seed}/{ckpt_name}] eval FAILED: {e}")
+                    print(f"  [{dataset_name}] load_dataset FAILED: {e}")
                     continue
+            rna_adata, protein_adata, run_cfg, _ = data_cache[dataset_name]
 
-                # Per-checkpoint artifacts
-                diag_out  = seed_dir / f"diagnostics_{ckpt_name}.json"
-                with open(diag_out, "w") as f:
-                    json.dump(diagnostics, f, indent=2)
-                if save_percell:
-                    pd.DataFrame({"foscttm": per_cell["foscttm"]}).to_csv(
-                        seed_dir / f"foscttm_{ckpt_name}.csv", index=False,
-                    )
+            try:
+                model, R_t, V_t, P_t, S_t, rna_obs, mask_t, align_cols = build_model_and_tensors(
+                    run_cfg, rna_adata, protein_adata, model_name, device,
+                )
+            except Exception as e:
+                print(f"  [{model_name}/{dataset_name}] build_model FAILED: {e}")
+                continue
 
-                # Summary row
-                row = {
-                    "run":                run_folder.name,
-                    "model":              model_name,
-                    "seed":               seed,
-                    "checkpoint":         ckpt_name,
-                    "checkpoint_epoch":   diagnostics["checkpoint_epoch"],
-                    "mean_foscttm":       diagnostics["mean_foscttm"],
-                    "time_mae":           diagnostics["time_mae"],
-                    "time_spearman":      diagnostics["time_spearman"],
-                    "traj_dtw_temporal":  diagnostics["traj_dtw_temporal"],
-                    "traj_dtw_recon":     diagnostics["traj_dtw_recon"],
-                    "phi_variance_ratio": diagnostics["phi_variance_ratio"],
-                    "jvp_rhs_cos":        diagnostics["jvp_rhs_cos"],
-                    "jvp_norm":           diagnostics["jvp_norm"],
-                    "rhs_norm":           diagnostics["rhs_norm"],
-                    "kappa_mean":         diagnostics["kappa_mean"],
-                    "kappa_std":          diagnostics["kappa_std"],
-                    "beta_mean":          diagnostics["beta_mean"],
-                    "beta_std":           diagnostics["beta_std"],
-                }
-                # Include training-time losses if present (align, dyn, anchor, total)
-                losses = diagnostics.get("checkpoint_losses", {})
-                if isinstance(losses, dict):
-                    for k, v in losses.items():
-                        if isinstance(v, (int, float)):
-                            row[f"loss_{k}"] = float(v)
+            for seed_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")):
+                tail = seed_dir.name.split("_", 1)[1]
+                if not tail.isdigit():
+                    continue
+                seed = int(tail)
 
-                rows.append(row)
-                print(f"  ✓ {model_name}/seed_{seed:>4}/{ckpt_name:<11} "
-                      f"FOSCTTM={diagnostics['mean_foscttm']:.4f}  "
-                      f"cos={diagnostics['jvp_rhs_cos']:+.3f}  "
-                      f"κ={diagnostics['kappa_mean']:.3f}  β={diagnostics['beta_mean']:.3f}")
+                for ckpt_name in CHECKPOINT_NAMES:
+                    ckpt_path = seed_dir / f"checkpoint_{ckpt_name}.pt"
+                    if not ckpt_path.exists():
+                        continue
+
+                    try:
+                        diagnostics, per_cell = evaluate_one_checkpoint(
+                            model,
+                            ckpt_path,
+                            R_t,
+                            V_t,
+                            P_t,
+                            S_t,
+                            rna_obs,
+                            mask_t,
+                            align_cols,
+                        )
+                    except Exception as e:
+                        print(f"  [{model_name}/{dataset_name}/seed_{seed}/{ckpt_name}] eval FAILED: {e}")
+                        continue
+
+                    # Per-checkpoint artifacts
+                    diag_out  = seed_dir / f"diagnostics_{ckpt_name}.json"
+                    with open(diag_out, "w") as f:
+                        json.dump(diagnostics, f, indent=2)
+                    if save_percell:
+                        pd.DataFrame({"foscttm": per_cell["foscttm"]}).to_csv(
+                            seed_dir / f"foscttm_{ckpt_name}.csv", index=False,
+                        )
+
+                    # Summary row
+                    row = {
+                        "run":                run_folder.name,
+                        "model":              model_name,
+                        "dataset":            dataset_name,
+                        "seed":               seed,
+                        "checkpoint":         ckpt_name,
+                        "checkpoint_epoch":   diagnostics["checkpoint_epoch"],
+                        "mean_foscttm":       diagnostics["mean_foscttm"],
+                        "time_mae":           diagnostics["time_mae"],
+                        "time_spearman":      diagnostics["time_spearman"],
+                        "traj_dtw_temporal":  diagnostics["traj_dtw_temporal"],
+                        "traj_dtw_recon":     diagnostics["traj_dtw_recon"],
+                        "phi_variance_ratio": diagnostics["phi_variance_ratio"],
+                        "jvp_rhs_cos":        diagnostics["jvp_rhs_cos"],
+                        "jvp_norm":           diagnostics["jvp_norm"],
+                        "rhs_norm":           diagnostics["rhs_norm"],
+                        "kappa_mean":         diagnostics["kappa_mean"],
+                        "kappa_std":          diagnostics["kappa_std"],
+                        "beta_mean":          diagnostics["beta_mean"],
+                        "beta_std":           diagnostics["beta_std"],
+                    }
+                    # Include training-time losses if present (align, dyn, anchor, total)
+                    losses = diagnostics.get("checkpoint_losses", {})
+                    if isinstance(losses, dict):
+                        for k, v in losses.items():
+                            if isinstance(v, (int, float)):
+                                row[f"loss_{k}"] = float(v)
+
+                    rows.append(row)
+                    print(f"  ✓ {model_name}/{dataset_name}/seed_{seed:>4}/{ckpt_name:<11} "
+                          f"FOSCTTM={diagnostics['mean_foscttm']:.4f}  "
+                          f"cos={diagnostics['jvp_rhs_cos']:+.3f}  "
+                          f"κ={diagnostics['kappa_mean']:.3f}  β={diagnostics['beta_mean']:.3f}")
 
     return rows
 
@@ -399,11 +687,12 @@ def main():
     print(f"✓ Wrote {len(df)} rows to {out_path}")
     print(f"  runs:        {df['run'].nunique()}")
     print(f"  models:      {sorted(df['model'].unique())}")
+    print(f"  datasets:    {sorted(df['dataset'].unique())}")
     print(f"  checkpoints: {sorted(df['checkpoint'].unique())}")
     print()
     print("Preview (best mean_foscttm per checkpoint):")
     preview = df.sort_values("mean_foscttm").groupby("checkpoint").head(3)
-    print(preview[["run", "model", "seed", "checkpoint", "checkpoint_epoch",
+    print(preview[["run", "model", "dataset", "seed", "checkpoint", "checkpoint_epoch",
                    "mean_foscttm", "jvp_rhs_cos", "kappa_mean", "beta_mean"]].to_string(index=False))
 
 

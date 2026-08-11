@@ -435,7 +435,13 @@ def run_scvelo(adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neigh
             adata.obsp[key] = sparse.csr_matrix(adata.obsp[key])
     scv.pp.moments(adata, n_pcs=actual_n_pcs, n_neighbors=n_neighbors)
     if velocity_mode == "dynamical":
-        scv.tl.recover_dynamics(adata, n_jobs=dynamics_n_jobs)
+        # var_names="all" fits EVERY gene in the HVG ∪ retain matrix; scVelo's default
+        # (highly-variable only) would skip the force-retained ADT genes, leaving them
+        # present but never fitted (velocity_usable=False for the genes we care about).
+        if retain_genes:
+            scv.tl.recover_dynamics(adata, var_names="all", n_jobs=dynamics_n_jobs)
+        else:
+            scv.tl.recover_dynamics(adata, n_jobs=dynamics_n_jobs)
     scv.tl.velocity(adata, mode=velocity_mode)
     scv.tl.velocity_graph(adata)
     scv.tl.velocity_confidence(adata)
@@ -585,15 +591,16 @@ def execute_run(run_config: dict) -> None:
     retain_genes = None
     retain_csv = run_config.get("retain_genes_csv")
     if retain_csv and Path(retain_csv).exists():
-        # Retain only genes for proteins that are actually use_for_kinetics — not
-        # every mapped gene. Alignment-only / excluded proteins must not force a
-        # gene into the velocity model.
+        # Retain every resolved ADT target gene. A base mapping marks genes that
+        # were dropped by the original velocity matrix as not kinetics-eligible,
+        # so filtering on use_for_kinetics here would make retained runs unable
+        # to recover exactly the genes they are meant to force-keep.
         retain_genes = {
             r["gene_symbol"]
             for r in load_mapping_records(Path(retain_csv))
-            if r["use_for_kinetics"] and r["gene_symbol"]
+            if r["gene_symbol"]
         }
-        print(f"[velocity] force-retaining {len(retain_genes)} use_for_kinetics genes from {retain_csv}")
+        print(f"[velocity] force-retaining {len(retain_genes)} resolved ADT-target genes from {retain_csv}")
 
     adata = run_scvelo(
         adata,

@@ -76,6 +76,13 @@ def sample_std(values: list[float]) -> float:
     return math.sqrt(var)
 
 
+def geometric_mean(values: list[float]) -> float:
+    """Geometric mean of positive values (0 if none) — β is log-normal, so the
+    physical→model centring should use the geometric, not arithmetic, mean."""
+    logs = [math.log(v) for v in values if v > 0]
+    return math.exp(sum(logs) / len(logs)) if logs else 0.0
+
+
 def resolve_beta_anchors(
     path,
     protein_var_names,
@@ -83,13 +90,20 @@ def resolve_beta_anchors(
     aggregate: str = "median",
     stable_cv_max: float | None = None,
     prior_sigma_floor: float = 0.25,
+    fixed_scale: float | None = None,
 ):
     """
-    Map a β-anchor CSV to (indices, betas, weights, sigmas).
+    Map a β-anchor CSV to (indices, betas, weights, sigmas, scale).
 
-    sigmas are relative: σ_i = rel_sigma_i × β*_i with rel_sigma floored at
-    prior_sigma_floor, so the log-normal width log_σ = σ/β* is constant across
-    proteins and low-β* anchors are not artificially weakened.
+    The physical→model scale is c = target_mean_beta / geometric_mean(centers),
+    computed from the resolved set (geometric because β is log-normal, and robust
+    to a single anchor unlike an arithmetic/global-log centring). For anchor-count
+    ablations, compute c ONCE on the full trusted set and pass it as `fixed_scale`
+    — otherwise every change of the anchor subset silently redefines the β unit and
+    confounds the ablation. The chosen scale is returned so it can be saved/frozen.
+
+    sigmas are relative: σ_i = rel_sigma_i × β*_i (floored at prior_sigma_floor), so
+    the log-normal width log_σ = σ/β* is constant across proteins.
     """
     if aggregate not in ("median", "mean"):
         raise ValueError(f"aggregate must be 'median' or 'mean', got {aggregate!r}")
@@ -103,7 +117,13 @@ def resolve_beta_anchors(
             continue
         per_protein.setdefault(j, []).append((r["beta_per_hour"], r["weight"]))
     if not per_protein:
-        return [], [], [], []
+        return [], [], [], [], 1.0
+
+    # Centre of every resolved protein → the "full trusted set" the frozen scale uses.
+    all_centers = [
+        aggregate_values([b for b, _ in per_protein[j]], aggregate) for j in sorted(per_protein)
+    ]
+    all_centers = [c for c in all_centers if c > 0]
 
     kept: list[tuple[int, float, float, float]] = []
     for j in sorted(per_protein):
@@ -116,25 +136,22 @@ def resolve_beta_anchors(
         if stable_cv_max is not None and len(betas_h) >= 2 and cv > stable_cv_max:
             continue
         weight = aggregate_values(weights, "mean")
-        # Relative dispersion → absolute σ after later rescaling (apply scale below).
         rel_sigma = max(cv, prior_sigma_floor) if len(betas_h) >= 2 else prior_sigma_floor
         kept.append((j, center, weight, rel_sigma))
 
     if not kept:
-        return [], [], [], []
+        return [], [], [], [], 1.0
 
     idx = [j for j, _, _, _ in kept]
-    betas = [b for _, b, _, _ in kept]
+    centers = [b for _, b, _, _ in kept]
     weights = [w for _, _, w, _ in kept]
     rel_sigmas = [s for _, _, _, s in kept]
 
-    mean_beta = sum(betas) / len(betas)
-    scale = (float(target_mean_beta) / mean_beta) if mean_beta > 0 else 1.0
-    betas = [b * scale for b in betas]
-    # σ is purely relative: σ_i = rel_sigma_i × β*_i, where rel_sigma is already
-    # floored at prior_sigma_floor. This keeps the log-normal width (log_σ = σ/β*)
-    # constant across proteins, so a low-β* anchor gets the same pull as a high-β*
-    # one. An absolute floor (prior_sigma_floor × target_mean) would inflate the
-    # relative width of small-β* anchors and make them toothless.
+    if fixed_scale is not None:
+        scale = float(fixed_scale)          # frozen unit — use for anchor-count ablations
+    else:
+        g = geometric_mean(all_centers)     # geometric mean of the full resolved set
+        scale = (float(target_mean_beta) / g) if g > 0 else 1.0
+    betas = [c * scale for c in centers]
     sigmas = [rel * beta for rel, beta in zip(rel_sigmas, betas)]
-    return idx, betas, weights, sigmas
+    return idx, betas, weights, sigmas, scale

@@ -9,7 +9,9 @@ def sinkhorn_coupling(x: np.ndarray, y: np.ndarray, reg: float = 0.1, n_iter: in
     """Sinkhorn algorithm for entropic OT coupling between x and y."""
     n, m = x.shape[0], y.shape[0]
     C = np.sum((x[:, None, :] - y[None, :, :]) ** 2, axis=-1)  # (n, m) cost
-    C = C / C.max()
+    cost_max = C.max()
+    if cost_max > 0:
+        C = C / cost_max
     K = np.exp(-C / reg)
     u = np.ones(n) / n
     for _ in range(n_iter):

@@ -18,7 +18,16 @@ datasets:
     label: bmmc_cite
     umap_key: GEX_X_umap
     n_top_genes: 2000
-    retain_genes_csv: cache/results/mapping/adt_mapping_bmmc_cite.csv   # #3: force-retain ADT-target genes
+
+  bmmc_cite_retained:
+    mode: starsolo_h5ad
+    report: /data2/core-med1-telem/common/Thesis_Jin/Datasets/BMMC/bmmc_starsolo_output_report.tsv
+    original_h5ad: /data2/core-med1-telem/common/Thesis_Jin/Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
+    assay: cite
+    label: bmmc_cite
+    umap_key: GEX_X_umap
+    n_top_genes: 2000
+    retain_genes_csv: cache/results/mapping/adt_mapping_bmmc_cite.csv
 
   bmmc_multiome:
     mode: starsolo_h5ad
@@ -35,7 +44,14 @@ datasets:
     loom: Datasets/PBMC/pbmc_final_sorted_B4NII.loom
     label: pbmc
     n_top_genes: 2000
-    retain_genes_csv: cache/results/mapping/adt_mapping_pbmc.csv   # #3: force-retain ADT-target genes
+
+  pbmc_retained:
+    mode: pbmc_10x_loom
+    pbmc_counts: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
+    loom: Datasets/PBMC/pbmc_final_sorted_B4NII.loom
+    label: pbmc
+    n_top_genes: 2000
+    retain_genes_csv: cache/results/mapping/adt_mapping_pbmc.csv
 
   perturb:
     # TODO: set mode once STARsolo alignment is complete for Perturb-CITE-seq.

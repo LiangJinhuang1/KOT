@@ -19,13 +19,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import anndata as ad
 import pandas as pd
 
 from src.utils.io import load_yaml
-from src.data.preprocessing import load_protein_from_h5ad, load_protein_from_10x_h5
 from src.data.adt_gene_map import build_mapping_rows
 
 DATASETS_CONFIG = Path("config/datasets.yaml")
@@ -36,9 +40,15 @@ def protein_var_names(meta: dict) -> list[str]:
     path = meta["protein_path"]
     label = meta.get("protein_label", "ADT")
     if str(path).endswith(".h5"):
-        protein = load_protein_from_10x_h5(path, label)
+        import scanpy as sc
+
+        adata = sc.read_10x_h5(path, gex_only=False)
     else:
-        protein = load_protein_from_h5ad(path, label)
+        adata = ad.read_h5ad(path)
+    if "feature_types" not in adata.var:
+        raise ValueError(f"{path} is missing var['feature_types']; cannot find {label!r} panel.")
+    protein = adata[:, adata.var["feature_types"] == label].copy()
+    protein.var_names_make_unique()
     return list(protein.var_names)
 
 
@@ -59,14 +69,17 @@ def dedupe_preserve_order(names: list[str]) -> tuple[list[str], list[str]]:
     return unique, dropped
 
 
-def write_mapping(name: str, meta: dict) -> None:
+def write_mapping(name: str, meta: dict, kinetic_complex_allow=None) -> None:
     prot_names = protein_var_names(meta)
     unique_names, dropped = dedupe_preserve_order(prot_names)
     if dropped:
         print(f"[{name}] WARNING: dropped {len(dropped)} duplicate ADT name(s): "
               f"{sorted(set(dropped))}")
 
-    rows = build_mapping_rows(unique_names, rna_var_names(meta))   # validated: names unique
+    # complex_curated markers (representative-chain approximations, e.g. CD3→CD3E)
+    # are kinetics-eligible only if named here; one_to_one are eligible automatically.
+    allow = kinetic_complex_allow or meta.get("kinetic_complex_allow")
+    rows = build_mapping_rows(unique_names, rna_var_names(meta), kinetic_complex_allow=allow)
     df = pd.DataFrame(rows)
     assert df["adt_name"].is_unique, f"[{name}] duplicate adt_name in output table"
 
@@ -93,7 +106,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", type=str, default=None,
                         help="Comma-separated dataset names (default: all rna_protein datasets).")
+    parser.add_argument("--kinetic-complex", type=str, default=None,
+                        help="Comma-separated ADT names or gene symbols allowed for kinetics "
+                             "despite being complex_curated (e.g. HLA-DR). Default: none.")
     args = parser.parse_args()
+
+    allow = [s.strip() for s in args.kinetic_complex.split(",")] if args.kinetic_complex else None
 
     datasets = load_yaml(DATASETS_CONFIG).get("datasets", {})
     selected = args.datasets.split(",") if args.datasets else list(datasets.keys())
@@ -102,7 +120,7 @@ def main() -> None:
         meta = datasets.get(name)
         if meta is None or not meta.get("protein_path"):
             continue
-        write_mapping(name, meta)
+        write_mapping(name, meta, kinetic_complex_allow=allow)
 
 
 if __name__ == "__main__":

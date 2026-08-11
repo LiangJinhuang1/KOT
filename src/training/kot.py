@@ -43,28 +43,36 @@ def beta_anchor_prior_loss(
     lambda_prior: float,
     prior_kind: str,
 ) -> torch.Tensor:
-    """Soft β prior: l2 | gaussian | log_normal (supervisor: not hard-fixed)."""
+    """Soft β prior: l2 | gaussian | log_normal (supervisor: not hard-fixed).
+
+    A WEIGHTED MEAN over anchors, not a sum — so a 24-anchor set does not impose 6x
+    the total prior force of a 4-anchor set (which would confound anchor-count
+    ablations). With weights: Σ(w·r²)/(Σw+ε); without: mean(r²).
+    """
     pred = beta[indices]
     if prior_kind == "l2":
-        resid = pred - targets
-        if weights is not None:
-            resid = resid * weights.sqrt()
-        return lambda_prior * resid.pow(2).sum()
-    if sigmas is None:
-        raise ValueError(f"prior_kind={prior_kind!r} requires per-anchor sigmas")
-    if prior_kind == "gaussian":
-        resid = (pred - targets) / sigmas.clamp(min=1e-6)
-    elif prior_kind == "log_normal":
-        # σ stored on β-scale → approximate log-space width as σ/β*
-        log_sigma = (sigmas / targets.clamp(min=1e-6)).clamp(min=1e-3)
-        resid = (
-            torch.log(pred.clamp(min=1e-6)) - torch.log(targets.clamp(min=1e-6))
-        ) / log_sigma
+        sq = (pred - targets).pow(2)
+        scale = 1.0
     else:
-        raise ValueError(f"Unknown beta_anchor_prior {prior_kind!r}; use l2|gaussian|log_normal")
+        if sigmas is None:
+            raise ValueError(f"prior_kind={prior_kind!r} requires per-anchor sigmas")
+        if prior_kind == "gaussian":
+            resid = (pred - targets) / sigmas.clamp(min=1e-6)
+        elif prior_kind == "log_normal":
+            # σ stored on β-scale → approximate log-space width as σ/β*
+            log_sigma = (sigmas / targets.clamp(min=1e-6)).clamp(min=1e-3)
+            resid = (
+                torch.log(pred.clamp(min=1e-6)) - torch.log(targets.clamp(min=1e-6))
+            ) / log_sigma
+        else:
+            raise ValueError(f"Unknown beta_anchor_prior {prior_kind!r}; use l2|gaussian|log_normal")
+        sq = resid.pow(2)
+        scale = 0.5
     if weights is not None:
-        resid = resid * weights.sqrt()
-    return lambda_prior * 0.5 * resid.pow(2).sum()
+        loss = (weights * sq).sum() / (weights.sum() + 1e-8)
+    else:
+        loss = sq.mean()
+    return lambda_prior * scale * loss
 
 
 def build_kot_optimiser(model, lr: float, n_epochs: int, use_phases: bool):
@@ -322,8 +330,15 @@ def compute_per_cell_diagnostics(
     S_t: torch.Tensor,
     rna_obs: pd.DataFrame,
     mask: torch.Tensor | None = None,
+    align_cols: torch.Tensor | None = None,
 ) -> dict:
-    """Per-cell arrays for FOSCTTM-correlated diagnostic plots."""
+    """Per-cell arrays for FOSCTTM-correlated diagnostic plots.
+
+    FOSCTTM and the nearest-neighbour matching are computed on the alignment panel
+    (align_cols, e.g. use_for_alignment proteins) so features excluded from the
+    Sinkhorn (isotype controls) do not re-enter evaluation. φ still predicts the
+    full panel; only the metric is restricted.
+    """
     model.eval()
 
     # All-cell JVP and RHS (single forward-mode pass).
@@ -341,8 +356,11 @@ def compute_per_cell_diagnostics(
     cos_per_cell = F.cosine_similarity(dphi_dv, rhs, dim=1, eps=1e-8).detach().cpu().numpy()
     dyn_per_cell = residual.pow(2).sum(dim=1).detach().cpu().numpy()
 
-    # Nearest-neighbor matching in protein space (row-chunked to bound memory).
-    nn_idx_t, min_dists = nearest_protein_match(phi_r, P_t)
+    # Nearest-neighbor matching + FOSCTTM on the alignment panel (φ predicts all D_p,
+    # but excluded features must not re-enter the geometric metric).
+    phi_a = phi_r if align_cols is None else phi_r[:, align_cols]
+    P_a   = P_t   if align_cols is None else P_t[:, align_cols]
+    nn_idx_t, min_dists = nearest_protein_match(phi_a, P_a)
     align_per_cell = min_dists.detach().cpu().numpy()
     nn_idx = nn_idx_t.cpu().numpy()
 
@@ -361,9 +379,9 @@ def compute_per_cell_diagnostics(
         state_pred = np.array([], dtype="U1")
         branch_match = np.full(len(nn_idx), -1)
 
-    phi_np = phi_r.detach().cpu().numpy()
-    p_np = P_t.cpu().numpy()
-    foscttm = np.asarray(calc_domainAveraged_FOSCTTM(phi_np, p_np))
+    foscttm = np.asarray(
+        calc_domainAveraged_FOSCTTM(phi_a.detach().cpu().numpy(), P_a.cpu().numpy())
+    )
 
     return {
         "foscttm":     foscttm,
@@ -592,14 +610,18 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     stable_cv_max = float(stable_cv_cfg) if stable_cv_cfg is not None else None
     prior_sigma_floor = float(cfg.get("beta_anchor_sigma_floor", 0.25))
     beta_warmstart = bool(cfg.get("kot_beta_warmstart_from_anchor", False))
+    anchor_scale = None
     if beta_anchor_csv and Path(beta_anchor_csv).exists():
-        idx, betas, weights, sigmas = resolve_beta_anchors(
+        # beta_anchor_fixed_scale freezes the physical→model β unit (compute it once on
+        # the full anchor set) so anchor-count ablations do not redefine the unit.
+        idx, betas, weights, sigmas, anchor_scale = resolve_beta_anchors(
             beta_anchor_csv,
             list(second_adata.var_names),
             target_mean_beta=float(cfg.get("beta_anchor_target", 0.5)),
             aggregate=beta_anchor_aggregate,
             stable_cv_max=stable_cv_max,
             prior_sigma_floor=prior_sigma_floor,
+            fixed_scale=cfg.get("beta_anchor_fixed_scale"),
         )
         if idx:
             anchor_indices, anchor_betas = idx, betas
@@ -608,7 +630,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             anchor_source = (
                 f"paper half-lives {beta_anchor_csv} "
                 f"(aggregate={beta_anchor_aggregate}, prior={beta_anchor_prior}, "
-                f"stable_cv_max={stable_cv_max}, rescaled mean={cfg.get('beta_anchor_target', 0.5)})"
+                f"stable_cv_max={stable_cv_max}, scale={anchor_scale:.4g} "
+                f"[{'frozen' if cfg.get('beta_anchor_fixed_scale') is not None else 'geom-mean'}])"
             )
     # Control: permute the target values across the anchored proteins (same set of
     # β* values, wrong assignment). If β still sits at these shuffled targets and
@@ -672,18 +695,28 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # In representation mode it is projected into the same PCA coordinates as phi.
     mapping_csv = cfg.get("adt_mapping_csv")
     mapping_records = None
-    if mapping_csv and Path(mapping_csv).exists():
+    if mapping_csv:
+        # A configured mapping CSV is the source of truth. If it is missing we do NOT
+        # silently fall back to live HGNC matching — fail loud and tell the user to
+        # build it, so a public run never trains on an ad-hoc, unaudited mapping.
+        if not Path(mapping_csv).exists():
+            raise FileNotFoundError(
+                f"adt_mapping_csv '{mapping_csv}' not found. Build the mapping first:\n"
+                f"  PYTHONPATH=. python tools/build_adt_mapping.py --datasets <dataset>"
+            )
         mapping_records = load_mapping_records(Path(mapping_csv))   # validated, source of truth
         print(f"[kot] ADT→gene mapping from CSV (source of truth): {mapping_csv} "
               f"({len(mapping_records)} rows)")
-    elif mapping_csv:
-        print(f"[kot] adt_mapping_csv '{mapping_csv}' not found — resolving live via HGNC.")
+    # For public data with a CSV, require the mapping to cover the exact panel: a
+    # protein with no mapping cannot align anyway, so partial coverage is an error.
+    require_full_panel = bool(cfg.get("kot_require_full_panel_mapping", True)) and mapping_records is not None
     S_np, align_mask, kin_mask, mapping_report = projection_matrix_from_adatas(
         rna_adata,
         second_adata,
         mapping_records=mapping_records,
         use_mean_expr=False,
         use_explicit_links=use_explicit_links,
+        require_full_panel=require_full_panel,
     )
     # Kinetics mask over the protein axis: only in feature space is each protein a
     # row of φ; in representation mode the protein-PCA axis mixes proteins, so no
@@ -752,7 +785,6 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     else:
         conf = np.ones(n, dtype=np.float32)
 
-    # Move to device
     R_t    = to_tensor(x,     device)   # (n, D_r)
     P_t    = to_tensor(y,     device)   # (n, D_p)
     V_t    = to_tensor(V,     device)   # (n, D_r)
@@ -767,6 +799,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         dropped = int((kin_mask & ~has_stable).sum())
         kin_mask = kin_mask & has_stable
         print(f"[kot] velocity-gene filter: dropped {dropped} proteins with no stable-velocity gene")
+
+    # RNA-side velocity reliability weight (D_r,): zero the velocity of genes without a
+    # usable scVelo fit so their noise cannot leak through J_φ·v into dφ/dt. Masking the
+    # protein outputs alone does not remove this leak — the Jacobian mixes all RNA coords.
+    velocity_weight_t = None
+    if bool(cfg.get("kot_velocity_rna_reliability", False)) and use_feature_space and "velocity_genes" in rna_adata.var:
+        vgene_w = np.asarray(rna_adata.var["velocity_genes"].values, dtype=np.float32)   # (D_r,)
+        velocity_weight_t = to_tensor(vgene_w, device)
+        print(f"[kot] RNA-side velocity reliability: {int(vgene_w.sum())}/{len(vgene_w)} genes kept in JVP")
 
     # Kinetics mask (default on in feature space): only kinetic_mask=True proteins
     # enter L_dyn. When a mapping CSV is the source of truth, its use_for_kinetics
@@ -786,9 +827,11 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # Alignment mask over the protein axis: Sinkhorn compares only use_for_alignment
     # proteins; φ still predicts the full panel. Per-protein only in feature space.
     if use_feature_space and not align_mask.all():
-        align_cols = torch.as_tensor(np.nonzero(align_mask)[0], dtype=torch.long, device=device)
+        align_np = np.nonzero(align_mask)[0]
+        align_cols = torch.as_tensor(align_np, dtype=torch.long, device=device)
         print(f"[kot] alignment_mask on | {int(align_mask.sum())}/{D_p} proteins in Sinkhorn")
     else:
+        align_np = None
         align_cols = None
     # Optional per-protein normalisation (off by default). The scale is floored at
     # the median std so it only DOWN-weights high-abundance proteins; without the
@@ -977,9 +1020,13 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         # sinkhorn_max_points caps it, so large real datasets (e.g. bmmc_cite at
         # ~90k cells) stay within GPU memory instead of building an n×n matrix.
         if sinkhorn_max_points is not None and n > sinkhorn_max_points:
-            align_idx = torch.randperm(n, device=device)[:sinkhorn_max_points]
-            phi_align = model.phi(R_t[align_idx])        # (b, D_p), φ predicts full panel
-            P_align = P_t[align_idx]
+            # Sample RNA and protein cells INDEPENDENTLY — the data is unpaired, so the
+            # protein batch must not be the same cells as the RNA batch (that would put
+            # each cell's true partner in the batch and leak the alignment).
+            rna_idx     = torch.randperm(n, device=device)[:sinkhorn_max_points]
+            protein_idx = torch.randperm(n, device=device)[:sinkhorn_max_points]
+            phi_align = model.phi(R_t[rna_idx])          # (b, D_p), φ predicts full panel
+            P_align = P_t[protein_idx]
         else:
             phi_align = model.phi(R_t)                   # (n, D_p)
             P_align = P_t
@@ -990,12 +1037,14 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
         # --- Kinetics step (micro-batches) ---
         loss_dyn_total = torch.tensor(0.0, device=device)
-        for r_b, v_b, c_b, _ in loader:
-            loss_dyn_total = loss_dyn_total + kinetics_loss(
-                model.phi, model.kappa, model.g,
-                r_b, v_b, S_t, model.beta, c_b, mask=mask_t, scale=protein_scale,
-            )
-        loss_dyn_total = loss_dyn_total / len(loader)
+        if lambda_dyn != 0.0:
+            for r_b, v_b, c_b, _ in loader:
+                loss_dyn_total = loss_dyn_total + kinetics_loss(
+                    model.phi, model.kappa, model.g,
+                    r_b, v_b, S_t, model.beta, c_b, mask=mask_t, scale=protein_scale,
+                    velocity_weight=velocity_weight_t,
+                )
+            loss_dyn_total = loss_dyn_total / len(loader)
 
         loss_anchor = (
             beta_anchor_prior_loss(
@@ -1039,7 +1088,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
         # Periodic JVP-based diagnostics: every 50 epochs (and epoch 1) on a 512-cell subset.
         if epoch % 50 == 0 or epoch == 1:
-            diag = compute_jvp_rhs_diagnostics(model, R_t, V_t, S_t, subset=512)
+            diag = compute_jvp_rhs_diagnostics(model, R_t, V_t, S_t, subset=512, mask=mask_t)
         else:
             diag = {"jvp_rhs_cos": np.nan, "jvp_norm": np.nan, "rhs_norm": np.nan,
                     "kappa_mean": np.nan, "kappa_std": np.nan,
@@ -1171,6 +1220,23 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["beta_anchor_prior"] = beta_anchor_prior if use_anchor else None
     diagnostics["beta_anchor_aggregate"] = beta_anchor_aggregate if use_anchor else None
     diagnostics["beta_anchor_n"] = int(len(anchor_indices)) if use_anchor else 0
+    diagnostics["beta_anchor_scale"] = float(anchor_scale) if anchor_scale is not None else None
+    # Anchors intersected with the actual runtime kinetic mask: an anchored protein
+    # only constrains the dynamics if it is in the kinetic term. Report which, by name.
+    if use_anchor and anchor_indices:
+        protein_names = list(second_adata.var_names)
+        anchor_in_mask = [bool(kin_mask[j]) for j in anchor_indices]
+        diagnostics["beta_anchor_in_kinetic_mask"] = anchor_in_mask
+        diagnostics["beta_anchor_names_in_kinetic"] = [
+            protein_names[j] for j, ok in zip(anchor_indices, anchor_in_mask) if ok
+        ]
+        diagnostics["beta_anchor_n_in_kinetic"] = int(sum(anchor_in_mask))
+        print(f"[kot] anchors in runtime kinetic mask: "
+              f"{diagnostics['beta_anchor_n_in_kinetic']}/{len(anchor_indices)}")
+    else:
+        diagnostics["beta_anchor_in_kinetic_mask"] = []
+        diagnostics["beta_anchor_names_in_kinetic"] = []
+        diagnostics["beta_anchor_n_in_kinetic"] = 0
     # Per-anchor recovery: judge the anchor on the proteins it constrains, not the
     # global beta_mean (which averages the ~130 unanchored proteins and hides whether
     # anchored β actually moved toward its target).
@@ -1285,7 +1351,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 continue
             model.load_state_dict(state)
             d  = compute_full_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t)
-            pc = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t)
+            pc = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t, align_cols=align_cols)
             mean_f = float(np.mean(pc["foscttm"]))
             d["mean_foscttm"]      = mean_f
             d["checkpoint"]        = name
@@ -1335,7 +1401,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             model.load_state_dict(best_align_state)
 
         # 5. Per-cell arrays + the FOSCTTM-vs-diagnostics scatter panel for best_align.
-        per_cell = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t)
+        per_cell = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t, align_cols=align_cols)
         per_cell_path = out / "per_cell_diagnostics.npz"
         np.savez(per_cell_path, **per_cell)
         plot_path = out / "foscttm_diagnostics.png"
@@ -1343,5 +1409,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         print(f"[kot] Saved per-cell arrays: {per_cell_path}")
         print(f"[kot] Saved FOSCTTM diagnostics plot: {plot_path}")
 
-    aligned = [phi_final, p_np]
+    # Benchmark FOSCTTM is computed on `aligned`. Restrict it to the alignment panel
+    # (use_for_alignment proteins) so the benchmark is consistent with training and
+    # with the other methods — features excluded from the Sinkhorn must not re-enter
+    # evaluation. The full-panel φ prediction is saved separately for downstream use.
+    if align_np is not None:
+        if output_dir is not None:
+            np.save(Path(output_dir) / "phi_full_panel.npy", phi_final)
+            np.save(Path(output_dir) / "protein_full_panel.npy", p_np)
+        aligned = [phi_final[:, align_np], p_np[:, align_np]]
+    else:
+        aligned = [phi_final, p_np]
     return aligned, None, pd.DataFrame(loss_history)

@@ -99,18 +99,30 @@ def load_mathieson(path: Path) -> pd.DataFrame:
 
 
 def mathieson_rows_for_gene(math_df: pd.DataFrame, gene: str, cell_types: list[str]) -> list[dict]:
+    """One row per (gene, cell_type). Multiple gene_name hits are resolved, not
+    silently taken as iloc[0]: several rows for one gene can be the same protein
+    measured repeatedly (keep and aggregate) or distinct accessions (ambiguous →
+    skip). One row per cell_type is produced by aggregating across the kept rows."""
     key = gene.upper()
-    hit = math_df.loc[math_df["gene_name"].astype(str).str.upper() == key]
-    if hit.empty:
+    hits = math_df.loc[math_df["gene_name"].astype(str).str.upper() == key]
+    if hits.empty:
         return []
-    row = hit.iloc[0]
+    # Distinct protein accessions for the same gene → ambiguous; do not guess.
+    if "uniprot_id" in hits.columns:
+        acc = hits["uniprot_id"].dropna().astype(str).str.strip()
+        acc = acc[acc != ""]
+        if acc.nunique() > 1:
+            print(f"[mathieson] {gene}: ambiguous — {acc.nunique()} distinct uniprot accessions; skipped")
+            return []
+
     out = []
     for ct in cell_types:
         hl_cols, r2_cols = MATHIESON_CELL_TYPES[ct]
-        t_half = mean_positive([row.get(c) for c in hl_cols])
+        # aggregate across ALL matching rows × replicate columns → one value per cell type
+        t_half = mean_positive([hits.iloc[k][c] for k in range(len(hits)) for c in hl_cols])
         if t_half is None:
             continue
-        r2 = mean_positive([row.get(c) for c in r2_cols])
+        r2 = mean_positive([hits.iloc[k][c] for k in range(len(hits)) for c in r2_cols])
         out.append({
             "cell_type": ct,
             "half_life_hours": t_half,
@@ -144,7 +156,9 @@ def load_tcell_table(
             f"T-cell table needs columns '{gene_col}' and '{half_life_col}'. "
             f"Got: {list(df.columns)}"
         )
-    out: dict[str, dict] = {}
+    # Group by gene so duplicate rows for one gene do NOT overwrite each other
+    # (a dict assignment would keep only the last). Aggregate to one T-cell row/gene.
+    groups: dict[str, list[tuple[float, float | None]]] = {}
     for _, row in df.iterrows():
         gene = str(row[gene_col]).strip().upper()
         if not gene or gene == "NAN":
@@ -152,15 +166,21 @@ def load_tcell_table(
         t_half = row[half_life_col]
         if pd.isna(t_half) or float(t_half) <= 0:
             continue
-        r2 = None
-        if r2_col and r2_col in df.columns and pd.notna(row[r2_col]):
-            r2 = float(row[r2_col])
+        r2 = float(row[r2_col]) if (r2_col and r2_col in df.columns and pd.notna(row[r2_col])) else None
+        groups.setdefault(gene, []).append((float(t_half), r2))
+
+    out: dict[str, dict] = {}
+    for gene, measurements in groups.items():
+        halfs = [h for h, _ in measurements]
+        r2s = [r for _, r in measurements if r is not None]
+        r2 = (sum(r2s) / len(r2s)) if r2s else None
         out[gene] = {
-            "half_life_hours": float(t_half),
+            "half_life_hours": sum(halfs) / len(halfs),   # mean over duplicate measurements
             "quality_score_or_R2": r2 if r2 is not None else "",
             "anchor_weight": r2 if r2 is not None else 1.0,
             "source": TCELL_SOURCE,
             "cell_type": "Tcells",
+            "n_measurements": len(measurements),
         }
     return out
 

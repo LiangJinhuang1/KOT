@@ -212,7 +212,21 @@ def load_and_preprocess_cached(
         key_parts += f"|{os.path.abspath(atac_path)}|atac_label={atac_label}"
     if cache_version:
         key_parts += f"|cache_version={cache_version}"
-    key_parts += f"|log_velocity={bool(add_log_velocity_layer)}:{float(log_velocity_scale)}"
+    if rna_umap_path:
+        key_parts += f"|rna_umap_path={os.path.abspath(rna_umap_path)}"
+    key_parts += (
+        "|preprocess_schema=2"
+        f"|rna_min_cells={int(rna_min_cells)}"
+        f"|rna_n_top_genes={int(rna_n_top_genes)}"
+        f"|rna_n_pcs={int(rna_n_pcs)}"
+        f"|rna_n_neighbors={int(rna_n_neighbors)}"
+        f"|log_velocity={bool(add_log_velocity_layer)}:{float(log_velocity_scale)}"
+        f"|protein_min_cells={int(protein_min_cells)}"
+        f"|protein_n_pcs={int(protein_n_pcs)}"
+        f"|atac_min_cells={int(atac_min_cells)}"
+        f"|atac_n_components={int(atac_n_components)}"
+        f"|atac_n_neighbors={int(atac_n_neighbors)}"
+    )
     cache_key = hashlib.md5(key_parts.encode("utf-8")).hexdigest()[:12]
     base_name = os.path.splitext(os.path.basename(rna_path))[0]
     safe_base = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in base_name)

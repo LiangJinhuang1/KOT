@@ -72,6 +72,7 @@ def build_projection_from_records(
     protein_var_names: list[str],
     records: list[dict],
     weights: dict[str, float] | None = None,
+    require_full_panel: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
     """
     Build (S, alignment_mask, kinetic_mask, report) from a curated mapping CSV that
@@ -87,13 +88,13 @@ def build_projection_from_records(
     by_name = {r["adt_name"]: r for r in records}
 
     report: list[dict] = []
-    n_missing = 0
+    missing: list[str] = []
     for j, prot in enumerate(protein_var_names):
         rec = by_name.get(prot)
         if rec is None:
             # Panel protein absent from the CSV: φ still predicts it, keep it in
             # alignment, but it cannot enter kinetics (no curated decision / gene).
-            n_missing += 1
+            missing.append(prot)
             alignment_mask[j] = True
             report.append(report_row(prot, "", "", False, True, False, False,
                                      "not in mapping CSV"))
@@ -116,8 +117,15 @@ def build_projection_from_records(
                                   alignment_mask[j], effective_kin,
                                   kinetic_mask[j], reason))
 
-    if n_missing:
-        print(f"[projection] WARNING: {n_missing} panel protein(s) not in mapping CSV "
+    if missing:
+        if require_full_panel:
+            raise ValueError(
+                f"{len(missing)} panel protein(s) are not in the mapping CSV: "
+                f"{missing[:10]}{' ...' if len(missing) > 10 else ''}. Rebuild the mapping for "
+                f"this exact panel (tools/build_adt_mapping.py) — with require_full_panel, "
+                f"partial panel coverage is a hard error (a protein with no mapping cannot align)."
+            )
+        print(f"[projection] WARNING: {len(missing)} panel protein(s) not in mapping CSV "
               f"(kept in alignment, excluded from kinetics).")
     assert_no_orphan_s_rows(S, kinetic_mask)
     print(f"[projection] CSV source-of-truth: kinetics {int(kinetic_mask.sum())}/{D_p}, "
@@ -178,6 +186,7 @@ def projection_matrix_from_adatas(
     use_mean_expr: bool = False,
     use_explicit_links: bool = True,
     alias_map: dict[str, str] | None = None,
+    require_full_panel: bool = False,
 ):
     """
     Build (S, alignment_mask, kinetic_mask, mapping_report), indexed by the protein
@@ -201,7 +210,10 @@ def projection_matrix_from_adatas(
 
     # 1. Curated mapping CSV is authoritative.
     if mapping_records is not None:
-        return build_projection_from_records(rna_names, prot_names, mapping_records, weights)
+        return build_projection_from_records(
+            rna_names, prot_names, mapping_records, weights,
+            require_full_panel=require_full_panel,
+        )
 
     # 2. Explicit curated links (synthetic / stored mapping).
     links = None

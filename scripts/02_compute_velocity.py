@@ -17,6 +17,9 @@ VELOCITY_DATASETS = [
 
 
 def velocity_result(name: str) -> Path:
+    if name.endswith("_retained"):
+        base = name.removesuffix("_retained")
+        return Path("cache/velocity") / base / f"{base}_scvelo_results_retained.h5ad"
     return Path("cache/velocity") / name / f"{name}_scvelo_results.h5ad"
 
 

@@ -26,8 +26,9 @@ model_groups:
   kot_oracles:  [kot_oracle, kot_oracle_learnalpha, kot_oracle_learnalpha_kappa]
   all:          [kot, kot_nodyn, moscot, scot, linear_ode, uniport, glue, totalvi]
 
-# Used when --models is not passed.
-default_models: all
+# Used when --models is not passed. Keep this narrow so an accidental run does
+# not launch every baseline and every stochastic seed.
+default_models: kot_main
 
 defaults:
   output_root: cache/training
@@ -132,6 +133,9 @@ defaults:
   kot_fixed_beta: null
   kot_beta_warmstart_from_anchor: false   # init β at anchor targets, keep trainable + soft prior
   kot_beta_anchor_shuffle: false          # control: permute β* across proteins (assertion vs recovery test)
+  kot_velocity_rna_reliability: false     # zero velocity of non-velocity_gene RNA coords before the JVP
+  kot_require_full_panel_mapping: true    # hard error if the mapping CSV misses any panel protein
+  beta_anchor_fixed_scale: null           # freeze physical→model β scale (compute once on full set); null = geom-mean
   g_dims: [256, 128]
   phi_init_gain: 0.5
   phi_spectral_norm: true
@@ -255,8 +259,10 @@ datasets:
     adt_mapping_csv: cache/results/mapping/adt_mapping_pbmc_retained.csv   # built against the retained matrix
     use_anchor: true
     # Pick ONE source CSV (do not mix Mathieson + T-cell in the same file).
-    # Switch with --set beta_anchor_csv=config/beta_anchors_pbmc_tcell.csv
-    beta_anchor_csv: config/beta_anchors_pbmc_mathieson.csv
+    # matched = lineage-correct anchors actually used by the runs (10 for pbmc).
+    # Switch with --set beta_anchor_csv=config/beta_anchors_pbmc_mathieson.csv
+    beta_anchor_csv: config/beta_anchors_pbmc_matched.csv
+    # beta_anchor_csv: config/beta_anchors_pbmc_mathieson.csv
     # beta_anchor_csv: config/beta_anchors_pbmc_tcell.csv
     beta_anchor_target: 0.5
     # Soft prior over paper β (not hard-fixed). median across cell types; optional
@@ -267,7 +273,10 @@ datasets:
     beta_anchor_sigma_floor: 0.25
     kot_anchor_indices: [0, 1, 2, 3, 4]
     kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
-    lambda_prior: 0.1
+    # Canonical run weights (baked in so no --set needed): strong dynamical term,
+    # soft β prior at 1.0. Switch with --set lambda_dyn=... / lambda_prior=...
+    lambda_dyn: 100
+    lambda_prior: 1.0
     # Retained velocity already force-keeps ADT-target genes; default OFF so kinetic
     # active ≈ matched S. Override with --set kot_kinetics_require_velocity_gene=true
     # to require scVelo velocity_genes.
@@ -286,7 +295,10 @@ datasets:
     adt_mapping_csv: cache/results/mapping/adt_mapping_bmmc_cite_retained.csv   # built against the retained matrix
     use_anchor: true
     # Pick ONE source CSV (Mathieson vs T-cell kept separate).
-    beta_anchor_csv: config/beta_anchors_bmmc_cite_mathieson.csv
+    # matched = lineage-correct anchors actually used by the runs (62 for bmmc_cite).
+    # Switch with --set beta_anchor_csv=config/beta_anchors_bmmc_cite_mathieson.csv
+    beta_anchor_csv: config/beta_anchors_bmmc_cite_matched.csv
+    # beta_anchor_csv: config/beta_anchors_bmmc_cite_mathieson.csv
     # beta_anchor_csv: config/beta_anchors_bmmc_cite_tcell.csv
     beta_anchor_target: 0.5
     beta_anchor_prior: log_normal
@@ -295,7 +307,9 @@ datasets:
     beta_anchor_sigma_floor: 0.25
     kot_anchor_indices: [0, 1, 2, 3, 4]
     kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
-    lambda_prior: 0.1
+    # Canonical run weights (baked in so no --set needed).
+    lambda_dyn: 100
+    lambda_prior: 1.0
     # Same as pbmc_retained: filter OFF by default on retained velocity.
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
