@@ -237,6 +237,25 @@ def set_fixed_beta(model, value: float | list[float], d_protein: int, device: to
     return target
 
 
+def build_velocity_weight(rna_adata, S_np: np.ndarray, cfg: dict, use_feature_space: bool) -> np.ndarray | None:
+    """RNA genes whose velocity can enter the JVP, or None for unweighted velocity."""
+    if not use_feature_space:
+        return None
+
+    weights = []
+    if bool(cfg.get("kot_velocity_rna_reliability", False)) and "velocity_genes" in rna_adata.var:
+        weights.append(np.asarray(rna_adata.var["velocity_genes"].values, dtype=np.float32))
+    if bool(cfg.get("kot_velocity_s_linked_only", False)):
+        weights.append((S_np != 0).any(axis=0).astype(np.float32))
+    if not weights:
+        return None
+
+    velocity_weight = weights[0].copy()
+    for weight in weights[1:]:
+        velocity_weight *= weight
+    return velocity_weight
+
+
 def compute_jvp_rhs_diagnostics(
     model,
     R_t: torch.Tensor,
@@ -244,6 +263,7 @@ def compute_jvp_rhs_diagnostics(
     S_t: torch.Tensor,
     subset: int = 512,
     mask: torch.Tensor | None = None,
+    velocity_weight: torch.Tensor | None = None,
 ) -> dict:
     """JVP/RHS cosine + norms and kappa stats on a small subset.
 
@@ -257,8 +277,9 @@ def compute_jvp_rhs_diagnostics(
     m = min(subset, R_t.shape[0])
     r = R_t[:m]
     v = V_t[:m]
+    v_in = v if velocity_weight is None else v * velocity_weight
 
-    phi_r, dphi_dv = torch_jvp(model.phi, (r,), (v,))
+    phi_r, dphi_dv = torch_jvp(model.phi, (r,), (v_in,))
     kappa = model.kappa(r)
     alpha = model.g(r)
     Sr = (S_t @ r.T).T
@@ -331,6 +352,7 @@ def compute_per_cell_diagnostics(
     rna_obs: pd.DataFrame,
     mask: torch.Tensor | None = None,
     align_cols: torch.Tensor | None = None,
+    velocity_weight: torch.Tensor | None = None,
 ) -> dict:
     """Per-cell arrays for FOSCTTM-correlated diagnostic plots.
 
@@ -342,7 +364,8 @@ def compute_per_cell_diagnostics(
     model.eval()
 
     # All-cell JVP and RHS (single forward-mode pass).
-    phi_r, dphi_dv = torch_jvp(model.phi, (R_t,), (V_t,))
+    v_in = V_t if velocity_weight is None else V_t * velocity_weight
+    phi_r, dphi_dv = torch_jvp(model.phi, (R_t,), (v_in,))
     kappa = model.kappa(R_t)
     alpha = model.g(R_t)
     Sr = (S_t @ R_t.T).T
@@ -461,6 +484,7 @@ def compute_full_diagnostics(
     rna_obs: pd.DataFrame,
     subset: int = 1024,
     mask: torch.Tensor | None = None,
+    velocity_weight: torch.Tensor | None = None,
 ) -> dict:
     """End-of-training diagnostics: time, branch confusion, variance, plus JVP stats."""
     model.eval()
@@ -523,7 +547,15 @@ def compute_full_diagnostics(
         traj_dtw_temporal = float("nan")
         traj_dtw_recon    = float("nan")
 
-    jvp = compute_jvp_rhs_diagnostics(model, R_t, V_t, S_t, subset=subset, mask=mask)
+    jvp = compute_jvp_rhs_diagnostics(
+        model,
+        R_t,
+        V_t,
+        S_t,
+        subset=subset,
+        mask=mask,
+        velocity_weight=velocity_weight,
+    )
 
     beta_np = beta.cpu().numpy()
 
@@ -800,14 +832,22 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         kin_mask = kin_mask & has_stable
         print(f"[kot] velocity-gene filter: dropped {dropped} proteins with no stable-velocity gene")
 
-    # RNA-side velocity reliability weight (D_r,): zero the velocity of genes without a
-    # usable scVelo fit so their noise cannot leak through J_φ·v into dφ/dt. Masking the
-    # protein outputs alone does not remove this leak — the Jacobian mixes all RNA coords.
+    # RNA-side velocity weight (D_r,): which genes' velocity may enter J_φ·v. Masking the
+    # protein outputs alone cannot stop off-target velocity leaking through the Jacobian,
+    # which mixes all RNA coords. Two optional restrictions, combined multiplicatively:
+    #  - kot_velocity_rna_reliability: keep only scVelo velocity_genes (fit reliability).
+    #  - kot_velocity_s_linked_only:   keep only S-linked genes (those coding for a panel
+    #    protein). The ODE's RHS (Sr) already uses only these, so restricting the LHS to
+    #    them puts both sides on the same genes — the control for scVelo (sparse) vs
+    #    RegVelo (dense) velocity, independent of how many genes each backend fills in.
+    velocity_weight_np = build_velocity_weight(rna_adata, S_np, cfg, use_feature_space)
     velocity_weight_t = None
-    if bool(cfg.get("kot_velocity_rna_reliability", False)) and use_feature_space and "velocity_genes" in rna_adata.var:
-        vgene_w = np.asarray(rna_adata.var["velocity_genes"].values, dtype=np.float32)   # (D_r,)
-        velocity_weight_t = to_tensor(vgene_w, device)
-        print(f"[kot] RNA-side velocity reliability: {int(vgene_w.sum())}/{len(vgene_w)} genes kept in JVP")
+    if velocity_weight_np is not None:
+        velocity_weight_t = to_tensor(velocity_weight_np, device)
+        print(
+            f"[kot] RNA-side velocity weight: {int(velocity_weight_np.sum())}/"
+            f"{len(velocity_weight_np)} genes kept in JVP"
+        )
 
     # Kinetics mask (default on in feature space): only kinetic_mask=True proteins
     # enter L_dyn. When a mapping CSV is the source of truth, its use_for_kinetics
@@ -1088,7 +1128,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
         # Periodic JVP-based diagnostics: every 50 epochs (and epoch 1) on a 512-cell subset.
         if epoch % 50 == 0 or epoch == 1:
-            diag = compute_jvp_rhs_diagnostics(model, R_t, V_t, S_t, subset=512, mask=mask_t)
+            diag = compute_jvp_rhs_diagnostics(
+                model,
+                R_t,
+                V_t,
+                S_t,
+                subset=512,
+                mask=mask_t,
+                velocity_weight=velocity_weight_t,
+            )
         else:
             diag = {"jvp_rhs_cos": np.nan, "jvp_norm": np.nan, "rhs_norm": np.nan,
                     "kappa_mean": np.nan, "kappa_std": np.nan,
@@ -1214,7 +1262,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
     # End-of-training diagnostics: time, branch confusion, variance, JVP/RHS.
     diagnostics = compute_full_diagnostics(
-        model, R_t, V_t, P_t, S_t, rna_adata.obs, subset=1024, mask=mask_t,
+        model,
+        R_t,
+        V_t,
+        P_t,
+        S_t,
+        rna_adata.obs,
+        subset=1024,
+        mask=mask_t,
+        velocity_weight=velocity_weight_t,
     )
     diagnostics["anchor_loss_final"] = float(loss_anchor_final.item())
     diagnostics["beta_anchor_prior"] = beta_anchor_prior if use_anchor else None
@@ -1350,8 +1406,27 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             if state is None:
                 continue
             model.load_state_dict(state)
-            d  = compute_full_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t)
-            pc = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t, align_cols=align_cols)
+            d = compute_full_diagnostics(
+                model,
+                R_t,
+                V_t,
+                P_t,
+                S_t,
+                rna_adata.obs,
+                mask=mask_t,
+                velocity_weight=velocity_weight_t,
+            )
+            pc = compute_per_cell_diagnostics(
+                model,
+                R_t,
+                V_t,
+                P_t,
+                S_t,
+                rna_adata.obs,
+                mask=mask_t,
+                align_cols=align_cols,
+                velocity_weight=velocity_weight_t,
+            )
             mean_f = float(np.mean(pc["foscttm"]))
             d["mean_foscttm"]      = mean_f
             d["checkpoint"]        = name
@@ -1401,7 +1476,17 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             model.load_state_dict(best_align_state)
 
         # 5. Per-cell arrays + the FOSCTTM-vs-diagnostics scatter panel for best_align.
-        per_cell = compute_per_cell_diagnostics(model, R_t, V_t, P_t, S_t, rna_adata.obs, mask=mask_t, align_cols=align_cols)
+        per_cell = compute_per_cell_diagnostics(
+            model,
+            R_t,
+            V_t,
+            P_t,
+            S_t,
+            rna_adata.obs,
+            mask=mask_t,
+            align_cols=align_cols,
+            velocity_weight=velocity_weight_t,
+        )
         per_cell_path = out / "per_cell_diagnostics.npz"
         np.savez(per_cell_path, **per_cell)
         plot_path = out / "foscttm_diagnostics.png"

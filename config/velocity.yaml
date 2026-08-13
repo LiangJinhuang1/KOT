@@ -6,6 +6,10 @@ defaults:
   min_shared_counts: 20
   hvg_flavor: seurat_v3
   velocity_mode: dynamical
+  # Velocity provider: 'scvelo_dynamical' (baseline) or 'regvelo' (GRN-informed).
+  # regvelo also needs grn_prior_csv (see tools/build_grn_prior.py) and the
+  # regvelo/scvi-tools stack in the container.
+  velocity_backend: scvelo_dynamical
   dynamics_n_jobs: 8
   random_state: 0
 
@@ -27,7 +31,24 @@ datasets:
     label: bmmc_cite
     umap_key: GEX_X_umap
     n_top_genes: 2000
-    retain_genes_csv: cache/results/mapping/adt_mapping_bmmc_cite.csv
+    retain_genes_csv: cache/results/mapping/adt_mapping_bmmc_cite_retained.csv
+
+  # RegVelo backend variant (writes bmmc_cite_regvelo_results_retained.h5ad).
+  bmmc_cite_regvelo_retained:
+    mode: starsolo_h5ad
+    report: /data2/core-med1-telem/common/Thesis_Jin/Datasets/BMMC/bmmc_starsolo_output_report.tsv
+    original_h5ad: /data2/core-med1-telem/common/Thesis_Jin/Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
+    assay: cite
+    label: bmmc_cite
+    umap_key: GEX_X_umap
+    n_top_genes: 2000
+    retain_genes_csv: cache/results/mapping/adt_mapping_bmmc_cite_retained.csv
+    velocity_backend: regvelo
+    grn_prior_csv: cache/results/grn/grn_prior_bmmc_cite.csv
+    # 90k cells OOM at RegVelo's default full-batch, but small minibatches make the
+    # per-gene likelihood variance collapse (invalid Normal scale -> NaN, crash ~epoch 350).
+    # Use a large batch: closer to the stable full-batch regime, still fits ~64 GB.
+    regvelo_batch_size: 16384
 
   bmmc_multiome:
     mode: starsolo_h5ad
@@ -51,7 +72,19 @@ datasets:
     loom: Datasets/PBMC/pbmc_final_sorted_B4NII.loom
     label: pbmc
     n_top_genes: 2000
-    retain_genes_csv: cache/results/mapping/adt_mapping_pbmc.csv
+    retain_genes_csv: cache/results/mapping/adt_mapping_pbmc_retained.csv
+
+  # RegVelo backend variant (writes pbmc_regvelo_results_retained.h5ad, alongside
+  # the scVelo one) for the velocity-provider ablation.
+  pbmc_regvelo_retained:
+    mode: pbmc_10x_loom
+    pbmc_counts: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
+    loom: Datasets/PBMC/pbmc_final_sorted_B4NII.loom
+    label: pbmc
+    n_top_genes: 2000
+    retain_genes_csv: cache/results/mapping/adt_mapping_pbmc_retained.csv
+    velocity_backend: regvelo
+    grn_prior_csv: cache/results/grn/grn_prior_pbmc.csv
 
   perturb:
     # TODO: set mode once STARsolo alignment is complete for Perturb-CITE-seq.

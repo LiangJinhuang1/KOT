@@ -33,7 +33,6 @@ import ast
 import json
 import re
 import sys
-import traceback
 from glob import glob
 from pathlib import Path
 
@@ -54,6 +53,7 @@ from src.models.KOT import KOTModel
 from src.training.kot import (
     FixedAlpha,
     FixedKappa,
+    build_velocity_weight,
     compute_full_diagnostics,
     compute_per_cell_diagnostics,
     matrix_from_adata,
@@ -419,6 +419,8 @@ def build_model_and_tensors(
     V_t = to_tensor(V, device)
     S_t = to_tensor(S_model, device)
     mask_t = to_tensor(kin_mask_np, device) if kin_mask_np is not None else None
+    velocity_weight_np = build_velocity_weight(rna_adata, S_np, run_cfg, use_feature_space)
+    velocity_weight_t = to_tensor(velocity_weight_np, device) if velocity_weight_np is not None else None
 
     phi_dims        = list(run_cfg.get("phi_dims", [1024, 512, 256]))
     kappa_dims      = list(run_cfg.get("kappa_dims", [64, 32]))
@@ -459,7 +461,7 @@ def build_model_and_tensors(
     if fixed_beta_value is not None:
         set_fixed_beta(model, fixed_beta_value, D_p, device)
 
-    return model, R_t, V_t, P_t, S_t, rna_adata.obs, mask_t, align_cols
+    return model, R_t, V_t, P_t, S_t, rna_adata.obs, mask_t, align_cols, velocity_weight_t
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +478,7 @@ def evaluate_one_checkpoint(
     rna_obs,
     mask_t=None,
     align_cols=None,
+    velocity_weight_t=None,
 ):
     """Load checkpoint into model, recompute diagnostics + per-cell arrays."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -485,7 +488,16 @@ def evaluate_one_checkpoint(
     state_dict = {k: v.to(target_device) for k, v in ckpt["state_dict"].items()}
     model.load_state_dict(state_dict)
 
-    diagnostics = compute_full_diagnostics(model, R_t, V_t, P_t, S_t, rna_obs, mask=mask_t)
+    diagnostics = compute_full_diagnostics(
+        model,
+        R_t,
+        V_t,
+        P_t,
+        S_t,
+        rna_obs,
+        mask=mask_t,
+        velocity_weight=velocity_weight_t,
+    )
     per_cell = compute_per_cell_diagnostics(
         model,
         R_t,
@@ -495,6 +507,7 @@ def evaluate_one_checkpoint(
         rna_obs,
         mask=mask_t,
         align_cols=align_cols,
+        velocity_weight=velocity_weight_t,
     )
     mean_foscttm = float(np.mean(per_cell["foscttm"]))
 
@@ -522,20 +535,12 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
         for dataset_dir in sorted(p for p in model_dir.iterdir() if p.is_dir()):
             dataset_name = dataset_dir.name
             if dataset_name not in data_cache:
-                try:
-                    data_cache[dataset_name] = load_dataset_for_run(run_folder, dataset_name)
-                except Exception as e:
-                    print(f"  [{dataset_name}] load_dataset FAILED: {e}")
-                    continue
+                data_cache[dataset_name] = load_dataset_for_run(run_folder, dataset_name)
             rna_adata, protein_adata, run_cfg, _ = data_cache[dataset_name]
 
-            try:
-                model, R_t, V_t, P_t, S_t, rna_obs, mask_t, align_cols = build_model_and_tensors(
-                    run_cfg, rna_adata, protein_adata, model_name, device,
-                )
-            except Exception as e:
-                print(f"  [{model_name}/{dataset_name}] build_model FAILED: {e}")
-                continue
+            model, R_t, V_t, P_t, S_t, rna_obs, mask_t, align_cols, velocity_weight_t = build_model_and_tensors(
+                run_cfg, rna_adata, protein_adata, model_name, device,
+            )
 
             for seed_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")):
                 tail = seed_dir.name.split("_", 1)[1]
@@ -548,21 +553,18 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
                     if not ckpt_path.exists():
                         continue
 
-                    try:
-                        diagnostics, per_cell = evaluate_one_checkpoint(
-                            model,
-                            ckpt_path,
-                            R_t,
-                            V_t,
-                            P_t,
-                            S_t,
-                            rna_obs,
-                            mask_t,
-                            align_cols,
-                        )
-                    except Exception as e:
-                        print(f"  [{model_name}/{dataset_name}/seed_{seed}/{ckpt_name}] eval FAILED: {e}")
-                        continue
+                    diagnostics, per_cell = evaluate_one_checkpoint(
+                        model,
+                        ckpt_path,
+                        R_t,
+                        V_t,
+                        P_t,
+                        S_t,
+                        rna_obs,
+                        mask_t,
+                        align_cols,
+                        velocity_weight_t,
+                    )
 
                     # Per-checkpoint artifacts
                     diag_out  = seed_dir / f"diagnostics_{ckpt_name}.json"
@@ -666,12 +668,7 @@ def main():
 
     all_rows = []
     for run_folder in run_folders:
-        try:
-            rows = evaluate_run(run_folder, device, args.save_percell)
-        except Exception:
-            print(f"\n[{run_folder.name}] FAILED:")
-            traceback.print_exc()
-            continue
+        rows = evaluate_run(run_folder, device, args.save_percell)
         all_rows.extend(rows)
 
     if not all_rows:

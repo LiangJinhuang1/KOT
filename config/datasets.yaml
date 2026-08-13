@@ -13,6 +13,14 @@ datasets:
     protein_path: Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
     protein_label: ADT
 
+  # Same as bmmc_cite_retained but RNA velocity from RegVelo — the velocity ablation.
+  bmmc_cite_regvelo:
+    name: BMMC CITE-seq (RegVelo velocity)
+    rna_path: cache/velocity/bmmc_cite/bmmc_cite_regvelo_results_retained.h5ad
+    rna_raw_layer: counts
+    protein_path: Datasets/BMMC/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad
+    protein_label: ADT
+
   bmmc_multiome:
     name: BMMC Multiome
     rna_path: cache/velocity/bmmc_multiome/bmmc_multiome_scvelo_results.h5ad
@@ -29,6 +37,15 @@ datasets:
   pbmc_retained:
     name: PBMC CITE-seq (ADT-genes retained)
     rna_path: cache/velocity/pbmc/pbmc_scvelo_results_retained.h5ad
+    rna_raw_layer: counts
+    protein_path: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
+    protein_label: Antibody Capture
+
+  # Same as pbmc_retained but RNA velocity from RegVelo (GRN-informed) — the
+  # velocity-provider ablation. Only rna_path differs.
+  pbmc_regvelo:
+    name: PBMC CITE-seq (RegVelo velocity)
+    rna_path: cache/velocity/pbmc/pbmc_regvelo_results_retained.h5ad
     rna_raw_layer: counts
     protein_path: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
     protein_label: Antibody Capture

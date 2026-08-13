@@ -134,6 +134,7 @@ defaults:
   kot_beta_warmstart_from_anchor: false   # init β at anchor targets, keep trainable + soft prior
   kot_beta_anchor_shuffle: false          # control: permute β* across proteins (assertion vs recovery test)
   kot_velocity_rna_reliability: false     # zero velocity of non-velocity_gene RNA coords before the JVP
+  kot_velocity_s_linked_only: false       # JVP uses only S-linked (panel-coding) genes' velocity; fair scVelo-vs-RegVelo control
   kot_require_full_panel_mapping: true    # hard error if the mapping CSV misses any panel protein
   beta_anchor_fixed_scale: null           # freeze physical→model β scale (compute once on full set); null = geom-mean
   g_dims: [256, 128]
@@ -285,6 +286,32 @@ datasets:
     kot_alpha_max: 3.0
     seeds: [42, 123, 2026]
 
+  # Velocity-provider ablation: identical KOT config to pbmc_retained, but the
+  # dataset's rna_path (in datasets.yaml) points at the RegVelo velocity h5ad.
+  pbmc_regvelo:
+    modality_pair: rna_protein
+    kot_use_feature_space: true
+    kot_rna_layer: Ms
+    velocity_layer: velocity
+    kot_protein_layer: null
+    kot_use_explicit_links: true
+    adt_mapping_csv: cache/results/mapping/adt_mapping_pbmc_retained.csv
+    use_anchor: true
+    beta_anchor_csv: config/beta_anchors_pbmc_matched.csv
+    beta_anchor_target: 0.5
+    beta_anchor_prior: log_normal
+    beta_anchor_aggregate: median
+    beta_anchor_stable_cv_max: 0.5
+    beta_anchor_sigma_floor: 0.25
+    kot_anchor_indices: [0, 1, 2, 3, 4]
+    kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
+    lambda_dyn: 100
+    lambda_prior: 1.0
+    kot_kinetics_require_velocity_gene: false
+    kot_kinetics_normalize: true
+    kot_alpha_max: 3.0
+    seeds: [42, 123, 2026]
+
   bmmc_cite_retained:
     modality_pair: rna_protein
     kot_use_feature_space: true
@@ -311,6 +338,34 @@ datasets:
     lambda_dyn: 100
     lambda_prior: 1.0
     # Same as pbmc_retained: filter OFF by default on retained velocity.
+    kot_kinetics_require_velocity_gene: false
+    kot_kinetics_normalize: true
+    kot_alpha_max: 3.0
+    sinkhorn_max_points: 8192
+    align_batch_key: batch
+    seeds: [42, 123, 2026]
+
+  # Velocity-provider ablation: identical KOT config to bmmc_cite_retained, but the
+  # dataset's rna_path (in datasets.yaml) points at the RegVelo velocity h5ad.
+  bmmc_cite_regvelo:
+    modality_pair: rna_protein
+    kot_use_feature_space: true
+    kot_rna_layer: Ms
+    velocity_layer: velocity
+    kot_protein_layer: null
+    kot_use_explicit_links: true
+    adt_mapping_csv: cache/results/mapping/adt_mapping_bmmc_cite_retained.csv
+    use_anchor: true
+    beta_anchor_csv: config/beta_anchors_bmmc_cite_matched.csv
+    beta_anchor_target: 0.5
+    beta_anchor_prior: log_normal
+    beta_anchor_aggregate: median
+    beta_anchor_stable_cv_max: 0.5
+    beta_anchor_sigma_floor: 0.25
+    kot_anchor_indices: [0, 1, 2, 3, 4]
+    kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
+    lambda_dyn: 100
+    lambda_prior: 1.0
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0

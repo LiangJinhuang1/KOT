@@ -1,10 +1,9 @@
 """
 Stage 2 — RNA Velocity
-Runs scVelo for every dataset listed in VELOCITY_DATASETS.
-Skips datasets whose _scvelo_results.h5ad already exists.
+Runs RNA velocity for every dataset listed in VELOCITY_DATASETS.
+Skips datasets whose configured result h5ad already exists.
 """
-from pathlib import Path
-from src.data.velocity import run_dataset as run_velocity
+from src.data.velocity import result_path_for_dataset, run_dataset as run_velocity
 
 VELOCITY_DATASETS = [
     # "bmmc_cite",
@@ -16,15 +15,8 @@ VELOCITY_DATASETS = [
 ]
 
 
-def velocity_result(name: str) -> Path:
-    if name.endswith("_retained"):
-        base = name.removesuffix("_retained")
-        return Path("cache/velocity") / base / f"{base}_scvelo_results_retained.h5ad"
-    return Path("cache/velocity") / name / f"{name}_scvelo_results.h5ad"
-
-
 for name in VELOCITY_DATASETS:
-    if velocity_result(name).exists():
+    if result_path_for_dataset(name).exists():
         print(f"[02_compute_velocity] Skipping {name} — result already exists.")
     else:
         print(f"[02_compute_velocity] Running {name}")

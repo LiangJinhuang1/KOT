@@ -4,7 +4,7 @@ import anndata as ad
 
 from src.data.synthetic import DEFAULT_SYNTHETIC_SEED, save_synthetic
 from src.utils.io import load_yaml
-from src.data.velocity import run_dataset as run_velocity
+from src.data.velocity import result_path_for_dataset, run_dataset as run_velocity
 from src.training.runner import run_training
 from src.visualization.modalities import plot_modalities
 
@@ -20,13 +20,6 @@ VELOCITY_DATASETS = [
     # "shareseq_brain",
     # "shareseq_lung",
 ]
-
-
-def velocity_result(name: str) -> Path:
-    if name.endswith("_retained"):
-        base = name.removesuffix("_retained")
-        return Path("cache/velocity") / base / f"{base}_scvelo_results_retained.h5ad"
-    return Path("cache/velocity") / name / f"{name}_scvelo_results.h5ad"
 
 
 def synthetic_seed() -> int:
@@ -47,7 +40,7 @@ if __name__ == "__main__":
     plot_modalities(rna_adata, protein_adata, save_dir="cache/results/synthetic")
 
     for name in VELOCITY_DATASETS:
-        if velocity_result(name).exists():
+        if result_path_for_dataset(name).exists():
             print(f"[velocity] Skipping {name} — result already exists.")
         else:
             run_velocity(name)

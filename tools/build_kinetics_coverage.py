@@ -169,6 +169,11 @@ def build_detail_rows(records, rna, anchored, min_quality: float, require_veloci
     vgene = var_bool_set(rna, "velocity_genes")
     fit_ok = dynamical_fit_set(rna)
     qual_ok = quality_pass_set(rna, min_quality)
+    # scVelo emits per-gene fit_likelihood/fit_alpha; RegVelo (one joint GRN-ODE) does
+    # not — for it there is no per-gene "fit failed" mode, so a produced velocity IS the
+    # fit and there is no separate quality gate. Detect the backend to avoid reporting
+    # dynamical_fit_success / velocity_usable as spuriously zero for RegVelo output.
+    has_dynamical = ("fit_likelihood" in rna.var.columns) or ("fit_alpha" in rna.var.columns)
 
     rows = []
     for r in records:
@@ -177,11 +182,21 @@ def build_detail_rows(records, rna, anchored, min_quality: float, require_veloci
         eligible = r["use_for_kinetics"]
         retained = gu in var_upper
         velocity_gene = gu in vgene
-        dyn_fit = gu in fit_ok
-        velocity_quality = gu in qual_ok
-        # usable = passed scVelo's velocity filter AND had a successful dynamical fit
-        # AND the fit quality clears the threshold — the strict, honest "trust it".
-        velocity_usable = bool(velocity_gene and dyn_fit and velocity_quality)
+        velocity_estimated = gu in vel_est
+        if has_dynamical:
+            dyn_fit = gu in fit_ok
+            velocity_quality = gu in qual_ok
+        else:
+            dyn_fit = velocity_estimated
+            velocity_quality = velocity_estimated
+        if has_dynamical:
+            # scVelo: keep the stricter report that separates its velocity filter,
+            # per-gene dynamical fit, and fit-quality threshold.
+            velocity_usable = bool(velocity_gene and dyn_fit and velocity_quality)
+        else:
+            # Joint ODE backends such as RegVelo have no per-gene fit columns; a
+            # finite non-zero velocity is the backend-specific usable signal.
+            velocity_usable = bool(velocity_estimated)
         runtime_mask = bool(eligible and retained and (velocity_gene or not require_velocity_gene))
         strict_mask = bool(eligible and retained and velocity_usable)
         rows.append({
@@ -193,7 +208,7 @@ def build_detail_rows(records, rna, anchored, min_quality: float, require_veloci
             "spliced_present":            gu in spliced,
             "unspliced_present":          gu in unspliced,
             "retained":                   retained,               # in the final velocity matrix
-            "velocity_estimated":         gu in vel_est,          # a velocity value exists
+            "velocity_estimated":         velocity_estimated,     # a velocity value exists
             "velocity_gene":              velocity_gene,          # scVelo velocity_genes flag
             "dynamical_fit_success":      dyn_fit,                # recover_dynamics fit this gene
             "velocity_quality":           velocity_quality,       # fit quality >= threshold
@@ -207,25 +222,27 @@ def build_detail_rows(records, rna, anchored, min_quality: float, require_veloci
     return rows
 
 
+def count_rows(rows: list[dict], pred) -> int:
+    return sum(1 for row in rows if pred(row))
+
+
 def summarize(dataset: str, rows: list[dict]) -> dict:
-    def count(pred):
-        return sum(1 for r in rows if pred(r))
     mapped_types = {"one_to_one", "complex_curated"}
     return {
         "dataset": dataset,
         "total_adts": len(rows),
-        "mapped_to_hgnc": count(lambda r: r["mapping_type"] in mapped_types),
-        "curated_kinetic_eligible": count(lambda r: r["curated_kinetic_eligible"]),
-        "present_in_rna": count(lambda r: r["present_in_rna"]),
-        "retained_after_qc": count(lambda r: r["retained"]),
-        "velocity_estimated": count(lambda r: r["velocity_estimated"]),
-        "velocity_gene": count(lambda r: r["velocity_gene"]),
-        "dynamical_fit_success": count(lambda r: r["dynamical_fit_success"]),
-        "velocity_usable": count(lambda r: r["velocity_usable"]),
+        "mapped_to_hgnc": count_rows(rows, lambda r: r["mapping_type"] in mapped_types),
+        "curated_kinetic_eligible": count_rows(rows, lambda r: r["curated_kinetic_eligible"]),
+        "present_in_rna": count_rows(rows, lambda r: r["present_in_rna"]),
+        "retained_after_qc": count_rows(rows, lambda r: r["retained"]),
+        "velocity_estimated": count_rows(rows, lambda r: r["velocity_estimated"]),
+        "velocity_gene": count_rows(rows, lambda r: r["velocity_gene"]),
+        "dynamical_fit_success": count_rows(rows, lambda r: r["dynamical_fit_success"]),
+        "velocity_usable": count_rows(rows, lambda r: r["velocity_usable"]),
         "require_velocity_gene": rows[0]["require_velocity_gene"] if rows else None,
-        "final_runtime_kinetic_mask": count(lambda r: r["final_runtime_kinetic_mask"]),
-        "strict_velocity_kinetic_mask": count(lambda r: r["strict_velocity_kinetic_mask"]),
-        "anchored": count(lambda r: r["anchor_available"]),
+        "final_runtime_kinetic_mask": count_rows(rows, lambda r: r["final_runtime_kinetic_mask"]),
+        "strict_velocity_kinetic_mask": count_rows(rows, lambda r: r["strict_velocity_kinetic_mask"]),
+        "anchored": count_rows(rows, lambda r: r["anchor_available"]),
     }
 
 

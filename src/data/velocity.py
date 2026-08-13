@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import re
 from pathlib import Path
 
@@ -40,6 +41,12 @@ def as_path(config: dict, key: str, required: bool = False) -> Path | None:
             raise ValueError(f"Missing required config value: {key}")
         return None
     return Path(value)
+
+
+def load_regvelo_runner():
+    """Load the optional RegVelo backend only for RegVelo velocity runs."""
+    module = importlib.import_module("src.data.regvelo_backend")
+    return module.run_regvelo
 
 
 # --- STARsolo / velocyto loading ---
@@ -538,6 +545,30 @@ def build_run_config(config: dict, dataset_name: str) -> dict:
     return run_config
 
 
+def velocity_backend_tag(backend: str) -> str:
+    if backend == "scvelo_dynamical":
+        return "scvelo"
+    if backend == "regvelo":
+        return "regvelo"
+    raise ValueError(f"Unsupported velocity_backend: {backend}. Expected scvelo_dynamical or regvelo.")
+
+
+def result_path_from_run_config(run_config: dict) -> Path:
+    label = str(run_config["label"])
+    output_root = as_path(run_config, "output_root", required=True)
+    output_dir = output_root / safe_label(label)
+    backend = str(run_config.get("velocity_backend", "scvelo_dynamical"))
+    suffix = "_retained" if run_config.get("retain_genes_csv") else ""
+    return output_dir / f"{label}_{velocity_backend_tag(backend)}_results{suffix}.h5ad"
+
+
+def result_path_for_dataset(dataset_name: str, config_path: Path = DEFAULT_CONFIG) -> Path:
+    config = load_yaml(Path(config_path))
+    config.setdefault("defaults", {})
+    config.setdefault("datasets", {})
+    return result_path_from_run_config(build_run_config(config, dataset_name))
+
+
 def execute_run(run_config: dict) -> None:
     scv.settings.verbosity = 3
     mode = run_config.get("mode")
@@ -590,41 +621,61 @@ def execute_run(run_config: dict) -> None:
 
     retain_genes = None
     retain_csv = run_config.get("retain_genes_csv")
-    if retain_csv and Path(retain_csv).exists():
+    if retain_csv:
+        retain_path = Path(retain_csv)
+        if not retain_path.exists():
+            raise FileNotFoundError(f"retain_genes_csv missing: {retain_path}")
         # Retain every resolved ADT target gene. A base mapping marks genes that
         # were dropped by the original velocity matrix as not kinetics-eligible,
         # so filtering on use_for_kinetics here would make retained runs unable
         # to recover exactly the genes they are meant to force-keep.
         retain_genes = {
             r["gene_symbol"]
-            for r in load_mapping_records(Path(retain_csv))
+            for r in load_mapping_records(retain_path)
             if r["gene_symbol"]
         }
-        print(f"[velocity] force-retaining {len(retain_genes)} resolved ADT-target genes from {retain_csv}")
+        print(f"[velocity] force-retaining {len(retain_genes)} resolved ADT-target genes from {retain_path}")
 
-    adata = run_scvelo(
-        adata,
-        int(run_config.get("n_top_genes", 2000) or 0),
-        str(run_config.get("hvg_flavor", "seurat_v3")),
-        int(run_config.get("min_shared_counts", 20)),
-        int(run_config.get("n_pcs", 30)),
-        int(run_config.get("n_neighbors", 30)),
-        str(run_config.get("velocity_mode", "dynamical")),
-        int(run_config.get("dynamics_n_jobs", 1)),
-        retain_genes=retain_genes,
-    )
+    backend = str(run_config.get("velocity_backend", "scvelo_dynamical"))
+    velocity_backend_tag(backend)
+    if backend == "scvelo_dynamical":
+        adata = run_scvelo(
+            adata,
+            int(run_config.get("n_top_genes", 2000) or 0),
+            str(run_config.get("hvg_flavor", "seurat_v3")),
+            int(run_config.get("min_shared_counts", 20)),
+            int(run_config.get("n_pcs", 30)),
+            int(run_config.get("n_neighbors", 30)),
+            str(run_config.get("velocity_mode", "dynamical")),
+            int(run_config.get("dynamics_n_jobs", 1)),
+            retain_genes=retain_genes,
+        )
+    elif backend == "regvelo":
+        run_regvelo = load_regvelo_runner()
+        adata = run_regvelo(
+            adata,
+            int(run_config.get("n_top_genes", 2000) or 0),
+            str(run_config.get("hvg_flavor", "seurat_v3")),
+            int(run_config.get("min_shared_counts", 20)),
+            int(run_config.get("n_pcs", 30)),
+            int(run_config.get("n_neighbors", 30)),
+            as_path(run_config, "grn_prior_csv", required=True),
+            retain_genes=retain_genes,
+            batch_size=run_config.get("regvelo_batch_size"),
+        )
 
     save_plots(adata, output_dir, label)
     save_confidence(adata, output_dir, label)
 
     # Retained runs write to a separate _retained file so the original velocity
-    # result (and its downstream runs) stay reproducible.
+    # result (and its downstream runs) stay reproducible. The backend tag keeps
+    # scvelo and regvelo outputs side by side for the velocity-provider ablation.
     suffix = "_retained" if retain_genes else ""
     if "velocity_gene_diagnostics" in adata.uns:
         diag_path = output_dir / f"{label}_velocity_gene_diagnostics{suffix}.csv"
         adata.uns["velocity_gene_diagnostics"].to_csv(diag_path, index=False)
         print(f"Wrote {diag_path}")
-    result_path = output_dir / f"{label}_scvelo_results{suffix}.h5ad"
+    result_path = result_path_from_run_config(run_config)
     adata.write_h5ad(result_path)
     print(f"Wrote {result_path}")
 
@@ -707,3 +758,7 @@ def main() -> None:
         if value is not None:
             run_config[key] = value
     execute_run(run_config)
+
+
+if __name__ == "__main__":
+    main()
