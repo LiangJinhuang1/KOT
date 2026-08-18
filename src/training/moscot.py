@@ -7,15 +7,17 @@ import numpy as np
 from moscot.problems.cross_modality import TranslationProblem
 
 
-def assert_context_matches_moscot_inputs(
+def validate_context_matches_moscot_inputs(
     context: dict,
     rna_adata,
     second_adata,
     rna_repr_key: str,
     second_repr_key: str,
 ) -> None:
-    assert np.allclose(context["x"], rna_adata.obsm[rna_repr_key])
-    assert np.allclose(context["y"], second_adata.obsm[second_repr_key])
+    if not np.allclose(context["x"], rna_adata.obsm[rna_repr_key]):
+        raise ValueError(f"context['x'] does not match rna_adata.obsm['{rna_repr_key}'].")
+    if not np.allclose(context["y"], second_adata.obsm[second_repr_key]):
+        raise ValueError(f"context['y'] does not match second_adata.obsm['{second_repr_key}'].")
 
 
 def coupling_metrics(coupling: np.ndarray, threshold: float) -> dict:
@@ -107,7 +109,7 @@ def run_moscot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, None,
     max_iter = int(cfg.get("max_iterations", 100))
 
     if bool(cfg.get("moscot_validate_inputs", True)):
-        assert_context_matches_moscot_inputs(
+        validate_context_matches_moscot_inputs(
             context, rna_adata, second_adata, rna_repr_key, second_repr_key
         )
 

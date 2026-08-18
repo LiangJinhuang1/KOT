@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import sys
 import time
 from datetime import datetime
@@ -11,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.utils.io import load_yaml
+from src.utils.io import load_yaml, save_yaml
 from src.data.preprocessing import load_and_preprocess_cached
 from src.training.scot import run_scot
 from src.training.moscot import run_moscot
@@ -607,8 +606,15 @@ def run_training(
     # Snapshot config + log under names that don't clobber the original run when resuming.
     snapshot_name = f"training_resume_{timestamp}.yaml" if run_dir is not None else "training.yaml"
     log_name = f"run_resume_{timestamp}.log" if run_dir is not None else "run.log"
+    # Snapshot the ACTUAL config used, not the original file: train_cfg already carries
+    # the modified defaults (output_root), and cli_overrides record what --set changed.
+    # shutil.copy(config_path) would save the pre-override file — misleading for resumes
+    # and for reading back what a run actually used.
     config_snapshot = run_root / snapshot_name
-    shutil.copy(config_path, config_snapshot)
+    snapshot_cfg = dict(train_cfg)
+    if cli_overrides:
+        snapshot_cfg["_cli_overrides"] = dict(cli_overrides)
+    save_yaml(snapshot_cfg, config_snapshot)
 
     log_path = run_root / log_name
     log_file = open(log_path, "w", buffering=1)

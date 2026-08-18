@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import re
 from pathlib import Path
+from typing import Callable, Iterable
 
 HGNC_PATH = Path("Datasets/HGNC_set.txt")
 
@@ -27,6 +28,85 @@ MANUAL_ADT_TO_GENE = {
     "IgD":        "IGHD",
     "integrinB7": "ITGB7",
 }
+
+# Columns commonly used by 10x / STARsolo / AnnData objects to keep the gene
+# symbol even when var_names are Ensembl IDs or have been made unique.
+GENE_ALIAS_COLUMNS = (
+    "gene_name",
+    "gene_symbol",
+    "gene_symbols",
+    "symbol",
+    "feature_name",
+    "gene_id",
+)
+
+
+def valid_gene_alias(value) -> str | None:
+    """Return a clean gene alias string, or None for empty/null-ish values."""
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "na", "<na>"}:
+        return None
+    return text
+
+
+def normalize_gene_symbol(value: str) -> str:
+    return str(value).strip().upper()
+
+
+def iter_gene_aliases(var_names: Iterable, var=None):
+    """Yield (position, alias) pairs from var_names plus common symbol columns."""
+    for i, name in enumerate(var_names):
+        alias = valid_gene_alias(name)
+        if alias is not None:
+            yield i, alias
+    if var is None:
+        return
+    for col in GENE_ALIAS_COLUMNS:
+        if col not in var.columns:
+            continue
+        for i, value in enumerate(var[col].astype(str)):
+            alias = valid_gene_alias(value)
+            if alias is not None:
+                yield i, alias
+
+
+def gene_alias_lookup(
+    var_names: Iterable,
+    var=None,
+    normalizer: Callable[[str], str] | None = None,
+) -> dict[str, int]:
+    """Map normalized gene aliases to the first RNA feature position."""
+    lookup: dict[str, int] = {}
+    for i, alias in iter_gene_aliases(var_names, var):
+        key = normalizer(alias) if normalizer is not None else alias
+        lookup.setdefault(key, i)
+    return lookup
+
+
+def gene_alias_set(
+    var_names: Iterable,
+    var=None,
+    normalizer: Callable[[str], str] | None = None,
+) -> set[str]:
+    """All normalized gene aliases visible for an RNA matrix."""
+    return {
+        normalizer(alias) if normalizer is not None else alias
+        for _, alias in iter_gene_aliases(var_names, var)
+    }
+
+
+def aliases_for_positions(
+    var_names: Iterable,
+    var,
+    positions: Iterable[int],
+    normalizer: Callable[[str], str] | None = None,
+) -> set[str]:
+    """All aliases belonging to selected RNA feature positions."""
+    keep = set(int(i) for i in positions)
+    return {
+        normalizer(alias) if normalizer is not None else alias
+        for i, alias in iter_gene_aliases(var_names, var) if i in keep
+    }
 
 
 def alnum(name: str) -> str:
@@ -122,7 +202,7 @@ def parse_bool(value) -> bool | None:
 
 def validate_mapping_records(records: list[dict]) -> None:
     """
-    Assert the invariants an ADT→gene mapping table must satisfy, failing loud on
+    Validate the invariants an ADT→gene mapping table must satisfy, failing loud on
     a malformed CSV rather than letting it silently distort alignment / kinetics:
 
       * adt_name is unique across rows;
@@ -132,16 +212,21 @@ def validate_mapping_records(records: list[dict]) -> None:
     """
     names = [r["adt_name"] for r in records]
     dupes = sorted({n for n in names if names.count(n) > 1})
-    assert not dupes, f"duplicate adt_name(s) in mapping: {dupes}"
+    if dupes:
+        raise ValueError(f"duplicate adt_name(s) in mapping: {dupes}")
     for r in records:
         name = r["adt_name"]
-        assert name, "empty adt_name in mapping row"
+        if not name:
+            raise ValueError("empty adt_name in mapping row")
         if r["use_for_kinetics"]:
-            assert r["gene_symbol"], f"{name}: use_for_kinetics=True but gene_symbol is empty"
+            if not r["gene_symbol"]:
+                raise ValueError(f"{name}: use_for_kinetics=True but gene_symbol is empty")
         else:
-            assert r["excluded_because"], f"{name}: excluded from kinetics but no excluded_because reason"
+            if not r["excluded_because"]:
+                raise ValueError(f"{name}: excluded from kinetics but no excluded_because reason")
         if r["mapping_type"] == "isotype":
-            assert not r["use_for_kinetics"], f"{name}: isotype control must not have use_for_kinetics=True"
+            if r["use_for_kinetics"]:
+                raise ValueError(f"{name}: isotype control must not have use_for_kinetics=True")
 
 
 def load_mapping_records(path: Path) -> list[dict]:
@@ -157,7 +242,8 @@ def load_mapping_records(path: Path) -> list[dict]:
     with open(path) as f:
         reader = csv.DictReader(f)
         missing = [c for c in MAPPING_COLUMNS if c not in (reader.fieldnames or [])]
-        assert not missing, f"{path} missing mapping columns: {missing}"
+        if missing:
+            raise ValueError(f"{path} missing mapping columns: {missing}")
         for row in reader:
             records.append({
                 "adt_name":          (row.get("adt_name") or "").strip(),
@@ -211,13 +297,13 @@ def build_mapping_rows(protein_names, rna_symbols=None, hgnc_path: Path = HGNC_P
     """
     records = load_hgnc_records(hgnc_path) if hgnc_path.exists() else {}
     manual = {alnum(k): v for k, v in MANUAL_ADT_TO_GENE.items()}
-    rna_set = {s.upper() for s in rna_symbols} if rna_symbols is not None else None
+    rna_set = {normalize_gene_symbol(s) for s in rna_symbols} if rna_symbols is not None else None
     allow = {alnum(strip_adt_suffix(str(x))) for x in (kinetic_complex_allow or [])}
 
     rows = []
     for name in protein_names:
         gene, hgnc_id, mapping_type = resolve_marker(name, records, manual)
-        present = None if (rna_set is None or gene is None) else (gene.upper() in rna_set)
+        present = None if (rna_set is None or gene is None) else (normalize_gene_symbol(gene) in rna_set)
         allowed_complex = (
             mapping_type == "complex_curated"
             and (alnum(strip_adt_suffix(name)) in allow or (gene and alnum(gene) in allow))

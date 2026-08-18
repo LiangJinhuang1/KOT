@@ -13,22 +13,23 @@ Writes:
   cache/results/mapping/kinetics_coverage_<dataset>_summary.csv  (per dataset)
 
 Every stage is reported SEPARATELY, so a gene's drop-out point is visible and the
-velocity flags are not conflated (velocity_gene is scVelo's filter, NOT a fit):
+velocity flags are not conflated (for scVelo, velocity_gene is a filter, NOT a fit):
   curated_kinetic_eligible   = biological / curation eligibility (maps to a real gene)
   present_in_rna             = data availability (mapping-CSV belief)
   retained                   = present in the final velocity matrix
   velocity_estimated         = a velocity value exists for the gene
-  velocity_gene              = scVelo velocity_genes flag (steady-state/velocity filter)
-  dynamical_fit_success      = recover_dynamics actually fit this gene (finite fit_likelihood)
-  velocity_quality           = fit quality (likelihood / r2) clears the threshold
-  velocity_usable            = velocity_gene & dynamical_fit_success & velocity_quality (strict report)
+  velocity_gene              = scVelo/RegVelo velocity_genes flag
+  dynamical_fit_success      = scVelo recover_dynamics fit this gene; RegVelo uses velocity_estimated
+  velocity_quality           = velocity R2 clears the threshold
+  velocity_usable            = scVelo strict fit+quality flag; RegVelo finite non-zero velocity
   final_runtime_kinetic_mask = curated_kinetic_eligible & retained, plus velocity_gene only when
                                kot_kinetics_require_velocity_gene=true for that dataset
   ...plus adt_name, gene_symbol, mapping_type, spliced_present, unspliced_present,
   alignment_active, anchor_available
 
 Usage:
-  python tools/build_kinetics_coverage.py --datasets pbmc_retained,bmmc_cite_retained
+  python tools/build_kinetics_coverage.py
+  python tools/build_kinetics_coverage.py --datasets pbmc_retained,bmmc_cite_retained,papalexi_retained
 """
 
 from __future__ import annotations
@@ -47,7 +48,12 @@ import numpy as np
 from scipy import sparse
 
 from src.utils.io import load_yaml
-from src.data.adt_gene_map import load_mapping_records
+from src.data.adt_gene_map import (
+    aliases_for_positions,
+    gene_alias_lookup,
+    load_mapping_records,
+    normalize_gene_symbol,
+)
 from src.data.beta_anchor import resolve_beta_anchors
 
 DATASETS_CONFIG = Path("config/datasets.yaml")
@@ -55,7 +61,7 @@ TRAINING_CONFIG = Path("config/training.yaml")
 OUT_DIR = Path("cache/results/mapping")
 
 DETAIL_COLS = [
-    "adt_name", "gene_symbol", "mapping_type",
+    "adt_name", "gene_symbol", "mapping_type", "velocity_backend",
     "curated_kinetic_eligible", "present_in_rna", "spliced_present", "unspliced_present",
     "retained", "velocity_estimated", "velocity_gene", "dynamical_fit_success",
     "velocity_quality", "velocity_usable", "require_velocity_gene",
@@ -64,7 +70,7 @@ DETAIL_COLS = [
 ]
 
 SUMMARY_COLS = [
-    "dataset", "total_adts", "mapped_to_hgnc", "curated_kinetic_eligible",
+    "dataset", "velocity_backend", "total_adts", "mapped_to_hgnc", "curated_kinetic_eligible",
     "present_in_rna", "retained_after_qc", "velocity_estimated", "velocity_gene",
     "dynamical_fit_success", "velocity_usable", "require_velocity_gene",
     "final_runtime_kinetic_mask", "strict_velocity_kinetic_mask", "anchored",
@@ -86,7 +92,7 @@ def mapping_path_for(dataset: str, meta: dict, train_cfg: dict) -> Path:
 def anchor_proteins(dataset: str, override: str | None, train_cfg: dict,
                     panel_names: list[str]) -> tuple[set[str], str | None]:
     """ADT names the run ACTUALLY anchors — via the same resolver training uses
-    (resolve_beta_anchors: name-normalization + stable_cv_max filter + aggregation),
+    (resolve_beta_anchors: name-normalization, quality/stability filters, aggregation),
     so the count matches diagnostics beta_anchor_n, not a raw CSV membership."""
     block = (train_cfg.get("datasets") or {}).get(dataset) or {}
     path = override or block.get("beta_anchor_csv")
@@ -97,22 +103,27 @@ def anchor_proteins(dataset: str, override: str | None, train_cfg: dict,
     if not path or not Path(path).exists():
         return set(), None
     merged = {**(train_cfg.get("defaults") or {}), **block}
+    stable_cv_cfg = merged.get("beta_anchor_stable_cv_max")
+    stable_cv_max = float(stable_cv_cfg) if stable_cv_cfg is not None else None
+    min_quality_cfg = merged.get("beta_anchor_min_r2")
+    min_quality = float(min_quality_cfg) if min_quality_cfg is not None else None
     idx, *_ = resolve_beta_anchors(
         path, panel_names,
         target_mean_beta=float(merged.get("beta_anchor_target", 0.5)),
         aggregate=merged.get("beta_anchor_aggregate", "median"),
-        stable_cv_max=merged.get("beta_anchor_stable_cv_max"),
+        stable_cv_max=stable_cv_max,
         prior_sigma_floor=float(merged.get("beta_anchor_sigma_floor", 0.25)),
+        min_quality=min_quality,
     )
     return {panel_names[j] for j in idx}, str(path)
 
 
 def var_bool_set(rna, col: str) -> set[str]:
-    """Upper-cased genes where a boolean var column is True."""
+    """Upper-cased gene aliases where a boolean var column is True."""
     if col not in rna.var.columns:
         return set()
     flags = rna.var[col].to_numpy().astype(bool)
-    return {str(g).upper() for g, ok in zip(rna.var_names, flags) if ok}
+    return aliases_for_positions(rna.var_names, rna.var, np.flatnonzero(flags), normalizer=normalize_gene_symbol)
 
 
 def var_column(rna, candidates: tuple[str, ...]):
@@ -123,21 +134,35 @@ def var_column(rna, candidates: tuple[str, ...]):
     return None
 
 
+def velocity_backend_name(rna) -> str:
+    backend = rna.uns.get("velocity_backend")
+    if backend:
+        return str(backend)
+    source = rna.uns.get("velocity_source", {})
+    if isinstance(source, dict) and source.get("backend"):
+        return str(source["backend"])
+    if "skeleton" in rna.uns and "regulators" in rna.uns:
+        return "regvelo"
+    return "scvelo_dynamical"
+
+
 def dynamical_fit_set(rna) -> set[str]:
-    """Genes the DYNAMICAL model actually fit (finite fit_likelihood / fit_alpha) —
-    distinct from velocity_genes, which is scVelo's steady-state / velocity filter."""
+    """Genes the scVelo dynamical model fit (finite fit_likelihood / fit_alpha)."""
     q = var_column(rna, ("fit_likelihood", "fit_alpha"))
     if q is None:
         return set()
-    return {str(g).upper() for g, v in zip(rna.var_names, q) if np.isfinite(v)}
+    return aliases_for_positions(rna.var_names, rna.var, np.flatnonzero(np.isfinite(q)), normalizer=normalize_gene_symbol)
 
 
 def quality_pass_set(rna, min_quality: float) -> set[str]:
-    """Genes whose velocity fit quality (likelihood or r2) clears a threshold."""
-    q = var_column(rna, ("fit_likelihood", "fit_r2", "velocity_r2", "r2"))
+    """Genes whose velocity fit R² clears a threshold. Use an explicit R² column only
+    (velocity_r2 / fit_r2 / r2), NOT fit_likelihood — a likelihood is not an R² and is
+    not comparable to a --velocity-min-r2 threshold."""
+    q = var_column(rna, ("velocity_r2", "fit_r2", "r2"))
     if q is None:
         return set()
-    return {str(g).upper() for g, v in zip(rna.var_names, q) if np.isfinite(v) and v >= min_quality}
+    ok = np.isfinite(q) & (q >= min_quality)
+    return aliases_for_positions(rna.var_names, rna.var, np.flatnonzero(ok), normalizer=normalize_gene_symbol)
 
 
 def gene_presence_sets(rna, genes_in_var: list[str]) -> dict[str, set[str]]:
@@ -151,36 +176,42 @@ def gene_presence_sets(rna, genes_in_var: list[str]) -> dict[str, set[str]]:
         if layer in sub.layers:
             M = sub.layers[layer]
             tot = np.asarray(M.sum(axis=0)).ravel() if sparse.issparse(M) else np.asarray(M).sum(axis=0)
-            out[layer] = {str(g).upper() for g, t in zip(sub.var_names, tot) if t > 0}
+            out[layer] = aliases_for_positions(
+                sub.var_names, sub.var, np.flatnonzero(tot > 0), normalizer=normalize_gene_symbol,
+            )
     if "velocity" in sub.layers:
         V = sub.layers["velocity"]
         arr = V.toarray() if sparse.issparse(V) else np.asarray(V)
         has_v = np.isfinite(arr).any(axis=0) & (np.nan_to_num(arr) != 0).any(axis=0)
-        out["velocity"] = {str(g).upper() for g, f in zip(sub.var_names, has_v) if f}
+        out["velocity"] = aliases_for_positions(
+            sub.var_names, sub.var, np.flatnonzero(has_v), normalizer=normalize_gene_symbol,
+        )
     return out
 
 
 def build_detail_rows(records, rna, anchored, min_quality: float, require_velocity_gene: bool) -> list[dict]:
-    var_upper = {str(g).upper(): str(g) for g in rna.var_names}
-    map_genes = [var_upper[r["gene_symbol"].upper()] for r in records
-                 if r["gene_symbol"] and r["gene_symbol"].upper() in var_upper]
+    gene_pos = gene_alias_lookup(rna.var_names, rna.var, normalizer=normalize_gene_symbol)
+    map_genes = list(dict.fromkeys(
+        str(rna.var_names[gene_pos[normalize_gene_symbol(r["gene_symbol"])]])
+        for r in records
+        if r["gene_symbol"] and normalize_gene_symbol(r["gene_symbol"]) in gene_pos
+    ))
     pres = gene_presence_sets(rna, map_genes)
     spliced, unspliced, vel_est = pres["spliced"], pres["unspliced"], pres["velocity"]
     vgene = var_bool_set(rna, "velocity_genes")
-    fit_ok = dynamical_fit_set(rna)
-    qual_ok = quality_pass_set(rna, min_quality)
-    # scVelo emits per-gene fit_likelihood/fit_alpha; RegVelo (one joint GRN-ODE) does
-    # not — for it there is no per-gene "fit failed" mode, so a produced velocity IS the
-    # fit and there is no separate quality gate. Detect the backend to avoid reporting
-    # dynamical_fit_success / velocity_usable as spuriously zero for RegVelo output.
-    has_dynamical = ("fit_likelihood" in rna.var.columns) or ("fit_alpha" in rna.var.columns)
+    backend = velocity_backend_name(rna)
+    # scVelo's dynamical model has a per-gene fit/fail mode; RegVelo is one joint
+    # GRN-ODE backend, so finite non-zero velocity is the usable backend-specific signal.
+    has_dynamical = backend.startswith("scvelo")
+    fit_ok = dynamical_fit_set(rna) if has_dynamical else set()
+    qual_ok = quality_pass_set(rna, min_quality) if has_dynamical else set()
 
     rows = []
     for r in records:
         gene = r["gene_symbol"]
-        gu = gene.upper()
+        gu = normalize_gene_symbol(gene)
         eligible = r["use_for_kinetics"]
-        retained = gu in var_upper
+        retained = gu in gene_pos
         velocity_gene = gu in vgene
         velocity_estimated = gu in vel_est
         if has_dynamical:
@@ -203,6 +234,7 @@ def build_detail_rows(records, rna, anchored, min_quality: float, require_veloci
             "adt_name":                   r["adt_name"],
             "gene_symbol":                gene,
             "mapping_type":               r["mapping_type"],
+            "velocity_backend":           backend,
             "curated_kinetic_eligible":   eligible,               # use_for_kinetics (curation)
             "present_in_rna":             r["present_in_rna"] is True,
             "spliced_present":            gu in spliced,
@@ -230,6 +262,7 @@ def summarize(dataset: str, rows: list[dict]) -> dict:
     mapped_types = {"one_to_one", "complex_curated"}
     return {
         "dataset": dataset,
+        "velocity_backend": rows[0]["velocity_backend"] if rows else None,
         "total_adts": len(rows),
         "mapped_to_hgnc": count_rows(rows, lambda r: r["mapping_type"] in mapped_types),
         "curated_kinetic_eligible": count_rows(rows, lambda r: r["curated_kinetic_eligible"]),
@@ -278,6 +311,7 @@ def run_one(name: str, meta: dict, train_cfg: dict, anchor_override: str | None,
     rna = ad.read_h5ad(rna_path, backed="r")
     require_velocity_gene = require_velocity_gene_for(name, train_cfg)
     rows = build_detail_rows(records, rna, anchored, min_quality, require_velocity_gene)
+    rna.file.close()
     summary = summarize(name, rows)
 
     write_csv(rows, OUT_DIR / f"kinetics_coverage_{name}.csv", DETAIL_COLS)
@@ -297,14 +331,17 @@ def run_one(name: str, meta: dict, train_cfg: dict, anchor_override: str | None,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", type=str,
-                        default="pbmc_retained,bmmc_cite_retained",
+                        default=(
+                            "pbmc_retained,bmmc_cite_retained,"
+                            "pbmc_regvelo,bmmc_cite_regvelo,"
+                            "papalexi_retained,papalexi_regvelo"
+                        ),
                         help="Comma-separated dataset keys from config/datasets.yaml "
-                             "(canonical = the _retained pair; add pbmc,bmmc_cite for the "
-                             "deprecated HVG-based variants)")
+                             "(default = retained scVelo/RegVelo CITE-seq datasets)")
     parser.add_argument("--anchor-csv", type=str, default=None,
                         help="Override β-anchor CSV for all selected datasets")
     parser.add_argument("--velocity-min-r2", type=float, default=0.1,
-                        help="Quality threshold for velocity_reliable")
+                        help="R2 threshold for velocity_quality")
     args = parser.parse_args()
 
     datasets = load_yaml(DATASETS_CONFIG).get("datasets", {})

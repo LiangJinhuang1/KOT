@@ -4,11 +4,31 @@ import numpy as np
 import anndata as ad
 import pandas as pd
 import scvi
+import torch
 
 from src.utils.arrays import to_dense
 
 
 PROTEIN_OBSM_KEY = "protein_expression"
+
+
+def drop_reduce_lr_verbose_kwarg() -> None:
+    """scvi 1.2.0 passes verbose= to torch's ReduceLROnPlateau, which torch 2.10 removed.
+
+    Wrap its __init__ to drop the now-unsupported kwarg. Idempotent, so calling it before
+    every totalVI train is safe.
+    """
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau
+    if getattr(scheduler, "kot_verbose_dropped", False):
+        return
+    original_init = scheduler.__init__
+
+    def init_dropping_verbose(self, *args, **kwargs):
+        kwargs.pop("verbose", None)
+        original_init(self, *args, **kwargs)
+
+    scheduler.__init__ = init_dropping_verbose
+    scheduler.kot_verbose_dropped = True
 
 
 def attach_protein_expression(
@@ -31,6 +51,7 @@ def train_totalvi_model(
     n_latent = int(cfg.get("n_latent", 20))
     max_epochs = int(cfg.get("totalvi_max_epochs", 400))
 
+    drop_reduce_lr_verbose_kwarg()
     scvi.settings.seed = seed
     scvi.model.TOTALVI.setup_anndata(
         combined,

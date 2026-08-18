@@ -56,6 +56,21 @@ datasets:
     protein_path: Datasets/Perturb_CITE_Seq/SCP1064/documentation/Protein_expression.csv.gz
     protein_label: Protein
 
+  papalexi_retained:
+    name: Papalexi ECCITE-seq (ADT-genes retained)
+    rna_path: cache/velocity/papalexi/papalexi_scvelo_results_retained.h5ad
+    rna_raw_layer: counts   # X is raw spliced+unspliced; use the counts layer for normalization
+    protein_path: Datasets/Papalexi_GSE153056/papalexi_protein.h5ad
+    protein_label: ADT
+
+  # Same as papalexi_retained but RNA velocity from RegVelo — the velocity ablation.
+  papalexi_regvelo:
+    name: Papalexi ECCITE-seq (RegVelo velocity)
+    rna_path: cache/velocity/papalexi/papalexi_regvelo_results_retained.h5ad
+    rna_raw_layer: counts
+    protein_path: Datasets/Papalexi_GSE153056/papalexi_protein.h5ad
+    protein_label: ADT
+
   synthetic:
     # run first: python -m src.data.synthetic
     name: Synthetic

@@ -28,9 +28,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import anndata as ad
 import pandas as pd
+import scanpy as sc
 
 from src.utils.io import load_yaml
-from src.data.adt_gene_map import build_mapping_rows
+from src.data.adt_gene_map import build_mapping_rows, gene_alias_set, normalize_gene_symbol
 
 DATASETS_CONFIG = Path("config/datasets.yaml")
 OUT_DIR = Path("cache/results/mapping")
@@ -40,20 +41,24 @@ def protein_var_names(meta: dict) -> list[str]:
     path = meta["protein_path"]
     label = meta.get("protein_label", "ADT")
     if str(path).endswith(".h5"):
-        import scanpy as sc
-
         adata = sc.read_10x_h5(path, gex_only=False)
     else:
         adata = ad.read_h5ad(path)
     if "feature_types" not in adata.var:
         raise ValueError(f"{path} is missing var['feature_types']; cannot find {label!r} panel.")
     protein = adata[:, adata.var["feature_types"] == label].copy()
-    protein.var_names_make_unique()
     return list(protein.var_names)
 
 
 def rna_var_names(meta: dict) -> list[str]:
-    return list(ad.read_h5ad(meta["rna_path"], backed="r").var_names)
+    adata = ad.read_h5ad(meta["rna_path"], backed="r")
+    aliases = gene_alias_set(
+        adata.var_names,
+        adata.var,
+        normalizer=normalize_gene_symbol,
+    )
+    adata.file.close()
+    return sorted(aliases)
 
 
 def dedupe_preserve_order(names: list[str]) -> tuple[list[str], list[str]]:
@@ -81,7 +86,8 @@ def write_mapping(name: str, meta: dict, kinetic_complex_allow=None) -> None:
     allow = kinetic_complex_allow or meta.get("kinetic_complex_allow")
     rows = build_mapping_rows(unique_names, rna_var_names(meta), kinetic_complex_allow=allow)
     df = pd.DataFrame(rows)
-    assert df["adt_name"].is_unique, f"[{name}] duplicate adt_name in output table"
+    if not df["adt_name"].is_unique:
+        raise ValueError(f"[{name}] duplicate adt_name in output table")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"adt_mapping_{name}.csv"

@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import gc
 import importlib
+import os
 import re
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -16,7 +18,13 @@ from scipy import sparse
 from scipy.io import mmread
 
 from src.data.transforms import reduce_rna
-from src.data.adt_gene_map import load_mapping_records
+from src.data.adt_gene_map import (
+    aliases_for_positions,
+    gene_alias_set,
+    iter_gene_aliases,
+    load_mapping_records,
+    normalize_gene_symbol,
+)
 from src.utils.io import load_yaml
 
 DEFAULT_CONFIG = Path("config/velocity.yaml")
@@ -41,6 +49,26 @@ def as_path(config: dict, key: str, required: bool = False) -> Path | None:
             raise ValueError(f"Missing required config value: {key}")
         return None
     return Path(value)
+
+
+def is_valid_h5ad(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    if not h5py.is_hdf5(path):
+        return False
+    with h5py.File(path, "r") as handle:
+        return "obs" in handle and "var" in handle
+
+
+def write_h5ad_atomic(adata: ad.AnnData, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    adata.write_h5ad(tmp_path)
+    if not is_valid_h5ad(tmp_path):
+        raise OSError(f"Temporary h5ad failed validation after write: {tmp_path}")
+    tmp_path.replace(output_path)
 
 
 def load_regvelo_runner():
@@ -83,6 +111,12 @@ def read_layer(path: Path) -> sparse.csr_matrix:
     return mmread(path).tocsr().T.tocsr()
 
 
+def validate_layer_shapes(label: str, expected_shape: tuple[int, int], layers: dict[str, sparse.csr_matrix]) -> None:
+    for layer_name, matrix in layers.items():
+        if matrix.shape != expected_shape:
+            raise ValueError(f"{label} {layer_name} shape {matrix.shape} != expected {expected_shape}")
+
+
 def load_velocyto_dir(sample: str, velocyto_dir: Path) -> ad.AnnData:
     barcodes = pd.read_csv(velocyto_dir / "barcodes.tsv", sep="\t", header=None)[0].astype(str)
     features = read_features(velocyto_dir / "features.tsv")
@@ -92,9 +126,11 @@ def load_velocyto_dir(sample: str, velocyto_dir: Path) -> ad.AnnData:
     ambiguous = read_layer(velocyto_dir / "ambiguous.mtx")
 
     expected_shape = (len(barcodes), len(features))
-    for layer_name, matrix in {"spliced": spliced, "unspliced": unspliced, "ambiguous": ambiguous}.items():
-        if matrix.shape != expected_shape:
-            raise ValueError(f"{sample} {layer_name} shape {matrix.shape} != expected {expected_shape}")
+    validate_layer_shapes(sample, expected_shape, {
+        "spliced": spliced,
+        "unspliced": unspliced,
+        "ambiguous": ambiguous,
+    })
 
     obs = pd.DataFrame(index=[f"{sample}:{barcode}" for barcode in barcodes])
     obs["barcode"] = barcodes.to_numpy()
@@ -102,14 +138,18 @@ def load_velocyto_dir(sample: str, velocyto_dir: Path) -> ad.AnnData:
         obs[key] = value
 
     var = features.copy()
-    var.index = var["gene_name"].astype(str)
+    var.index = pd.Index(var["gene_name"].astype(str).to_numpy(), name=None)
     if not pd.Index(var.index).is_unique:
-        var.index = var["gene_id"].astype(str)
+        duplicated = int(pd.Index(var.index).duplicated().sum())
+        print(f"  {sample}: RNA gene symbols include {duplicated} duplicate feature(s); "
+              "AnnData will make var_names unique while var['gene_name'] keeps the symbols")
 
     adata = ad.AnnData(X=(spliced + unspliced).tocsr(), obs=obs, var=var)
     adata.layers["spliced"] = spliced
     adata.layers["unspliced"] = unspliced
     adata.layers["ambiguous"] = ambiguous
+    adata.obs.index.name = None
+    adata.var.index.name = None
     return adata
 
 
@@ -267,8 +307,7 @@ def build_integrated_h5ad(report_path: Path, original_h5ad: Path, output_path: P
         "matched_genes": int(len(common_gene_keys)),
     }
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    original_subset.write_h5ad(output_path)
+    write_h5ad_atomic(original_subset, output_path)
     print(f"Wrote integrated {assay} velocity h5ad: {output_path}")
     print(original_subset)
 
@@ -356,12 +395,30 @@ def select_hvgs(adata, n_top_genes: int, hvg_flavor: str, retain_genes=None):
     if retain_genes:
         # Force-retain ADT-target genes so KOT's S/kinetics can use them, even
         # when they are not among the most variable genes.
-        forced = adata.var_names.isin(list(retain_genes))
+        forced = gene_alias_mask(adata, retain_genes)
         n_added = int((forced & ~keep).sum())
         keep = keep | forced
         print(f"[velocity] retained {n_added} ADT-target genes on top of "
               f"{int(adata.var['highly_variable'].sum())} HVGs → {int(keep.sum())} total")
     return adata[:, keep].copy()
+
+
+def gene_alias_mask(adata, genes) -> np.ndarray:
+    """Boolean var mask for requested gene symbols, matching var_names and aliases."""
+    targets = {normalize_gene_symbol(g) for g in (genes or [])}
+    mask = np.zeros(adata.n_vars, dtype=bool)
+    if not targets:
+        return mask
+    for i, alias in iter_gene_aliases(adata.var_names, adata.var):
+        if normalize_gene_symbol(alias) in targets:
+            mask[i] = True
+    return mask
+
+
+def resolve_retain_var_names(adata, genes) -> list[str]:
+    """Resolve retained gene symbols to the current AnnData var_names for scVelo."""
+    mask = gene_alias_mask(adata, genes)
+    return sorted(str(g) for g in adata.var_names[mask])
 
 
 def gene_layer_presence(adata, layer: str) -> set[str]:
@@ -370,7 +427,8 @@ def gene_layer_presence(adata, layer: str) -> set[str]:
         return set()
     M = adata.layers[layer]
     totals = np.asarray(M.sum(axis=0)).ravel() if sparse.issparse(M) else np.asarray(M).sum(axis=0)
-    return {str(g) for g, t in zip(adata.var_names, totals) if t > 0}
+    positions = np.flatnonzero(totals > 0)
+    return aliases_for_positions(adata.var_names, adata.var, positions, normalizer=normalize_gene_symbol)
 
 
 def build_velocity_gene_diagnostics(retain_genes, raw_names, spliced, unspliced, final_adata):
@@ -380,18 +438,22 @@ def build_velocity_gene_diagnostics(retain_genes, raw_names, spliced, unspliced,
     present_in_unspliced, passed_count_qc, velocity_estimated, velocity_gene,
     final_kinetics_eligible (survived QC and got a scVelo velocity fit).
     """
-    retain = {str(g) for g in (retain_genes or [])}
-    final_names = {str(g) for g in final_adata.var_names}
+    retain = {normalize_gene_symbol(g) for g in (retain_genes or [])}
+    final_names = gene_alias_set(final_adata.var_names, final_adata.var, normalizer=normalize_gene_symbol)
     vgenes = set()
     if "velocity_genes" in final_adata.var:
         flags = final_adata.var["velocity_genes"].to_numpy().astype(bool)
-        vgenes = {str(g) for g, f in zip(final_adata.var_names, flags) if f}
+        vgenes = aliases_for_positions(
+            final_adata.var_names, final_adata.var, np.flatnonzero(flags), normalizer=normalize_gene_symbol,
+        )
     vel_est = set()
     if "velocity" in final_adata.layers:
         V = final_adata.layers["velocity"]
         arr = V.toarray() if sparse.issparse(V) else np.asarray(V)
         has_v = np.isfinite(arr).any(axis=0) & (np.nan_to_num(arr) != 0).any(axis=0)
-        vel_est = {str(g) for g, f in zip(final_adata.var_names, has_v) if f}
+        vel_est = aliases_for_positions(
+            final_adata.var_names, final_adata.var, np.flatnonzero(has_v), normalizer=normalize_gene_symbol,
+        )
 
     rows = []
     for g in sorted(retain):
@@ -411,25 +473,28 @@ def build_velocity_gene_diagnostics(retain_genes, raw_names, spliced, unspliced,
     return rows
 
 
-def run_scvelo(adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neighbors,
-               velocity_mode, dynamics_n_jobs, retain_genes=None):
-    if not has_splicing_layers(adata):
-        raise ValueError("Missing spliced/unspliced layers; cannot calculate RNA velocity.")
-    scv.utils.show_proportions(adata)
-    # Snapshot raw presence BEFORE HVG / count filtering, so the diagnostics can
-    # trace every retained gene through each stage of the pipeline.
-    raw_names     = {str(g) for g in adata.var_names}
-    raw_spliced   = gene_layer_presence(adata, "spliced")
-    raw_unspliced = gene_layer_presence(adata, "unspliced")
+def preprocess_for_velocity(adata, n_top_genes, hvg_flavor, min_shared_counts,
+                            n_pcs, n_neighbors, retain_genes=None):
+    """Upstream data preprocessing shared by every velocity backend.
 
+    HVG (hvg_flavor) ∪ retain → count filter/normalize → PCA → neighbours → moments.
+    Both run_scvelo and run_regvelo call this so the two backends see identical
+    inputs, and the scVelo-vs-RegVelo comparison isolates the velocity model rather
+    than the preprocessing. RegVelo layers its own min-max step (preprocess_data)
+    on top of this shared base. Returns (adata, resolved_n_pcs).
+    """
     adata = select_hvgs(adata, n_top_genes, hvg_flavor, retain_genes=retain_genes)
+    resolved_retain = resolve_retain_var_names(adata, retain_genes) if retain_genes else None
+    if retain_genes:
+        print(f"[velocity] resolved {len(resolved_retain)}/{len(retain_genes)} retained "
+              "gene symbol(s) to current var_names")
     # Preserve the retained (use_for_kinetics) genes through count filtering: scVelo
     # honours retain_genes and keeps them even below min_shared_counts, so the union
     # HVG ∪ retain is not silently eroded by filter_and_normalize.
     scv.pp.filter_and_normalize(
         adata,
         min_shared_counts=min_shared_counts,
-        retain_genes=sorted(retain_genes) if retain_genes else None,
+        retain_genes=resolved_retain,
     )
     actual_n_pcs = min(n_pcs, adata.n_obs - 1, adata.n_vars - 1)
     if actual_n_pcs < 1:
@@ -441,6 +506,24 @@ def run_scvelo(adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neigh
         if key in adata.obsp:
             adata.obsp[key] = sparse.csr_matrix(adata.obsp[key])
     scv.pp.moments(adata, n_pcs=actual_n_pcs, n_neighbors=n_neighbors)
+    return adata, actual_n_pcs
+
+
+def run_scvelo(adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neighbors,
+               velocity_mode, dynamics_n_jobs, retain_genes=None):
+    if not has_splicing_layers(adata):
+        raise ValueError("Missing spliced/unspliced layers; cannot calculate RNA velocity.")
+    scv.utils.show_proportions(adata)
+    # Snapshot raw presence BEFORE HVG / count filtering, so the diagnostics can
+    # trace every retained gene through each stage of the pipeline.
+    raw_names     = gene_alias_set(adata.var_names, adata.var, normalizer=normalize_gene_symbol)
+    raw_spliced   = gene_layer_presence(adata, "spliced")
+    raw_unspliced = gene_layer_presence(adata, "unspliced")
+
+    adata, _ = preprocess_for_velocity(
+        adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neighbors,
+        retain_genes=retain_genes,
+    )
     if velocity_mode == "dynamical":
         # var_names="all" fits EVERY gene in the HVG ∪ retain matrix; scVelo's default
         # (highly-variable only) would skip the force-retained ADT genes, leaving them
@@ -449,10 +532,15 @@ def run_scvelo(adata, n_top_genes, hvg_flavor, min_shared_counts, n_pcs, n_neigh
             scv.tl.recover_dynamics(adata, var_names="all", n_jobs=dynamics_n_jobs)
         else:
             scv.tl.recover_dynamics(adata, n_jobs=dynamics_n_jobs)
-    scv.tl.velocity(adata, mode=velocity_mode)
+    # use_highly_variable=False so velocity is computed for every fitted gene, not just
+    # HVGs. The force-retained ADT genes are marked highly_variable=False, so the default
+    # (True) would fit them via recover_dynamics(var_names="all") yet leave them without a
+    # velocity — exactly the genes KOT's kinetics needs.
+    scv.tl.velocity(adata, mode=velocity_mode, use_highly_variable=False)
     scv.tl.velocity_graph(adata)
     scv.tl.velocity_confidence(adata)
     scv.tl.velocity_pseudotime(adata)
+    adata.uns["velocity_backend"] = "scvelo_dynamical"
     if velocity_mode == "dynamical":
         scv.tl.latent_time(adata)
 
@@ -487,6 +575,12 @@ def load_pbmc(pbmc_counts: Path, loom: Path):
 
 def load_h5ad(path: Path, umap_key: str | None):
     print(f"Reading velocity h5ad: {path}")
+    if not is_valid_h5ad(path):
+        raise OSError(
+            f"Invalid or incomplete h5ad file: {path}. "
+            "This is often a truncated cached velocity input from an interrupted "
+            "job; remove or rebuild it."
+        )
     adata = sc.read_h5ad(path)
     adata.var_names_make_unique()
     if umap_key and umap_key in adata.obsm:
@@ -589,7 +683,7 @@ def execute_run(run_config: dict) -> None:
     elif mode == "h5ad":
         adata = load_h5ad(as_path(run_config, "input_h5ad", required=True), run_config.get("umap_key"))
         merged_path = output_dir / f"{label}_merged_velocity_input.h5ad"
-        adata.write_h5ad(merged_path)
+        write_h5ad_atomic(adata, merged_path)
         print(f"Wrote {merged_path}")
     elif mode == "pbmc_10x_loom":
         adata = load_pbmc(
@@ -597,7 +691,7 @@ def execute_run(run_config: dict) -> None:
             as_path(run_config, "loom", required=True),
         )
         merged_path = output_dir / f"{label}_merged_velocity_input.h5ad"
-        adata.write_h5ad(merged_path)
+        write_h5ad_atomic(adata, merged_path)
         print(f"Wrote {merged_path}")
     elif mode == "shareseq_loom":
         counts_path = as_path(run_config, "counts", required=True)
@@ -612,32 +706,40 @@ def execute_run(run_config: dict) -> None:
         adata.obsm["X_umap"] = rna[adata.obs_names].obsm["X_umap"]
         adata.obs["leiden"] = rna.obs.loc[adata.obs_names, "leiden"].astype(str).to_numpy()
         merged_path = output_dir / f"{label}_merged_velocity_input.h5ad"
-        adata.write_h5ad(merged_path)
+        write_h5ad_atomic(adata, merged_path)
         print(f"Wrote {merged_path}")
     else:
         raise ValueError(f"Unsupported mode: {mode}. Expected starsolo_h5ad, h5ad, pbmc_10x_loom, or shareseq_loom.")
 
     save_summary(adata, output_dir, f"{label}_merged")
 
+    backend = str(run_config.get("velocity_backend", "scvelo_dynamical"))
+    velocity_backend_tag(backend)
     retain_genes = None
     retain_csv = run_config.get("retain_genes_csv")
     if retain_csv:
         retain_path = Path(retain_csv)
         if not retain_path.exists():
             raise FileNotFoundError(f"retain_genes_csv missing: {retain_path}")
-        # Retain every resolved ADT target gene. A base mapping marks genes that
-        # were dropped by the original velocity matrix as not kinetics-eligible,
-        # so filtering on use_for_kinetics here would make retained runs unable
-        # to recover exactly the genes they are meant to force-keep.
+        # For retained runs, force resolved ADT target genes through scVelo's
+        # preprocessing. RegVelo then keeps those dimensions with keep_dim=True
+        # and filter_on_r2=False.
         retain_genes = {
             r["gene_symbol"]
             for r in load_mapping_records(retain_path)
             if r["gene_symbol"]
         }
-        print(f"[velocity] force-retaining {len(retain_genes)} resolved ADT-target genes from {retain_path}")
+        if backend == "scvelo_dynamical":
+            print(
+                f"[velocity] force-retaining {len(retain_genes)} resolved "
+                f"ADT-target genes from {retain_path}"
+            )
+        else:
+            print(
+                f"[velocity] retaining {len(retain_genes)} resolved ADT-target "
+                f"genes for RegVelo keep-dim preprocessing from {retain_path}"
+            )
 
-    backend = str(run_config.get("velocity_backend", "scvelo_dynamical"))
-    velocity_backend_tag(backend)
     if backend == "scvelo_dynamical":
         adata = run_scvelo(
             adata,
@@ -662,6 +764,7 @@ def execute_run(run_config: dict) -> None:
             as_path(run_config, "grn_prior_csv", required=True),
             retain_genes=retain_genes,
             batch_size=run_config.get("regvelo_batch_size"),
+            max_epochs=run_config.get("regvelo_max_epochs"),
         )
 
     save_plots(adata, output_dir, label)
@@ -676,7 +779,7 @@ def execute_run(run_config: dict) -> None:
         adata.uns["velocity_gene_diagnostics"].to_csv(diag_path, index=False)
         print(f"Wrote {diag_path}")
     result_path = result_path_from_run_config(run_config)
-    adata.write_h5ad(result_path)
+    write_h5ad_atomic(adata, result_path)
     print(f"Wrote {result_path}")
 
 
@@ -714,6 +817,8 @@ def parse_args():
     parser.add_argument("--velocity-mode", choices=["dynamical", "stochastic", "deterministic"], default=None)
     parser.add_argument("--dynamics-n-jobs", type=int, default=None)
     parser.add_argument("--random-state", type=int, default=None)
+    parser.add_argument("--regvelo-batch-size", type=int, default=None)
+    parser.add_argument("--regvelo-max-epochs", type=int, default=None)
     return parser.parse_args()
 
 
@@ -753,6 +858,8 @@ def main() -> None:
         "velocity_mode": args.velocity_mode,
         "dynamics_n_jobs": args.dynamics_n_jobs,
         "random_state": args.random_state,
+        "regvelo_batch_size": args.regvelo_batch_size,
+        "regvelo_max_epochs": args.regvelo_max_epochs,
     }
     for key, value in cli_overrides.items():
         if value is not None:

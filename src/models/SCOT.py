@@ -14,12 +14,13 @@ def sym_inv_sqrt(M):
     return Q @ np.diag((v + 1e-12) ** (-0.5)) @ Q.T
 
 
-class SCOTv2(object):
+class SCOTv2:
 
     def __init__(self, data):
-        assert type(data) == list and len(data) >= 2, (
-            "SCOTv2 requires a list of at least two numpy arrays (cells × features)."
-        )
+        if not isinstance(data, list) or len(data) < 2:
+            raise ValueError(
+                "SCOTv2 requires a list of at least two numpy arrays (cells x features)."
+            )
         self.data = data
         self.marginals = []
         self.graphs = []
@@ -34,9 +35,8 @@ class SCOTv2(object):
         return self.marginals
 
     def normalize_data(self, norm="l2", bySample=True):
-        assert norm in ["l1", "l2", "max", "zscore"], (
-            "norm must be one of 'l1', 'l2', 'max', 'zscore'."
-        )
+        if norm not in {"l1", "l2", "max", "zscore"}:
+            raise ValueError("norm must be one of 'l1', 'l2', 'max', 'zscore'.")
         for i in range(len(self.data)):
             if norm == "zscore":
                 self.data[i] = StandardScaler().fit_transform(self.data[i])
@@ -46,7 +46,8 @@ class SCOTv2(object):
         return self.data
 
     def construct_graph(self, k=20, mode="connectivity", metric="correlation"):
-        assert mode in ["connectivity", "distance"]
+        if mode not in {"connectivity", "distance"}:
+            raise ValueError("mode must be one of 'connectivity', 'distance'.")
         include_self = mode == "connectivity"
         for i in range(len(self.data)):
             self.graphs.append(
@@ -138,7 +139,7 @@ class SCOTv2(object):
             self.couplings.append(coupling.cpu())
             self.flags.append(flag)
             if not flag:
-                raise Exception(
+                raise RuntimeError(
                     f"Solver got NaN plan with (eps, rho, rho2) = {(eps, rho, rho2)}. "
                     f"Try increasing eps."
                 )
@@ -203,11 +204,11 @@ class SCOTv2(object):
               mode="connectivity", metric="correlation", eps=0.01, rho=1.0,
               rho2=None, projMethod="embedding", Lambda=1.0, out_dim=10,
               nits_plan=500, nits_sinkhorn=500):
-        assert projMethod in ["embedding", "barycentric"]
+        if projMethod not in {"embedding", "barycentric"}:
+            raise ValueError("projMethod must be one of 'embedding', 'barycentric'.")
         self.find_correspondences(normalize=normalize, norm=norm, bySample=bySample,
                                   k=k, mode=mode, metric=metric, eps=eps, rho=rho, rho2=rho2,
                                   nits_plan=nits_plan, nits_sinkhorn=nits_sinkhorn)
-        print("FLAGS", self.flags)
         if projMethod == "embedding":
             integrated_data = self.coembed_datasets(Lambda=Lambda, out_dim=out_dim)
         else:

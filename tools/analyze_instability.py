@@ -309,10 +309,7 @@ def load_diagnostics(output_dir: Path | None, summary_path: Path) -> dict:
         diag_path = summary_path.parent / "diagnostics.json"
     if not diag_path.exists():
         return {}
-    try:
-        return json.loads(diag_path.read_text())
-    except json.JSONDecodeError:
-        return {}
+    return json.loads(diag_path.read_text())
 
 
 def build_result_row(

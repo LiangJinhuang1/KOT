@@ -9,6 +9,8 @@ with L_anchor active only when an explicit anchor set H is configured.
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +19,6 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch.func import jvp as torch_jvp
-from torch.utils.data import TensorDataset, DataLoader
 
 from src.utils.arrays import to_dense
 from src.models.KOT import KOTModel
@@ -32,6 +33,28 @@ from src.evaluation.trajectory_dtw import trajectory_dtw
 
 def to_tensor(arr: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.tensor(arr, dtype=torch.float32, device=device)
+
+
+def choose_torch_device(cfg: dict) -> torch.device:
+    requested = str(cfg.get("device", "auto")).lower()
+    gpu_allocated = bool(
+        os.environ.get("SLURM_JOB_GPUS")
+        or os.environ.get("SLURM_STEP_GPUS")
+        or os.environ.get("CUDA_VISIBLE_DEVICES")
+    )
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested not in {"auto", "cuda", "gpu"}:
+        raise ValueError(f"Unsupported device setting: {requested!r}. Expected auto, cuda, or cpu.")
+    if not torch.cuda.is_available():
+        if requested in {"cuda", "gpu"} or gpu_allocated:
+            raise RuntimeError(
+                "A GPU allocation is present, but torch.cuda.is_available() is false. "
+                "This usually means the allocated node/GPU failed CUDA initialization."
+            )
+        return torch.device("cpu")
+    torch.empty(1, device="cuda")
+    return torch.device("cuda")
 
 
 def beta_anchor_prior_loss(
@@ -484,6 +507,7 @@ def compute_full_diagnostics(
     rna_obs: pd.DataFrame,
     subset: int = 1024,
     mask: torch.Tensor | None = None,
+    align_cols: torch.Tensor | None = None,
     velocity_weight: torch.Tensor | None = None,
 ) -> dict:
     """End-of-training diagnostics: time, branch confusion, variance, plus JVP stats."""
@@ -492,10 +516,12 @@ def compute_full_diagnostics(
     with torch.no_grad():
         phi_all = model.phi(R_t)
         beta = model.beta.detach()
+        phi_metric = phi_all if align_cols is None else phi_all[:, align_cols]
+        P_metric = P_t if align_cols is None else P_t[:, align_cols]
 
     # Nearest-neighbor in protein space → predicted state/time of cell i is taken from the
     # observed cell whose protein is closest to φ(r_i). Row-chunked to bound memory.
-    nn_idx_t, _ = nearest_protein_match(phi_all, P_t)
+    nn_idx_t, _ = nearest_protein_match(phi_metric, P_metric)
     nn_idx = nn_idx_t.cpu().numpy()
 
     # Ground-truth 'time' (synthetic) or scVelo pseudotime (real); None if neither.
@@ -529,8 +555,8 @@ def compute_full_diagnostics(
         labels = []
         conf_mat = []
 
-    phi_np = phi_all.cpu().numpy()
-    p_np = P_t.cpu().numpy()
+    phi_np = phi_metric.cpu().numpy()
+    p_np = P_metric.cpu().numpy()
     var_phi = float(phi_np.var(axis=0).mean())
     var_p   = float(p_np.var(axis=0).mean())
     phi_var_ratio = var_phi / max(var_p, 1e-12)
@@ -596,7 +622,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     coupling : None; KOT currently optimises the Sinkhorn divergence directly
     loss_df  : per-epoch loss history
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = choose_torch_device(cfg)
 
     x = context["x"]             # runner RNA representation; may be replaced below
     y = context["y"]             # runner second-modality representation; may be replaced below
@@ -611,6 +637,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     lambda_dyn   = float(cfg.get("lambda_dyn", 1.0))
     lambda_reg   = float(cfg.get("lambda_reg", 1e-4))
     blur         = float(cfg.get("sinkhorn_reg", 0.1))
+    # geomloss backend for the alignment Sinkhorn: "auto" (default) uses the linear
+    # KeOps path once the batch is large, "tensorized" forces the O(N²) PyTorch path
+    # (no pykeops). See src/losses/sinkhorn.py.
+    sinkhorn_backend = str(cfg.get("sinkhorn_backend", "auto"))
     seed         = int(cfg.get("seed",         42))
     # Cap the alignment Sinkhorn to a random minibatch of this many cells each
     # epoch. None → full-batch (exact; keeps small/synthetic runs unchanged). Set
@@ -640,6 +670,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     beta_anchor_aggregate = str(cfg.get("beta_anchor_aggregate", "median")).lower()
     stable_cv_cfg = cfg.get("beta_anchor_stable_cv_max")
     stable_cv_max = float(stable_cv_cfg) if stable_cv_cfg is not None else None
+    min_anchor_quality_cfg = cfg.get("beta_anchor_min_r2")
+    min_anchor_quality = float(min_anchor_quality_cfg) if min_anchor_quality_cfg is not None else None
     prior_sigma_floor = float(cfg.get("beta_anchor_sigma_floor", 0.25))
     beta_warmstart = bool(cfg.get("kot_beta_warmstart_from_anchor", False))
     anchor_scale = None
@@ -654,6 +686,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             stable_cv_max=stable_cv_max,
             prior_sigma_floor=prior_sigma_floor,
             fixed_scale=cfg.get("beta_anchor_fixed_scale"),
+            min_quality=min_anchor_quality,
         )
         if idx:
             anchor_indices, anchor_betas = idx, betas
@@ -689,6 +722,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         float(kappa_prior_target_cfg) if kappa_prior_target_cfg is not None else None
     )
     lambda_kappa_prior = float(cfg.get("lambda_kappa_prior", 0.0))
+    allow_empty_kinetic_mask = bool(cfg.get("kot_allow_empty_kinetic_mask", False))
+    allow_empty_anchor_after_mask = bool(
+        cfg.get("kot_allow_empty_anchor_after_kinetic_mask", False)
+    )
     g_freeze_epochs = int(cfg.get("g_freeze_epochs", 0))
     dyn_warmup_epochs       = int(cfg.get("dyn_warmup_epochs",       n_epochs // 2))
     early_stopping_patience = int(cfg.get("early_stopping_patience", 100))
@@ -791,6 +828,18 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             f"KOT velocity shape {V_raw.shape} is incompatible with KOT input shape {x.shape}."
         )
 
+    # Velocity gauge normalisation. scVelo and RegVelo velocity fields carry different
+    # absolute norms, and κ is bounded by its prior so it cannot absorb an arbitrary
+    # scale in J_φ(r)·v ≈ κ(α⊙Sr − β⊙φ). Rescaling V so the RMS per-cell velocity norm
+    # is 1 fixes that gauge (the pseudotime unit), leaving relative cell speeds intact,
+    # so the kinetic term compares velocity DIRECTION not magnitude — required for a
+    # fair scVelo-vs-RegVelo comparison.
+    if bool(cfg.get("kot_velocity_gauge_normalize", False)):
+        cell_norms = np.linalg.norm(V, axis=1)               # ||v_k|| across cells k
+        gauge = float(np.sqrt(np.mean(cell_norms ** 2))) + 1e-8
+        V = (V / gauge).astype(np.float32)
+        print(f"[kot] velocity gauge-normalized: RMS per-cell norm {gauge:.4g} -> 1.0")
+
     data_debug = kot_data_debug_summary(
         rna_adata,
         rna_layer,
@@ -864,6 +913,22 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     mask_source = "mapping CSV (use_for_kinetics)" if csv_source_of_truth else "name/link matching"
     print(f"[kot] kinetics_mask={'on' if mask_t is not None else 'off'} (source: {mask_source}) "
           f"| active={int(kin_mask.sum()) if use_feature_space else D_p}/{D_p}")
+    if use_feature_space and use_kinetics_mask and int(kin_mask.sum()) == 0:
+        message = (
+            "kinetic mask has 0 active proteins; no protein has a usable RNA gene "
+            "link for the ODE residual."
+        )
+        if lambda_dyn != 0.0 and not allow_empty_kinetic_mask:
+            raise ValueError(
+                f"{message} Fix the mapping/RNA features, or set "
+                "kot_allow_empty_kinetic_mask=true for an explicit "
+                "alignment-only run."
+            )
+        if lambda_dyn != 0.0:
+            print(f"[kot] WARNING: {message} Disabling dynamics for this run.")
+            lambda_dyn = 0.0
+        else:
+            print(f"[kot] WARNING: {message} Dynamics already disabled.")
     # Alignment mask over the protein axis: Sinkhorn compares only use_for_alignment
     # proteins; φ still predicts the full panel. Per-protein only in feature space.
     if use_feature_space and not align_mask.all():
@@ -932,10 +997,20 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         + list(model.g.parameters())
     )
     optimiser, scheduler = build_kot_optimiser(model, lr, n_epochs, use_phases)
-    loader = DataLoader(
-        TensorDataset(R_t, V_t, conf_t, torch.arange(n, device=device)),
-        batch_size=batch_size, shuffle=True,
+
+    # Precompute the per-cell quantities the kinetics term reuses every epoch, so the
+    # training loop only indexes into GPU tensors (no DataLoader, no per-batch S·r):
+    #   V_eff_t = velocity_weight ⊙ V   (RNA-side reliability applied once)
+    #   SR_t    = S·r for every cell    (fixed projection, computed once)
+    # Both are constant across epochs (S, V, velocity_weight do not change).
+    V_eff_t = V_t if velocity_weight_t is None else V_t * velocity_weight_t
+    SR_t = R_t @ S_t.T                                  # (n, D_p)
+    kappa_target_t = (
+        torch.tensor(kappa_prior_target, dtype=R_t.dtype, device=device)
+        if kappa_prior_target is not None else None
     )
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     print(f"[kot] Training {n_epochs} epochs | n={n} | D_r={D_r} | D_p={D_p} | device={device}")
 
@@ -945,23 +1020,51 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     anchor_weight_t = None
     if use_anchor:
         if not anchor_indices:
-            raise ValueError("use_anchor=true requires at least one kot_anchor_indices entry.")
-        anchor_idx_t = torch.tensor(anchor_indices, dtype=torch.long, device=device)
-        if anchor_betas:
-            if len(anchor_betas) != len(anchor_indices):
-                raise ValueError(
-                    "kot_anchor_betas must have the same length as kot_anchor_indices."
-                )
-            anchor_target = torch.tensor(anchor_betas, dtype=torch.float32, device=device)
-        else:
-            anchor_target = torch.full((anchor_idx_t.numel(),), anchor_beta, device=device)
-        if anchor_sigmas_list and len(anchor_sigmas_list) == len(anchor_indices):
-            anchor_sigma_t = torch.tensor(anchor_sigmas_list, dtype=torch.float32, device=device)
-        else:
-            floor = prior_sigma_floor * float(cfg.get("beta_anchor_target", anchor_beta))
-            anchor_sigma_t = torch.full((anchor_idx_t.numel(),), floor, device=device)
-        if anchor_weights_list and len(anchor_weights_list) == len(anchor_indices):
-            anchor_weight_t = torch.tensor(anchor_weights_list, dtype=torch.float32, device=device)
+            message = "use_anchor=true but no kot_anchor_indices are configured."
+            if allow_empty_anchor_after_mask:
+                print(f"[kot] WARNING: {message} Disabling β-anchor prior for this run.")
+                use_anchor = False
+            else:
+                raise ValueError(f"{message} Disable use_anchor or provide anchors.")
+        # Restrict the β prior to proteins ACTIVE in the kinetic mask (resolved anchors ∩
+        # kinetic mask). β only enters the ODE for kinetic-active proteins, so anchoring
+        # an inactive one does nothing — previously the full resolved set was used.
+        if use_anchor and use_feature_space:
+            n_from_csv = len(anchor_indices)
+            keep = [k for k, j in enumerate(anchor_indices) if bool(kin_mask[j])]
+            anchor_indices = [anchor_indices[k] for k in keep]
+            if len(anchor_betas) == n_from_csv:
+                anchor_betas = [anchor_betas[k] for k in keep]
+            if len(anchor_weights_list) == n_from_csv:
+                anchor_weights_list = [anchor_weights_list[k] for k in keep]
+            if len(anchor_sigmas_list) == n_from_csv:
+                anchor_sigmas_list = [anchor_sigmas_list[k] for k in keep]
+            print(f"[kot] anchors: {n_from_csv} from csv, {n_from_csv - len(anchor_indices)} "
+                  f"excluded (not in kinetic mask), {len(anchor_indices)} active priors")
+            if not anchor_indices:
+                message = "No anchored proteins fall in the kinetic mask; the β prior would be empty."
+                if allow_empty_anchor_after_mask:
+                    print(f"[kot] WARNING: {message} Disabling β-anchor prior for this run.")
+                    use_anchor = False
+                else:
+                    raise ValueError(message)
+        if use_anchor:
+            anchor_idx_t = torch.tensor(anchor_indices, dtype=torch.long, device=device)
+            if anchor_betas:
+                if len(anchor_betas) != len(anchor_indices):
+                    raise ValueError(
+                        "kot_anchor_betas must have the same length as kot_anchor_indices."
+                    )
+                anchor_target = torch.tensor(anchor_betas, dtype=torch.float32, device=device)
+            else:
+                anchor_target = torch.full((anchor_idx_t.numel(),), anchor_beta, device=device)
+            if anchor_sigmas_list and len(anchor_sigmas_list) == len(anchor_indices):
+                anchor_sigma_t = torch.tensor(anchor_sigmas_list, dtype=torch.float32, device=device)
+            else:
+                floor = prior_sigma_floor * float(cfg.get("beta_anchor_target", anchor_beta))
+                anchor_sigma_t = torch.full((anchor_idx_t.numel(),), floor, device=device)
+            if anchor_weights_list and len(anchor_weights_list) == len(anchor_indices):
+                anchor_weight_t = torch.tensor(anchor_weights_list, dtype=torch.float32, device=device)
 
     print(f"[kot] model: {model_name}")
     print(f"[kot] bounds: κ∈{(kappa_min, kappa_max)}  α∈{(alpha_min, alpha_max)}")
@@ -1014,6 +1117,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     stop_epoch = n_epochs
     current_phase = 0   # for use_phases mode; tracks transitions
 
+    train_start = time.perf_counter()
     for epoch in range(1, n_epochs + 1):
         model.train()
 
@@ -1055,72 +1159,98 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 state = "trainable" if g_train else "frozen"
                 print(f"[kot] g/alpha head is {state} at epoch {epoch}")
 
+        optimiser.zero_grad()
+
         # --- Sinkhorn alignment step (differentiable through phi) ---
         # Full-batch when small (exact); a fresh random minibatch each epoch when
         # sinkhorn_max_points caps it, so large real datasets (e.g. bmmc_cite at
         # ~90k cells) stay within GPU memory instead of building an n×n matrix.
-        if sinkhorn_max_points is not None and n > sinkhorn_max_points:
-            # Sample RNA and protein cells INDEPENDENTLY — the data is unpaired, so the
-            # protein batch must not be the same cells as the RNA batch (that would put
-            # each cell's true partner in the batch and leak the alignment).
-            rna_idx     = torch.randperm(n, device=device)[:sinkhorn_max_points]
-            protein_idx = torch.randperm(n, device=device)[:sinkhorn_max_points]
-            phi_align = model.phi(R_t[rna_idx])          # (b, D_p), φ predicts full panel
-            P_align = P_t[protein_idx]
-        else:
-            phi_align = model.phi(R_t)                   # (n, D_p)
-            P_align = P_t
-        if align_cols is not None:                       # compare only use_for_alignment proteins
-            phi_align = phi_align[:, align_cols]
-            P_align = P_align[:, align_cols]
-        loss_align = sinkhorn_divergence(phi_align, P_align, blur=blur)
+        # Backward immediately so the φ/Sinkhorn graph is freed before the kinetics loop.
+        align_val = 0.0
+        align_was_computed = False
+        if lam_align_eff > 0.0:
+            if sinkhorn_max_points is not None and n > sinkhorn_max_points:
+                # Sample RNA and protein cells INDEPENDENTLY — the data is unpaired, so the
+                # protein batch must not be the same cells as the RNA batch (that would put
+                # each cell's true partner in the batch and leak the alignment).
+                rna_idx     = torch.randperm(n, device=device)[:sinkhorn_max_points]
+                protein_idx = torch.randperm(n, device=device)[:sinkhorn_max_points]
+                phi_align = model.phi(R_t[rna_idx])          # (b, D_p), φ predicts full panel
+                P_align = P_t[protein_idx]
+            else:
+                phi_align = model.phi(R_t)                   # (n, D_p)
+                P_align = P_t
+            if align_cols is not None:                       # compare only use_for_alignment proteins
+                phi_align = phi_align[:, align_cols]
+                P_align = P_align[:, align_cols]
+            loss_align = sinkhorn_divergence(phi_align, P_align, blur=blur, backend=sinkhorn_backend)
+            (lam_align_eff * loss_align).backward()
+            align_val = loss_align.item()
+            align_was_computed = True
 
-        # --- Kinetics step (micro-batches) ---
-        loss_dyn_total = torch.tensor(0.0, device=device)
-        if lambda_dyn != 0.0:
-            for r_b, v_b, c_b, _ in loader:
-                loss_dyn_total = loss_dyn_total + kinetics_loss(
+        # --- Kinetics step (per-batch, gradients accumulated) ---
+        # Shuffle once on-GPU and split; each batch's JVP graph is freed by its own
+        # backward() rather than all graphs living until the end of the epoch. Cell-weighted
+        # (len_b/n) so the accumulated gradient equals one backward() on the full-data mean.
+        # κ from each batch is reused for the κ prior instead of a second κ(R_t) pass.
+        dyn_val = 0.0
+        kappa_prior_val = 0.0
+        dyn_was_computed = False
+        if lam_dyn_eff > 0.0:
+            dyn_was_computed = True
+            for idx in torch.randperm(n, device=device).split(batch_size):
+                weight = idx.numel() / n
+                loss_dyn_b, kappa_b = kinetics_loss(
                     model.phi, model.kappa, model.g,
-                    r_b, v_b, S_t, model.beta, c_b, mask=mask_t, scale=protein_scale,
-                    velocity_weight=velocity_weight_t,
+                    R_t[idx], V_eff_t[idx], SR_t[idx], model.beta, conf_t[idx],
+                    mask=mask_t, scale=protein_scale,
                 )
-            loss_dyn_total = loss_dyn_total / len(loader)
+                batch_obj = (lam_dyn_eff * weight) * loss_dyn_b
+                dyn_val += weight * loss_dyn_b.item()
+                if lambda_kappa_prior > 0.0 and kappa_target_t is not None:
+                    kp_b = lambda_kappa_prior * torch.log(kappa_b / kappa_target_t).pow(2).mean()
+                    batch_obj = batch_obj + weight * kp_b
+                    kappa_prior_val += weight * kp_b.item()
+                batch_obj.backward()
+        elif (
+            lambda_kappa_prior > 0.0
+            and kappa_target_t is not None
+            and any(param.requires_grad for param in model.kappa.parameters())
+        ):
+            for idx in torch.randperm(n, device=device).split(batch_size):
+                weight = idx.numel() / n
+                kappa_b = model.kappa(R_t[idx])
+                kp_b = lambda_kappa_prior * torch.log(kappa_b / kappa_target_t).pow(2).mean()
+                (weight * kp_b).backward()
+                kappa_prior_val += weight * kp_b.item()
 
-        loss_anchor = (
-            beta_anchor_prior_loss(
-                model.beta,
-                anchor_idx_t,
-                anchor_target,
-                anchor_sigma_t,
-                anchor_weight_t,
-                lambda_prior,
-                beta_anchor_prior,
+        # --- β anchor prior (on β directly; only when β is trainable) ---
+        anchor_val = 0.0
+        if anchor_target is not None and model.beta_raw.requires_grad:
+            loss_anchor = beta_anchor_prior_loss(
+                model.beta, anchor_idx_t, anchor_target,
+                anchor_sigma_t, anchor_weight_t, lambda_prior, beta_anchor_prior,
             )
-            if anchor_target is not None
-            else torch.tensor(0.0, device=device)
-        )
-        loss_kappa_prior = torch.tensor(0.0, device=device)
-        if lambda_kappa_prior > 0.0 and kappa_prior_target is not None:
-            kappa_for_prior = model.kappa(R_t)
-            target = torch.tensor(kappa_prior_target, dtype=R_t.dtype, device=device)
-            loss_kappa_prior = (
-                lambda_kappa_prior * torch.log(kappa_for_prior / target).pow(2).mean()
-            )
+            loss_anchor.backward()
+            anchor_val = loss_anchor.item()
+
+        # --- weight decay on the network parameters ---
         loss_reg = lambda_reg * sum(param.pow(2).sum() for param in network_params)
-        loss = (
-            lam_align_eff * loss_align
-            + lam_dyn_eff * loss_dyn_total
-            + loss_anchor
-            + loss_kappa_prior
-            + loss_reg
-        )
+        loss_reg.backward()
+        reg_val = loss_reg.item()
 
-        optimiser.zero_grad()
-        loss.backward()
+        total_val = (lam_align_eff * align_val + lam_dyn_eff * dyn_val
+                     + anchor_val + kappa_prior_val + reg_val)
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimiser.step()
         if scheduler is not None:
             scheduler.step()
+        if epoch == 1 and device.type == "cuda":
+            print(f"[kot] GPU memory after epoch 1: "
+                  f"allocated {torch.cuda.memory_allocated(device) / 1e9:.2f} GB, "
+                  f"peak {torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB "
+                  f"(batch_size={batch_size}, n={n})")
 
         beta_detached = model.beta.detach()
         beta_mean_val = float(beta_detached.mean().cpu())
@@ -1145,12 +1275,12 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                     "alpha_min": np.nan, "alpha_max": np.nan}
 
         loss_history["epoch"].append(epoch)
-        loss_history["align"].append(loss_align.item())
-        loss_history["dyn"].append(loss_dyn_total.item())
-        loss_history["anchor"].append(loss_anchor.item())
-        loss_history["kappa_prior"].append(loss_kappa_prior.item())
-        loss_history["reg"].append(loss_reg.item())
-        loss_history["total"].append(loss.item())
+        loss_history["align"].append(align_val)
+        loss_history["dyn"].append(dyn_val)
+        loss_history["anchor"].append(anchor_val)
+        loss_history["kappa_prior"].append(kappa_prior_val)
+        loss_history["reg"].append(reg_val)
+        loss_history["total"].append(total_val)
         loss_history["beta_mean"].append(beta_mean_val)
         loss_history["beta_std"].append(beta_std_val)
         loss_history["kappa_mean"].append(diag["kappa_mean"])
@@ -1166,30 +1296,31 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         loss_history["rhs_norm"].append(diag["rhs_norm"])
 
         if epoch % 50 == 0 or epoch == 1:
-            print(f"[kot] epoch {epoch:4d}  align={loss_align.item():.6f}  "
-                  f"dyn={loss_dyn_total.item():.6f}  anchor={loss_anchor.item():.6f}  "
-                  f"kprior={loss_kappa_prior.item():.6f}  "
+            print(f"[kot] epoch {epoch:4d}  align={align_val:.6f}  "
+                  f"dyn={dyn_val:.6f}  anchor={anchor_val:.6f}  "
+                  f"kprior={kappa_prior_val:.6f}  "
                   f"λ_dyn={effective_lambda_dyn:.3f}  lr={optimiser.param_groups[0]['lr']:.2e}  "
                   f"β={beta_mean_val:.3f}±{beta_std_val:.3f}  "
                   f"κ={diag['kappa_mean']:.3f}±{diag['kappa_std']:.3f} "
                   f"[{diag['kappa_min']:.3f},{diag['kappa_max']:.3f}]  "
                   f"α={diag['alpha_mean']:.3f} "
                   f"[{diag['alpha_min']:.3f},{diag['alpha_max']:.3f}]  "
-                  f"cos={diag['jvp_rhs_cos']:.3f}  total={loss.item():.6f}")
+                  f"cos={diag['jvp_rhs_cos']:.3f}  total={total_val:.6f}  "
+                  f"[{time.perf_counter() - train_start:.0f}s, {epoch / (time.perf_counter() - train_start):.1f} ep/s]")
 
         # Track minima for all three checkpoints.
-        current_align = loss_align.item()
-        current_dyn   = loss_dyn_total.item()
-        current_total = loss.item()
+        current_align = align_val
+        current_dyn   = dyn_val
+        current_total = total_val
         current_losses = {
             "align":  current_align,
             "dyn":    current_dyn,
-            "anchor": loss_anchor.item(),
-            "kappa_prior": loss_kappa_prior.item(),
+            "anchor": anchor_val,
+            "kappa_prior": kappa_prior_val,
             "total":  current_total,
         }
 
-        if current_dyn < best_dyn:
+        if dyn_was_computed and current_dyn < best_dyn:
             best_dyn = current_dyn
             best_dyn_epoch = epoch
             best_dyn_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -1201,15 +1332,18 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             best_total_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             best_total_losses = dict(current_losses)
 
-        # Early stopping: only monitor after warmup completes (kinetics term active at full weight).
-        if epoch > dyn_warmup_epochs:
+        # Early stopping: only monitor epochs with a real alignment loss. In phased
+        # runs, the dynamics-only phase sets lam_align_eff=0 and must not become
+        # "best_align" simply because align_val is 0.
+        monitor_align = align_was_computed and (use_phases or epoch > dyn_warmup_epochs)
+        if monitor_align:
             if current_align < best_align:
                 best_align = current_align
                 best_align_epoch = epoch
                 best_align_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 best_align_losses = dict(current_losses)
                 epochs_since_improvement = 0
-            else:
+            elif not use_phases or current_phase == 3:
                 epochs_since_improvement += 1
                 if epochs_since_improvement >= early_stopping_patience:
                     stop_epoch = epoch
@@ -1270,6 +1404,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         rna_adata.obs,
         subset=1024,
         mask=mask_t,
+        align_cols=align_cols,
         velocity_weight=velocity_weight_t,
     )
     diagnostics["anchor_loss_final"] = float(loss_anchor_final.item())
@@ -1320,12 +1455,12 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         diagnostics["beta_anchor_mean_abs_err"] = None
         diagnostics["beta_anchor_final_mean"] = None
     diagnostics["stop_epoch"]        = int(stop_epoch)
-    diagnostics["best_align_epoch"]  = int(best_align_epoch)
-    diagnostics["best_align"]        = float(best_align)
-    diagnostics["best_dyn_epoch"]    = int(best_dyn_epoch)
-    diagnostics["best_dyn"]          = float(best_dyn)
-    diagnostics["best_total_epoch"]  = int(best_total_epoch)
-    diagnostics["best_total"]        = float(best_total)
+    diagnostics["best_align_epoch"]  = int(best_align_epoch) if best_align_state is not None else None
+    diagnostics["best_align"]        = float(best_align) if best_align_state is not None else None
+    diagnostics["best_dyn_epoch"]    = int(best_dyn_epoch) if best_dyn_state is not None else None
+    diagnostics["best_dyn"]          = float(best_dyn) if best_dyn_state is not None else None
+    diagnostics["best_total_epoch"]  = int(best_total_epoch) if best_total_state is not None else None
+    diagnostics["best_total"]        = float(best_total) if best_total_state is not None else None
     diagnostics["fixed_kappa"]       = fixed_kappa_value is not None
     diagnostics["fixed_kappa_value"] = (
         float(fixed_kappa_value) if fixed_kappa_value is not None else None
@@ -1414,6 +1549,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 S_t,
                 rna_adata.obs,
                 mask=mask_t,
+                align_cols=align_cols,
                 velocity_weight=velocity_weight_t,
             )
             pc = compute_per_cell_diagnostics(

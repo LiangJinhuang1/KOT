@@ -95,20 +95,12 @@ def dtw_for_run(run_folder: Path, device, n_bins: int) -> list[dict]:
         for dataset_dir in sorted(p for p in model_dir.iterdir() if p.is_dir()):
             dataset_name = dataset_dir.name
             if dataset_name not in data_cache:
-                try:
-                    data_cache[dataset_name] = load_dataset_for_run(run_folder, dataset_name)
-                except Exception as e:
-                    print(f"  [{dataset_name}] load_dataset FAILED: {e}")
-                    continue
+                data_cache[dataset_name] = load_dataset_for_run(run_folder, dataset_name)
             rna_adata, protein_adata, run_cfg, _ = data_cache[dataset_name]
 
-            try:
-                model, R_t, _V_t, P_t, _S_t, rna_obs, _mask_t, _align_cols = build_model_and_tensors(
-                    run_cfg, rna_adata, protein_adata, model_name, device,
-                )
-            except Exception as e:
-                print(f"  [{model_name}/{dataset_name}] build_model FAILED: {e}")
-                continue
+            model, R_t, _V_t, P_t, _S_t, rna_obs, _mask_t, _align_cols = build_model_and_tensors(
+                run_cfg, rna_adata, protein_adata, model_name, device,
+            )
 
             for seed_dir in sorted(
                 p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")

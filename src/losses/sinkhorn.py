@@ -7,10 +7,12 @@ import torch
 from geomloss import SamplesLoss
 
 
-_loss_cache: dict[float, SamplesLoss] = {}
+LOSS_CACHE: dict[tuple[float, str], SamplesLoss] = {}
 
 
-def sinkhorn_divergence(x: torch.Tensor, y: torch.Tensor, blur: float = 0.05) -> torch.Tensor:
+def sinkhorn_divergence(
+    x: torch.Tensor, y: torch.Tensor, blur: float = 0.05, backend: str = "auto"
+) -> torch.Tensor:
     """
     Unbiased Sinkhorn divergence S_blur(x, y).
 
@@ -22,7 +24,15 @@ def sinkhorn_divergence(x: torch.Tensor, y: torch.Tensor, blur: float = 0.05) ->
     x    : (n, d) predicted protein embeddings φ_θ(r)
     y    : (m, d) observed protein measurements
     blur : entropic regularisation (= sqrt(ε) in geomloss convention)
+    backend : geomloss compute backend.
+        "tensorized" — stores the full n×m cost matrix: O(N²) memory, pure PyTorch,
+                       only scales to ~5k points per measure.
+        "online"     — KeOps map-reduce, O(N) memory, works in any dimension.
+        "multiscale" — KeOps block-sparse, O(N) but only efficient in 1–3D.
+        "auto"       — geomloss heuristic: tensorized when small, online when large.
+        The linear backends ("online"/"multiscale") need pykeops.
     """
-    if blur not in _loss_cache:
-        _loss_cache[blur] = SamplesLoss("sinkhorn", blur=blur, backend="tensorized")
-    return _loss_cache[blur](x, y)
+    key = (blur, backend)
+    if key not in LOSS_CACHE:
+        LOSS_CACHE[key] = SamplesLoss("sinkhorn", blur=blur, backend=backend)
+    return LOSS_CACHE[key](x, y)

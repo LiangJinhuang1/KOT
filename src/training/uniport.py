@@ -115,7 +115,10 @@ def run_uniport(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, dict
     reg        = float(cfg.get("reg",        0.1))
     reg_m      = float(cfg.get("reg_m",      1.0))
     iteration  = int(cfg.get("iteration",    30000))
-    batch_size = int(cfg.get("batch_size",   256))
+    # Decoupled from the shared `batch_size` (which is KOT's kinetics minibatch, now 8192):
+    # uniPort is a collapse-prone VAE-OT method, so it keeps its own stable minibatch and is
+    # not silently changed when KOT's batch size does.
+    batch_size = int(cfg.get("uniport_batch_size", 1024))
     lr         = float(cfg.get("lr",         2e-4))
     seed       = int(cfg.get("seed",         42))
     n_latent   = int(cfg.get("uniport_n_latent", cfg.get("n_latent", 16)))

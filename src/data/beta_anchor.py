@@ -49,10 +49,12 @@ def load_beta_anchor_csv(path: Path) -> list[dict]:
                 beta_val = LN2 / float(half)
             else:
                 continue
+            quality_raw = (r.get("quality_score_or_R2") or "").strip()
             rows.append({
                 "protein_name": protein,
                 "beta_per_hour": beta_val,
                 "weight": float(r.get("anchor_weight") or 1.0),
+                "quality": float(quality_raw) if quality_raw else float("nan"),
                 "cell_type": (r.get("cell_type") or "").strip(),
             })
     return rows
@@ -91,6 +93,7 @@ def resolve_beta_anchors(
     stable_cv_max: float | None = None,
     prior_sigma_floor: float = 0.25,
     fixed_scale: float | None = None,
+    min_quality: float | None = None,
 ):
     """
     Map a β-anchor CSV to (indices, betas, weights, sigmas, scale).
@@ -110,29 +113,32 @@ def resolve_beta_anchors(
 
     rows = load_beta_anchor_csv(Path(path))
     index = {normalize_protein_name(p): j for j, p in enumerate(protein_var_names)}
-    per_protein: dict[int, list[tuple[float, float]]] = {}
+    per_protein: dict[int, list[tuple[float, float, float]]] = {}
     for r in rows:
         j = index.get(normalize_protein_name(r["protein_name"]))
         if j is None:
             continue
-        per_protein.setdefault(j, []).append((r["beta_per_hour"], r["weight"]))
+        per_protein.setdefault(j, []).append((r["beta_per_hour"], r["weight"], r["quality"]))
     if not per_protein:
         return [], [], [], [], 1.0
 
-    # Centre of every resolved protein → the "full trusted set" the frozen scale uses.
-    all_centers = [
-        aggregate_values([b for b, _ in per_protein[j]], aggregate) for j in sorted(per_protein)
-    ]
-    all_centers = [c for c in all_centers if c > 0]
-
     kept: list[tuple[int, float, float, float]] = []
     for j in sorted(per_protein):
-        betas_h = [b for b, _ in per_protein[j]]
-        weights = [w for _, w in per_protein[j]]
+        entries = per_protein[j]
+        # Quality gate: drop measurements whose R²/quality is below min_quality (missing
+        # quality is kept — unknown is not the same as low). Downweighting alone leaves
+        # low-confidence half-lives anchoring β; this gate removes them outright.
+        if min_quality is not None:
+            entries = [e for e in entries if math.isnan(e[2]) or e[2] >= min_quality]
+        if not entries:
+            continue
+        betas_h = [b for b, _, _ in entries]
+        weights = [w for _, w, _ in entries]
         center = aggregate_values(betas_h, aggregate)
         if center <= 0:
             continue
         cv = sample_std(betas_h) / center if center > 0 else 0.0
+        # Stability filter: drop proteins whose half-life varies too much across cell types.
         if stable_cv_max is not None and len(betas_h) >= 2 and cv > stable_cv_max:
             continue
         weight = aggregate_values(weights, "mean")
@@ -150,7 +156,10 @@ def resolve_beta_anchors(
     if fixed_scale is not None:
         scale = float(fixed_scale)          # frozen unit — use for anchor-count ablations
     else:
-        g = geometric_mean(all_centers)     # geometric mean of the full resolved set
+        # Geometric mean of the TRUSTED set — after the quality + stability filters, before
+        # any anchor-count subset — so a dropped low-quality/unstable anchor cannot skew the
+        # physical→model β unit.
+        g = geometric_mean(centers)
         scale = (float(target_mean_beta) / g) if g > 0 else 1.0
     betas = [c * scale for c in centers]
     sigmas = [rel * beta for rel, beta in zip(rel_sigmas, betas)]

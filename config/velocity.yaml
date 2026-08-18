@@ -94,6 +94,31 @@ datasets:
     label: perturb
     n_top_genes: 2000
 
+  # Papalexi ECCITE-seq (GSE153056), pooled 8-lane STARsolo. RNA input h5ad is built
+  # by tools/build_papalexi.py (spliced/unspliced from STARsolo Velocyto, cells matched
+  # to the ECCITE metadata on the core barcode). Retains the 4 checkpoint-ADT target
+  # genes (CD86, CD274, PDCD1LG2, HAVCR2) so KOT's kinetics can use them.
+  papalexi_retained:
+    mode: h5ad
+    input_h5ad: Datasets/Papalexi_GSE153056/papalexi_rna_input.h5ad
+    label: papalexi
+    n_top_genes: 2000
+    retain_genes_csv: cache/results/mapping/adt_mapping_papalexi.csv
+
+  # RegVelo backend for Papalexi (velocity-provider ablation). Same input h5ad as the
+  # scVelo variant. grn_prior_csv is the shared human DoRothEA edge list (organism-level;
+  # grn_edges_to_matrix intersects it with this dataset's genes), so no rebuild is needed.
+  # ~20k cells: use a large minibatch (near full-batch) to stay in RegVelo's stable regime.
+  papalexi_regvelo_retained:
+    mode: h5ad
+    input_h5ad: Datasets/Papalexi_GSE153056/papalexi_rna_input.h5ad
+    label: papalexi
+    n_top_genes: 2000
+    retain_genes_csv: cache/results/mapping/adt_mapping_papalexi.csv
+    velocity_backend: regvelo
+    grn_prior_csv: cache/results/grn/grn_prior_pbmc.csv
+    regvelo_batch_size: 16384
+
   # SHARE-seq: run velocyto on BAM files first (see velocyto_slurm.sh), then set loom paths below.
   shareseq_skin:
     mode: shareseq_loom

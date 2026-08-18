@@ -27,7 +27,7 @@ import re
 import numpy as np
 import scipy.sparse as sp
 
-from src.data.adt_gene_map import adt_to_gene
+from src.data.adt_gene_map import adt_to_gene, gene_alias_lookup
 
 
 STRIP_PATTERNS = [
@@ -62,9 +62,10 @@ def report_row(protein, gene, mapping_type, present, use_align, use_kin, in_s, r
 def assert_no_orphan_s_rows(S: np.ndarray, kinetic_mask: np.ndarray) -> None:
     """A protein excluded from kinetics must have an all-zero S row (no fallback)."""
     orphan = (S != 0).any(axis=1) & ~kinetic_mask
-    assert not orphan.any(), (
-        f"{int(orphan.sum())} protein(s) have a non-zero S row but kinetic_mask=False"
-    )
+    if orphan.any():
+        raise ValueError(
+            f"{int(orphan.sum())} protein(s) have a non-zero S row but kinetic_mask=False"
+        )
 
 
 def build_projection_from_records(
@@ -73,6 +74,7 @@ def build_projection_from_records(
     records: list[dict],
     weights: dict[str, float] | None = None,
     require_full_panel: bool = False,
+    rna_var=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
     """
     Build (S, alignment_mask, kinetic_mask, report) from a curated mapping CSV that
@@ -84,7 +86,7 @@ def build_projection_from_records(
     S = np.zeros((D_p, D_r), dtype=np.float32)
     alignment_mask = np.zeros(D_p, dtype=bool)
     kinetic_mask = np.zeros(D_p, dtype=bool)
-    gene_index = {normalize_name(g): i for i, g in enumerate(rna_var_names)}
+    gene_index = gene_alias_lookup(rna_var_names, rna_var, normalizer=normalize_name)
     by_name = {r["adt_name"]: r for r in records}
 
     report: list[dict] = []
@@ -111,7 +113,11 @@ def build_projection_from_records(
                   f"{gene!r} not in RNA matrix — masked from kinetics.")
         if effective_kin:
             i = gene_index[normalize_name(gene)]
-            S[j, i] = float(weights.get(prot, 1.0)) if weights else 1.0
+            rna_name = str(rna_var_names[i])
+            if weights:
+                S[j, i] = float(weights.get(rna_name, weights.get(gene, weights.get(prot, 1.0))))
+            else:
+                S[j, i] = 1.0
             kinetic_mask[j] = True
         report.append(report_row(prot, gene, rec["mapping_type"], present,
                                   alignment_mask[j], effective_kin,
@@ -138,6 +144,7 @@ def build_projection_matrix(
     protein_var_names: list[str],
     weights: dict[str, float] | None = None,
     alias_map: dict[str, str] | None = None,
+    rna_var=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
     """
     Name-matching fallback (no curated CSV): build S by matching each protein to a
@@ -151,7 +158,7 @@ def build_projection_matrix(
     kinetic_mask = np.zeros(D_p, dtype=bool)
     alignment_mask = np.ones(D_p, dtype=bool)   # every measured protein feeds alignment
 
-    gene_index = {normalize_name(g): i for i, g in enumerate(rna_var_names)}
+    gene_index = gene_alias_lookup(rna_var_names, rna_var, normalizer=normalize_name)
     alias_map = alias_map or {}
 
     report: list[dict] = []
@@ -165,7 +172,8 @@ def build_projection_matrix(
             key = normalize_name(gene)
         if gene is not None and key in gene_index:
             i = gene_index[key]
-            w = weights.get(prot, 1.0) if weights else 1.0
+            rna_name = str(rna_var_names[i])
+            w = weights.get(rna_name, weights.get(gene, weights.get(prot, 1.0))) if weights else 1.0
             S[j, i] = float(w)
             kinetic_mask[j] = True
             report.append(report_row(prot, gene, "name_match", True, True, True, True, ""))
@@ -213,6 +221,7 @@ def projection_matrix_from_adatas(
         return build_projection_from_records(
             rna_names, prot_names, mapping_records, weights,
             require_full_panel=require_full_panel,
+            rna_var=rna_adata.var,
         )
 
     # 2. Explicit curated links (synthetic / stored mapping).
@@ -227,7 +236,7 @@ def projection_matrix_from_adatas(
         link_prots   = links.get("protein", links.get("target", []))
         link_weights = links.get("weight",  [1.0] * len(link_genes))
 
-        rna_index  = {g: i for i, g in enumerate(rna_names)}
+        rna_index  = gene_alias_lookup(rna_names, rna_adata.var, normalizer=normalize_name)
         prot_index = {p: j for j, p in enumerate(prot_names)}
 
         D_p, D_r = len(prot_names), len(rna_names)
@@ -236,10 +245,11 @@ def projection_matrix_from_adatas(
         alignment_mask = np.ones(D_p, dtype=bool)
         linked_gene = {}
         for gene, prot, w in zip(link_genes, link_prots, link_weights):
-            i = rna_index.get(str(gene))
+            i = rna_index.get(normalize_name(str(gene)))
             j = prot_index.get(str(prot))
             if i is not None and j is not None:
-                S[j, i] = float(weights[str(gene)]) if (use_mean_expr and weights) else float(w)
+                rna_name = str(rna_names[i])
+                S[j, i] = float(weights[rna_name]) if (use_mean_expr and weights) else float(w)
                 kinetic_mask[j] = True
                 linked_gene[j] = str(gene)
         if kinetic_mask.any():
@@ -257,4 +267,6 @@ def projection_matrix_from_adatas(
     # 3. HGNC alias / name matching.
     if alias_map is None:
         alias_map = adt_to_gene(prot_names)
-    return build_projection_matrix(rna_names, prot_names, weights=weights, alias_map=alias_map)
+    return build_projection_matrix(
+        rna_names, prot_names, weights=weights, alias_map=alias_map, rna_var=rna_adata.var,
+    )

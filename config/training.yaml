@@ -97,6 +97,9 @@ defaults:
   # otherwise the over-sized latent is free to be ignored and collapses.
   uniport_n_latent: 8
   uniport_hidden_dim: 1024
+  # uniPort's own minibatch, decoupled from the shared `batch_size` (KOT's 8192) so the
+  # KOT speed default can't tip this collapse-prone VAE into posterior collapse.
+  uniport_batch_size: 1024
   # Keep uniPort on the same runner representations as the other baselines.
   uniport_rna_rep: X_pca
   uniport_second_rep: X_pca
@@ -122,8 +125,19 @@ defaults:
   # KOT
   lambda_dyn: 1
   lambda_reg: 1.0e-4
+  # geomloss Sinkhorn backend. Kept 'tensorized' (GPU-native PyTorch, O(N²) but fine
+  # for the ≤8192-point align batch on a B200): KeOps in codedev_v1.0.5.sif cannot load
+  # CUDA ("Switching to CPU only"), so 'online'/'multiscale' would run the Sinkhorn on
+  # CPU with GPU tensors — slower, not faster. Flip to 'online' only once KeOps-CUDA
+  # works in the container (pykeops.test_torch_bindings() must run on GPU without the
+  # CPU-only warning).
+  sinkhorn_backend: tensorized
   n_epochs: 500
-  batch_size: 1024
+  # Kinetics minibatch size. 8192 is the speed knee on BMMC (n=90k): ~7× faster than
+  # 1024 (95s vs 651s/500ep) and larger gives little more. NOTE: with per-forward
+  # spectral norm, batch size affects results, so all datasets must be re-baselined at
+  # this value (small datasets n<8192 run full-batch). Override per-run with --set.
+  batch_size: 8192
   lr: 1.0e-3
   seed: 42
   phi_dims: [1024, 512, 256]
@@ -135,8 +149,12 @@ defaults:
   kot_beta_anchor_shuffle: false          # control: permute β* across proteins (assertion vs recovery test)
   kot_velocity_rna_reliability: false     # zero velocity of non-velocity_gene RNA coords before the JVP
   kot_velocity_s_linked_only: false       # JVP uses only S-linked (panel-coding) genes' velocity; fair scVelo-vs-RegVelo control
+  kot_velocity_gauge_normalize: true      # rescale velocity to unit RMS per-cell norm (κ is bounded → compare direction not magnitude)
   kot_require_full_panel_mapping: true    # hard error if the mapping CSV misses any panel protein
+  kot_allow_empty_kinetic_mask: false     # explicit opt-in for alignment-only panels with no usable RNA gene links
+  kot_allow_empty_anchor_after_kinetic_mask: false
   beta_anchor_fixed_scale: null           # freeze physical→model β scale (compute once on full set); null = geom-mean
+  beta_anchor_min_r2: null                # drop anchors whose R²/quality is below this (e.g. 0.8); null = keep all (downweight only)
   g_dims: [256, 128]
   phi_init_gain: 0.5
   phi_spectral_norm: true
@@ -371,4 +389,52 @@ datasets:
     kot_alpha_max: 3.0
     sinkhorn_max_points: 8192
     align_batch_key: batch
+    seeds: [42, 123, 2026]
+
+  # Papalexi ECCITE-seq (GSE153056). Only a 4-marker checkpoint ADT panel (CD86,
+  # PD-L1, PD-L2, TIM3), so the alignment metric is inherently noisy — this is a
+  # supporting case, not a headline benchmark. No beta-anchor CSV is available for
+  # this panel, but the ADT-target genes are still kinetics-eligible when retained.
+  papalexi_retained:
+    modality_pair: rna_protein
+    preprocessing_cache_version: papalexi_gene_alias_v1
+    kot_use_feature_space: true
+    kot_rna_layer: Ms
+    velocity_layer: velocity
+    kot_protein_layer: null
+    kot_use_explicit_links: true
+    adt_mapping_csv: cache/results/mapping/adt_mapping_papalexi.csv
+    use_anchor: false
+    kot_anchor_indices: []
+    kot_anchor_betas: []
+    lambda_dyn: 100
+    lambda_prior: 0.0
+    kot_kinetics_require_velocity_gene: false
+    kot_kinetics_normalize: true
+    kot_alpha_max: 3.0
+    kot_velocity_gauge_normalize: false
+    sinkhorn_max_points: 8192            # ~20k cells: minibatch the align Sinkhorn
+    seeds: [42, 123, 2026]
+
+  # Velocity-provider ablation: identical KOT config to papalexi_retained, but the
+  # dataset's rna_path (datasets.yaml) points at the RegVelo velocity h5ad.
+  papalexi_regvelo:
+    modality_pair: rna_protein
+    preprocessing_cache_version: papalexi_gene_alias_v1
+    kot_use_feature_space: true
+    kot_rna_layer: Ms
+    velocity_layer: velocity
+    kot_protein_layer: null
+    kot_use_explicit_links: true
+    adt_mapping_csv: cache/results/mapping/adt_mapping_papalexi.csv
+    use_anchor: false
+    kot_anchor_indices: []
+    kot_anchor_betas: []
+    lambda_dyn: 100
+    lambda_prior: 0.0
+    kot_kinetics_require_velocity_gene: false
+    kot_kinetics_normalize: true
+    kot_alpha_max: 3.0
+    kot_velocity_gauge_normalize: false
+    sinkhorn_max_points: 8192
     seeds: [42, 123, 2026]
