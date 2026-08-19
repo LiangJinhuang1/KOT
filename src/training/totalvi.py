@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import anndata as ad
 import pandas as pd
@@ -52,6 +54,12 @@ def train_totalvi_model(
     max_epochs = int(cfg.get("totalvi_max_epochs", 400))
 
     drop_reduce_lr_verbose_kwarg()
+    # scvi warns (and this env escalates it to an error) when the protein layer is not raw
+    # integer counts. BMMC's ADT comes pre-normalized from the NeurIPS object; totalVI is the
+    # PAIRED upper bound (shared encoder → FOSCTTM ≈ 0 regardless of protein normalization), so
+    # silence that specific warning rather than let it abort the run. pbmc/papalexi (raw counts)
+    # never trip it.
+    warnings.filterwarnings("ignore", message=".*unnormalized count data.*", category=UserWarning)
     scvi.settings.seed = seed
     scvi.model.TOTALVI.setup_anndata(
         combined,
