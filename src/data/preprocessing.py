@@ -19,6 +19,19 @@ from src.data.transforms import (
 )
 
 
+def write_h5ad_atomic(adata, path: str) -> None:
+    """Write to a per-process temp file then os.replace into place.
+
+    os.replace is atomic on the filesystem, so concurrent jobs that share a preprocessing
+    cache key (e.g. many runs of the same dataset packed on one GPU) never see a partial
+    file: readers get either the old or a complete new h5ad, and racing writers just
+    redundantly recompute — the last replace wins with a valid file.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    adata.write_h5ad(tmp)
+    os.replace(tmp, path)
+
+
 # --- UMAP utilities ---
 
 def add_umap_from_csv(adata, umap_path, key="X_umap"):
@@ -248,7 +261,7 @@ def load_and_preprocess_cached(
                 raise FileNotFoundError(f"RNA UMAP path not found: {rna_umap_path}")
             if "X_umap" not in rna_adata.obsm:
                 add_umap_from_csv(rna_adata, rna_umap_path)
-                rna_adata.write_h5ad(rna_cache)
+                write_h5ad_atomic(rna_adata, rna_cache)
         return rna_adata, protein_adata, atac_adata
 
     rna_adata = load_rna_from_h5ad(rna_path, raw_layer=rna_raw_layer)
@@ -303,15 +316,15 @@ def load_and_preprocess_cached(
         )
 
     print(f"[cache] Writing RNA to {rna_cache}")
-    rna_adata.write_h5ad(rna_cache)
+    write_h5ad_atomic(rna_adata, rna_cache)
     if protein_adata is not None:
         print(f"[cache] Writing Protein to {protein_cache}")
-        protein_adata.write_h5ad(protein_cache)
+        write_h5ad_atomic(protein_adata, protein_cache)
     elif os.path.exists(protein_cache):
         os.remove(protein_cache)
     if atac_adata is not None:
         print(f"[cache] Writing ATAC to {atac_cache}")
-        atac_adata.write_h5ad(atac_cache)
+        write_h5ad_atomic(atac_adata, atac_cache)
     elif os.path.exists(atac_cache):
         os.remove(atac_cache)
 

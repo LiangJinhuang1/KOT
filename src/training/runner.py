@@ -397,6 +397,13 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Record the fully-resolved config for THIS individual run (defaults + dataset/--set/
+    # model overrides + seed) in the run's own directory. The run-root snapshot only holds
+    # the un-resolved training config, so without this a single run dir cannot be traced
+    # back to the exact hyperparameters it used.
+    save_yaml({"dataset": name, "dataset_paths": dict(dataset), "run_cfg": dict(run_cfg)},
+              output_dir / "run_config.yaml")
+
     print(f"\n{'=' * 50}")
     if run_label is None:
         print(f"[{model_name}] Training on [{name}]")

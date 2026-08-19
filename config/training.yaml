@@ -150,6 +150,8 @@ defaults:
   kot_velocity_rna_reliability: false     # zero velocity of non-velocity_gene RNA coords before the JVP
   kot_velocity_s_linked_only: false       # JVP uses only S-linked (panel-coding) genes' velocity; fair scVelo-vs-RegVelo control
   kot_velocity_gauge_normalize: true      # rescale velocity to unit RMS per-cell norm (κ is bounded → compare direction not magnitude)
+  kot_grad_interaction_diag: false        # every 50 epochs, on fixed probe batches, log ||∇L_align||, ||∇L_dyn|| on φ + their cosine (gradient conflict). writes grad_interaction.csv
+  kot_grad_interaction_batches: 4         # number of fixed probe batches for the gradient-interaction diagnostic
   kot_require_full_panel_mapping: true    # hard error if the mapping CSV misses any panel protein
   kot_allow_empty_kinetic_mask: false     # explicit opt-in for alignment-only panels with no usable RNA gene links
   kot_allow_empty_anchor_after_kinetic_mask: false
