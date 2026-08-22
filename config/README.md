@@ -25,7 +25,7 @@ Defined under `model_groups:` in `training.yaml`:
 | `baselines`    | scot, moscot, glue, uniport, linear_ode                       |
 | `upperbound`   | totalvi (paired-latent ceiling)                              |
 | `convex`       | linear_ode                                                    |
-| `kot`          | kot, kot_anchor, kot_nodyn                                    |
+| `kot`          | kot, kot_noanchor, kot_nodyn                                    |
 | `kot_ablation` | kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle    |
 | `all`          | kot, kot_nodyn, moscot, scot, linear_ode, uniport, glue, totalvi |
 

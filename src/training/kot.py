@@ -13,9 +13,11 @@ import os
 import time
 from pathlib import Path
 
+import anndata as ad
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import torch
 import torch.nn.functional as F
 from torch.func import jvp as torch_jvp
@@ -29,6 +31,10 @@ from src.data.adt_gene_map import load_mapping_records
 from src.data.beta_anchor import resolve_beta_anchors
 from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
 from src.evaluation.trajectory_dtw import trajectory_dtw
+from src.visualization import FOSCTTM_CHANCE, METHOD_COLORS, MODALITY_COLORS
+from src.visualization.style import (
+    apply_style, chance_line, figsize, ink, panel_letter, save_figure,
+)
 
 
 def to_tensor(arr: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -279,6 +285,232 @@ def build_velocity_weight(rna_adata, S_np: np.ndarray, cfg: dict, use_feature_sp
     return velocity_weight
 
 
+# --- Distribution summaries for the physics diagnostics ------------------------------
+# A global mean hides the shape of the distribution it came from: a mean JVP/RHS cosine of
+# 0.2 means something very different if every cell sits at 0.2 than if half the cells are
+# at +0.9 and half at -0.5. Every per-cell / per-protein quantity below is therefore
+# reported as mean/std/min/max plus a quantile ladder, so box plots can be drawn straight
+# from the JSON without reloading the per-cell arrays.
+DIAG_QUANTILES = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
+STAT_SUFFIXES = ("mean", "std", "min", "max", "median") + tuple(
+    f"q{int(round(q * 100)):02d}" for q in DIAG_QUANTILES
+)
+# Floor for every ratio / log denominator. Cells whose kept velocity genes are all zero
+# give a zero JVP and can give a zero RHS, and the ratio must stay finite instead of
+# blowing the whole diagnostic up.
+DIAG_EPS = 1e-8
+
+# Per-cell physics quantities produced by `jvp_rhs_per_cell`, in report order.
+JVP_DIAG_PREFIXES = (
+    "jvp_norm", "rhs_norm", "residual_norm", "jvp_rhs_cos",
+    "norm_ratio", "log_norm_ratio", "rel_residual",
+)
+# Learned-parameter distributions reported alongside them.
+PARAM_DIAG_PREFIXES = ("kappa", "alpha")
+
+
+def summarize_distribution(values, prefix: str) -> dict:
+    """mean/std/min/max/median + DIAG_QUANTILES of a 1-D array, keyed `{prefix}_{stat}`.
+
+    Non-finite entries are dropped first (a degenerate cell can make a ratio inf or NaN);
+    when nothing finite is left every stat is NaN, so a broken run logs NaN rather than
+    aborting the diagnostic. `std` uses ddof=0, matching the `unbiased=False` the older
+    scalar stats used, so the values stay comparable with runs from before this change.
+    """
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {f"{prefix}_{s}": float("nan") for s in STAT_SUFFIXES}
+    stats = {
+        "mean":   float(arr.mean()),
+        "std":    float(arr.std()),
+        "min":    float(arr.min()),
+        "max":    float(arr.max()),
+        "median": float(np.median(arr)),
+    }
+    for q, value in zip(DIAG_QUANTILES, np.quantile(arr, DIAG_QUANTILES)):
+        stats[f"q{int(round(q * 100)):02d}"] = float(value)
+    return {f"{prefix}_{s}": stats[s] for s in STAT_SUFFIXES}
+
+
+def jvp_rhs_per_cell(dphi_dv: torch.Tensor, rhs: torch.Tensor) -> dict:
+    """Per-cell views of how well J_φ(r)·v matches the ODE right-hand side.
+
+    The cosine alone only says the two sides point the same way — it is blind to a φ whose
+    direction is right but whose speed is wrong. These add the magnitude view:
+
+      jvp_norm       ‖J_φ(r_i)·v_i‖                       LHS speed
+      rhs_norm       ‖κ(α⊙Sr_i − β⊙φ_i)‖                  RHS speed
+      residual_norm  ‖LHS − RHS‖                          unnormalised miss
+      norm_ratio     ‖LHS‖ / (‖RHS‖ + ε)                  1 = matched speeds
+      log_norm_ratio log((‖LHS‖+ε) / (‖RHS‖+ε))           symmetric around 0
+      rel_residual   ‖LHS−RHS‖ / (‖LHS‖+‖RHS‖+ε)          bounded [0, 1], 0 = perfect fit
+
+    Both sides must already be masked by the caller when only mapped proteins count.
+    """
+    jvp_n = dphi_dv.norm(dim=1)
+    rhs_n = rhs.norm(dim=1)
+    res_n = (dphi_dv - rhs).norm(dim=1)
+    per_cell = {
+        "jvp_norm":       jvp_n,
+        "rhs_norm":       rhs_n,
+        "residual_norm":  res_n,
+        "jvp_rhs_cos":    F.cosine_similarity(dphi_dv, rhs, dim=1, eps=1e-8),
+        "norm_ratio":     jvp_n / (rhs_n + DIAG_EPS),
+        "log_norm_ratio": torch.log((jvp_n + DIAG_EPS) / (rhs_n + DIAG_EPS)),
+        "rel_residual":   res_n / (jvp_n + rhs_n + DIAG_EPS),
+    }
+    return {name: t.detach().cpu().numpy() for name, t in per_cell.items()}
+
+
+def jvp_diag_keys() -> list[str]:
+    """Every key `compute_jvp_rhs_diagnostics` returns.
+
+    The per-epoch history columns and the NaN row used on epochs where the diagnostic does
+    not run are both built from this, so neither can drift out of sync with the diagnostic.
+    """
+    keys = [
+        f"{prefix}_{stat}"
+        for prefix in JVP_DIAG_PREFIXES + PARAM_DIAG_PREFIXES
+        for stat in STAT_SUFFIXES
+    ]
+    # Legacy scalar aliases (== the matching *_mean stat) kept for the existing plots,
+    # checkpoint CSVs and tools/collect_run_diagnostics.py.
+    keys += ["jvp_rhs_cos", "jvp_norm", "rhs_norm"]
+    return keys
+
+
+def velocity_norm_diagnostics(v_eff) -> dict:
+    """‖v_eff‖ per cell, plus the fraction of cells that carry any velocity at all.
+
+    v_eff is the exact vector pushed through the Jacobian, after the RNA-side weight has
+    zeroed the genes without a usable fit. A cell whose every kept gene is zero contributes
+    a zero JVP and can only ever push the residual toward "the RHS should be zero too", so
+    the non-zero fraction says how much of the dataset the kinetic term can actually see.
+    """
+    if isinstance(v_eff, torch.Tensor):
+        norms = v_eff.norm(dim=1).detach().cpu().numpy()
+    else:
+        norms = np.linalg.norm(np.asarray(v_eff, dtype=np.float64), axis=1)
+    out = summarize_distribution(norms, "v_eff_norm")
+    out["v_eff_nonzero_frac"] = float(np.mean(norms > DIAG_EPS)) if norms.size else float("nan")
+    out["v_eff_n_cells"] = int(norms.size)
+    return out
+
+
+def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dict) -> dict:
+    """Per-cell cos(v_i from this run, v_i from a second velocity backend).
+
+    scVelo and RegVelo never meet inside one run — datasets.yaml swaps `rna_path` between
+    `*_scvelo_results_retained.h5ad` and `*_regvelo_results_retained.h5ad` — so a FOSCTTM
+    gap between the two ablations cannot be attributed without knowing how different the
+    two velocity fields were in the first place. Point `kot_velocity_compare_h5ad` at the
+    other backend's h5ad and this measures that difference directly, per cell, over the
+    cells and genes the two files share.
+
+    Anything that goes wrong (no path configured, missing file, missing layer, no shared
+    cells/genes, velocity not in gene space) is reported as NaN with a reason: this is a
+    diagnostic and must never take a training run down with it.
+    """
+    compare_path = cfg.get("kot_velocity_compare_h5ad")
+    layer = str(cfg.get("kot_velocity_compare_layer", "velocity"))
+    out = summarize_distribution([], "velocity_backend_cos")
+    out.update({
+        "velocity_backend_compare_h5ad": str(compare_path) if compare_path else None,
+        "velocity_backend_compare_layer": layer,
+        "velocity_backend_label": cfg.get("kot_velocity_compare_label"),
+        "velocity_backend_n_cells": 0,
+        "velocity_backend_n_genes": 0,
+        "velocity_backend_status": "not configured",
+    })
+    if not compare_path:
+        return out
+
+    def fail(reason: str) -> dict:
+        print(f"[kot] velocity-backend comparison skipped: {reason}")
+        out["velocity_backend_status"] = reason
+        return out
+
+    if velocity.shape[1] != rna_adata.n_vars:
+        return fail(
+            f"velocity has {velocity.shape[1]} columns but the AnnData has "
+            f"{rna_adata.n_vars} genes (representation mode: no gene axis to match on)"
+        )
+    if not Path(compare_path).exists():
+        return fail(f"'{compare_path}' not found")
+
+    try:
+        other = ad.read_h5ad(compare_path)
+    except Exception as exc:                      # noqa: BLE001 - diagnostic must not raise
+        return fail(f"could not read '{compare_path}': {exc}")
+
+    try:
+        if layer not in other.layers:
+            return fail(f"layer '{layer}' missing from '{compare_path}' "
+                        f"(has: {list(other.layers.keys())})")
+
+        self_cells = pd.Index(rna_adata.obs_names)
+        self_genes = pd.Index(rna_adata.var_names)
+        cells = self_cells.intersection(pd.Index(other.obs_names))
+        genes = self_genes.intersection(pd.Index(other.var_names))
+        if len(cells) == 0 or len(genes) == 0:
+            return fail(f"no shared cells/genes with '{compare_path}' "
+                        f"({len(cells)} cells, {len(genes)} genes)")
+
+        v_self = velocity[self_cells.get_indexer(cells)][:, self_genes.get_indexer(genes)]
+        v_other = np.nan_to_num(to_dense(other.layers[layer], np.float32), nan=0.0)
+        v_other = v_other[pd.Index(other.obs_names).get_indexer(cells)][
+            :, pd.Index(other.var_names).get_indexer(genes)
+        ]
+    finally:
+        del other
+
+    dot = np.einsum("ij,ij->i", v_self, v_other).astype(np.float64)
+    denom = np.linalg.norm(v_self, axis=1) * np.linalg.norm(v_other, axis=1)
+    cos = dot / (denom + DIAG_EPS)
+
+    out.update(summarize_distribution(cos, "velocity_backend_cos"))
+    out["velocity_backend_n_cells"] = int(len(cells))
+    out["velocity_backend_n_genes"] = int(len(genes))
+    # Cells where one backend produced no velocity at all: their cosine is a forced 0 and
+    # says nothing about agreement, so report how many rows are in that state.
+    out["velocity_backend_zero_frac"] = float(np.mean(denom <= DIAG_EPS))
+    out["velocity_backend_status"] = "ok"
+    print(f"[kot] velocity-backend cos vs {compare_path}: "
+          f"median={out['velocity_backend_cos_median']:+.3f} "
+          f"mean={out['velocity_backend_cos_mean']:+.3f} "
+          f"[q25={out['velocity_backend_cos_q25']:+.3f}, q75={out['velocity_backend_cos_q75']:+.3f}] "
+          f"over {len(cells)} cells x {len(genes)} genes")
+    return out
+
+
+def build_effective_velocity(
+    velocity: np.ndarray, velocity_weight: np.ndarray | None, cfg: dict, quiet: bool = False,
+) -> np.ndarray:
+    """The exact velocity fed to the JVP: RNA-side weight applied, then gauge-normalized.
+
+    Order matters. The weight zeroes the genes whose velocity may not enter J_φ·v, and the
+    gauge scalar must be measured from the vector that actually reaches the Jacobian — not
+    from the raw field — so it is computed after the weight. The gauge uses the median of
+    the NONZERO per-cell norms, which is robust both to outliers and to the zeros the weight
+    itself introduces.
+
+    Training and every diagnostic must call this rather than re-deriving V_eff from a raw
+    velocity plus a separate weight: a checkpoint re-evaluated on a differently-scaled
+    velocity reports physics numbers that do not match the run that produced it.
+    """
+    gauge_eps = 1e-8
+    v_eff = velocity if velocity_weight is None else velocity * velocity_weight[None, :]
+    if bool(cfg.get("kot_velocity_gauge_normalize", False)):
+        cell_norms = np.linalg.norm(v_eff, axis=1)
+        nonzero = cell_norms > gauge_eps
+        gauge = float(np.median(cell_norms[nonzero])) if nonzero.any() else 1.0
+        v_eff = v_eff / (gauge + gauge_eps)
+        if not quiet:
+            print(f"[kot] velocity gauge-normalized: median nonzero per-cell norm {gauge:.4g} -> 1.0")
+    return v_eff.astype(np.float32)
+
+
 def compute_jvp_rhs_diagnostics(
     model,
     R_t: torch.Tensor,
@@ -287,13 +519,18 @@ def compute_jvp_rhs_diagnostics(
     subset: int = 512,
     mask: torch.Tensor | None = None,
 ) -> dict:
-    """JVP/RHS cosine + norms and kappa stats on a small subset.
+    """JVP/RHS agreement and κ/α distributions on a small subset.
 
     `V_eff` is the exact velocity fed to the JVP in training (RNA-side weight applied and
     gauge-normalized upstream); this receives it directly so the diagnostic uses the same
     vector as the loss. JVP requires autograd (forward-mode AD): do not call inside
     torch.no_grad(). When mask is given, the cosine/norms are over the mapped (kinetics)
     proteins only, so unmapped proteins do not dilute the physics fit.
+
+    Every quantity is reported as a full distribution across cells (mean/std/min/max/median
+    plus DIAG_QUANTILES) — see `jvp_rhs_per_cell` for what each one measures. The bare
+    `jvp_rhs_cos` / `jvp_norm` / `rhs_norm` keys are kept as aliases of the corresponding
+    `*_mean` so the existing plots and checkpoint CSVs keep working.
     """
     was_training = model.training
     model.eval()
@@ -312,21 +549,19 @@ def compute_jvp_rhs_diagnostics(
     if mask is not None:
         dphi_dv = dphi_dv * mask
         rhs = rhs * mask
-    cos = F.cosine_similarity(dphi_dv, rhs, dim=1, eps=1e-8)
 
-    out = {
-        "jvp_rhs_cos": float(cos.mean().detach().cpu()),
-        "jvp_norm":    float(dphi_dv.norm(dim=1).mean().detach().cpu()),
-        "rhs_norm":    float(rhs.norm(dim=1).mean().detach().cpu()),
-        "kappa_mean":  float(kappa.mean().detach().cpu()),
-        "kappa_std":   float(kappa.std(unbiased=False).detach().cpu()),
-        "kappa_min":   float(kappa.min().detach().cpu()),
-        "kappa_max":   float(kappa.max().detach().cpu()),
-        "alpha_mean":  float(alpha.mean().detach().cpu()),
-        "alpha_std":   float(alpha.std(unbiased=False).detach().cpu()),
-        "alpha_min":   float(alpha.min().detach().cpu()),
-        "alpha_max":   float(alpha.max().detach().cpu()),
-    }
+    per_cell = jvp_rhs_per_cell(dphi_dv, rhs)
+    out = {}
+    for name in JVP_DIAG_PREFIXES:
+        out.update(summarize_distribution(per_cell[name], name))
+    # κ is one scalar per cell; α is per (cell, protein) and is summarised over every
+    # entry, matching what the older alpha_mean/alpha_std reported.
+    out.update(summarize_distribution(kappa.detach().cpu().numpy(), "kappa"))
+    out.update(summarize_distribution(alpha.detach().cpu().numpy(), "alpha"))
+    # Back-compat aliases for the existing plots / CSVs / collect_run_diagnostics.py.
+    out["jvp_rhs_cos"] = out["jvp_rhs_cos_mean"]
+    out["jvp_norm"]    = out["jvp_norm_mean"]
+    out["rhs_norm"]    = out["rhs_norm_mean"]
 
     if was_training:
         model.train()
@@ -359,6 +594,7 @@ def compute_grad_interaction(
     mask: torch.Tensor | None = None,
     scale: torch.Tensor | None = None,
     align_cols: torch.Tensor | None = None,
+    lambda_dyn: float = 1.0,
 ) -> dict:
     """Per-batch interaction between the alignment and kinetics objectives on the shared φ.
 
@@ -366,9 +602,17 @@ def compute_grad_interaction(
     kinetics residual via J_φ·v and β⊙φ). For each FIXED probe batch we take ∇L_align and
     ∇L_dyn w.r.t. the φ parameters and report each gradient's L2 norm plus the cosine between
     them: cos < 0 means the two objectives pull φ in opposing directions (gradient conflict),
-    cos > 0 means they cooperate; the norms show which objective dominates φ's update. Raw
-    (un-λ-weighted) losses, so the norms reflect the intrinsic gradient magnitudes. Run in
+    cos > 0 means they cooperate; the norms show which objective dominates φ's update. Run in
     eval() so the extra forwards do not perturb φ's spectral-norm estimate.
+
+    The losses are raw (un-λ-weighted), so `grad_dyn_norm` is the objective's *intrinsic*
+    gradient magnitude — comparable across runs with different λ_dyn. What actually reaches
+    the optimiser is λ_dyn times that, so `grad_dyn_norm_scaled` (= λ_dyn · ‖∇L_dyn‖, since
+    ∇(λL) = λ∇L) and `grad_mag_ratio` = ‖λ_dyn ∇L_dyn‖ / (‖∇L_align‖ + ε) are reported too:
+    the ratio is the one that says which objective is actually driving φ this epoch, with
+    1.0 the balance point. Pass the *effective* λ_dyn for the epoch (0 during a warmup or an
+    alignment-only phase), so the scaled view reflects the real update rather than the
+    configured weight. The cosine is scale-free and identical either way.
     """
     was_training = model.training
     model.eval()
@@ -381,6 +625,7 @@ def compute_grad_interaction(
         ])
 
     align_norms, dyn_norms, cosines = [], [], []
+    dyn_norms_scaled, mag_ratios = [], []
     for idx, pidx in probe_batches:
         phi_r = model.phi(R_t[idx])
         phi_a = phi_r if align_cols is None else phi_r[:, align_cols]
@@ -397,20 +642,29 @@ def compute_grad_interaction(
 
         na = float(g_align.norm())
         nd = float(g_dyn.norm())
+        nd_scaled = float(lambda_dyn) * nd
         align_norms.append(na)
         dyn_norms.append(nd)
+        dyn_norms_scaled.append(nd_scaled)
+        mag_ratios.append(nd_scaled / (na + DIAG_EPS))
         cosines.append(float((g_align @ g_dyn) / (g_align.norm() * g_dyn.norm() + 1e-12)))
 
     if was_training:
         model.train()
     return {
-        "grad_align_norm": float(np.mean(align_norms)),
-        "grad_dyn_norm":   float(np.mean(dyn_norms)),
-        "grad_cos_mean":   float(np.mean(cosines)),
-        "grad_cos_std":    float(np.std(cosines)),
-        "grad_align_norms": align_norms,
-        "grad_dyn_norms":   dyn_norms,
-        "grad_cosines":     cosines,
+        "grad_align_norm":      float(np.mean(align_norms)),
+        "grad_dyn_norm":        float(np.mean(dyn_norms)),
+        "grad_dyn_norm_scaled": float(np.mean(dyn_norms_scaled)),
+        "grad_mag_ratio":       float(np.mean(mag_ratios)),
+        "grad_mag_ratio_std":   float(np.std(mag_ratios)),
+        "grad_cos_mean":        float(np.mean(cosines)),
+        "grad_cos_std":         float(np.std(cosines)),
+        "grad_lambda_dyn":      float(lambda_dyn),
+        "grad_align_norms":      align_norms,
+        "grad_dyn_norms":        dyn_norms,
+        "grad_dyn_norms_scaled": dyn_norms_scaled,
+        "grad_mag_ratios":       mag_ratios,
+        "grad_cosines":          cosines,
     }
 
 
@@ -450,6 +704,11 @@ def compute_per_cell_diagnostics(
     (align_cols, e.g. use_for_alignment proteins) so features excluded from the
     Sinkhorn (isotype controls) do not re-enter evaluation. φ still predicts the
     full panel; only the metric is restricted.
+
+    Alongside FOSCTTM this returns the full per-cell physics arrays (`jvp_rhs_per_cell`),
+    κ, the per-cell mean α over the kinetic proteins, and ‖v_eff‖ — everything the summary
+    statistics in the diagnostics JSON are computed from, so a box plot or a scatter
+    against FOSCTTM can be drawn from the saved npz without rerunning the model.
     """
     model.eval()
 
@@ -465,8 +724,20 @@ def compute_per_cell_diagnostics(
         rhs = rhs * mask
     residual = dphi_dv - rhs
 
-    cos_per_cell = F.cosine_similarity(dphi_dv, rhs, dim=1, eps=1e-8).detach().cpu().numpy()
+    physics_per_cell = jvp_rhs_per_cell(dphi_dv, rhs)
     dyn_per_cell = residual.pow(2).sum(dim=1).detach().cpu().numpy()
+
+    # κ is one scalar per cell; α is per (cell, protein), so average it over the proteins
+    # the kinetic term actually uses — an α mean over masked-out proteins is meaningless.
+    kappa_per_cell = kappa.detach().reshape(-1).cpu().numpy()
+    if mask is not None:
+        mask_row = mask.reshape(1, -1)
+        alpha_per_cell = (
+            (alpha * mask_row).sum(dim=1) / mask_row.sum().clamp(min=1.0)
+        ).detach().cpu().numpy()
+    else:
+        alpha_per_cell = alpha.mean(dim=1).detach().cpu().numpy()
+    v_eff_norm_per_cell = V_eff.norm(dim=1).detach().cpu().numpy()
 
     # Nearest-neighbor matching + FOSCTTM on the alignment panel (φ predicts all D_p,
     # but excluded features must not re-enter the geometric metric).
@@ -501,18 +772,27 @@ def compute_per_cell_diagnostics(
         "branch_match": branch_match,
         "state_true":  state_true,
         "state_pred":  state_pred,
-        "jvp_rhs_cos": cos_per_cell,
         "dyn":         dyn_per_cell,
         "align":       align_per_cell,
+        "kappa":       kappa_per_cell,
+        "alpha_cell_mean": alpha_per_cell,
+        "v_eff_norm":  v_eff_norm_per_cell,
+        # jvp_norm / rhs_norm / residual_norm / jvp_rhs_cos / norm_ratio /
+        # log_norm_ratio / rel_residual
+        **physics_per_cell,
     }
 
 
 def plot_grad_interaction(rows: list, output_path: Path) -> None:
-    """2-panel: φ-gradient norms of the two objectives, and their cosine, vs epoch.
+    """How the alignment and kinetics objectives interact on phi, across training.
 
-    Left: ||∇L_align|| and ||∇L_dyn|| on φ (log scale) — which objective drives φ's update.
-    Right: cos(∇L_align, ∇L_dyn), mean ± std over the probe batches, with the 0 conflict line
-    (< 0 = the objectives pull φ in opposing directions).
+    a  intrinsic gradient magnitude of each objective on phi
+    b  the lambda-weighted ratio: which objective actually drives phi's update
+    c  cosine between the two gradients: do they cooperate or fight
+
+    The gradients are probed at a handful of epochs, not every epoch, so the
+    samples are drawn as markers with a light connector rather than a solid
+    line, which would imply continuity the data does not have (§6.3).
     """
     df = pd.DataFrame(rows)
     g = df.groupby("epoch")
@@ -521,33 +801,91 @@ def plot_grad_interaction(rows: list, output_path: Path) -> None:
     dn_m  = g["grad_dyn_norm"].mean().to_numpy()
     cos_m = g["grad_cos"].mean().to_numpy()
     cos_s = g["grad_cos"].std(ddof=0).fillna(0.0).to_numpy()
+    # Runs written before the lambda-scaled columns existed only carry the two raw
+    # norms; fall back to the unweighted ratio and say so on the panel rather than
+    # failing to plot the run at all.
+    has_scaled = "grad_dyn_norm_scaled" in df.columns
+    dns_m = g["grad_dyn_norm_scaled"].mean().to_numpy() if has_scaled else None
+    if "grad_mag_ratio" in df.columns:
+        rat_m = g["grad_mag_ratio"].mean().to_numpy()
+    else:
+        rat_m = np.divide(dns_m if has_scaled else dn_m, an_m,
+                          out=np.zeros_like(an_m), where=an_m > 0)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    axes[0].plot(ep, an_m, "-o", label=r"$\|\nabla L_{align}\|$", color="tab:blue")
-    axes[0].plot(ep, dn_m, "-o", label=r"$\|\nabla L_{dyn}\|$", color="tab:red")
-    axes[0].set_yscale("log")
-    axes[0].set_xlabel("epoch")
-    axes[0].set_ylabel(r"$\phi$-gradient L2 norm")
-    axes[0].set_title("Objective gradient magnitude on φ")
-    axes[0].legend()
-    axes[0].grid(alpha=0.3)
+    apply_style()
+    fig, axes = plt.subplots(1, 3, figsize=figsize("full", 1.9))
+    probe = dict(marker="o", ms=2.6, lw=0.7, ls=(0, (3, 2)))
 
-    axes[1].axhline(0.0, color="grey", lw=1, ls="--")
-    axes[1].plot(ep, cos_m, "-o", color="tab:purple")
-    axes[1].fill_between(ep, cos_m - cos_s, cos_m + cos_s, color="tab:purple", alpha=0.2)
-    axes[1].set_ylim(-1.05, 1.05)
-    axes[1].set_xlabel("epoch")
-    axes[1].set_ylabel(r"$\cos(\nabla L_{align}, \nabla L_{dyn})$")
-    axes[1].set_title("Alignment–kinetics gradient conflict\n(<0 conflict, >0 cooperate)")
-    axes[1].grid(alpha=0.3)
+    ax = axes[0]
+    ax.plot(ep, an_m, color=ink(METHOD_COLORS["kot"]), **probe)
+    ax.plot(ep, dn_m, color=ink(MODALITY_COLORS["Protein"]), **probe)
+    if has_scaled:
+        ax.plot(ep, dns_m, color="0.45", marker="s", ms=2.0, lw=0.7, ls=(0, (1, 2)))
+    ax.set_yscale("log")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(r"$\phi$-gradient norm")
+    ax.set_title("Gradient magnitude")
+    labelled = [
+        ("alignment", an_m, ink(METHOD_COLORS["kot"])),
+        ("kinetics", dn_m, ink(MODALITY_COLORS["Protein"])),
+    ]
+    if has_scaled:
+        labelled.append((r"kinetics $\times\ \lambda$", dns_m, "0.45"))
+    for label, ys, color in labelled:
+        ax.annotate(label, xy=(ep[-1], ys[-1]), xytext=(3, 0),
+                    textcoords="offset points", fontsize=6, color=color,
+                    va="center", ha="left")
+    ax.set_xlim(0, float(ep[-1]) * 1.38)
+    panel_letter(ax, "a")
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=100, bbox_inches="tight")
-    plt.close(fig)
+    # A ratio of exactly 0 (lambda_dyn = 0 during warmup) cannot be drawn on a log
+    # axis; mask those epochs rather than letting matplotlib drop them silently.
+    ax = axes[1]
+    ratio_plot = np.where(rat_m > 0, rat_m, np.nan)
+    ax.axhline(1.0, color="0.45", lw=0.7, ls=(0, (4, 2)))
+    ax.text(0.99, 1.0, " equal ", transform=ax.get_yaxis_transform(),
+            fontsize=6, color="0.45", ha="right", va="top")
+    ax.plot(ep, ratio_plot, color=ink(METHOD_COLORS["kot"]), **probe)
+    ax.set_yscale("log")
+    ax.set_xlim(0, float(ep[-1]) * 1.04)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("kinetics / alignment")
+    ax.set_title(r"Which objective drives $\phi$")
+    if not has_scaled:
+        ax.text(0.02, -0.42, r"unweighted ($\lambda$ not recorded)",
+                transform=ax.transAxes, fontsize=6, color="0.45",
+                ha="left", va="top")
+    panel_letter(ax, "b")
+
+    ax = axes[2]
+    ax.axhline(0.0, color="0.45", lw=0.7, ls=(0, (4, 2)))
+    ax.fill_between(ep, cos_m - cos_s, cos_m + cos_s,
+                    color=METHOD_COLORS["kot"], alpha=0.18, linewidth=0)
+    ax.plot(ep, cos_m, color=ink(METHOD_COLORS["kot"]), **probe)
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_xlim(0, float(ep[-1]) * 1.04)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("gradient cosine")
+    ax.set_title("Cooperate or conflict")
+    ax.text(0.99, 0.97, "> 0 cooperate", transform=ax.transAxes,
+            fontsize=6, color="0.35", ha="right", va="top")
+    ax.text(0.99, 0.03, "< 0 conflict", transform=ax.transAxes,
+            fontsize=6, color="0.35", ha="right", va="bottom")
+    panel_letter(ax, "c")
+
+    fig.text(0.5, -0.02,
+             f"Gradients probed at {len(ep)} epochs; band in c is 1 s.d. over probe batches",
+             ha="center", va="top", fontsize=6, color="0.35")
+    fig.tight_layout(pad=0.5, w_pad=2.4)
+    save_figure(fig, Path(output_path).with_suffix(""))
 
 
 def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
-    """5-panel figure: FOSCTTM vs branch_match, time error, JVP/RHS cosine, dyn, align."""
+    """What per-cell alignment failure co-varies with.
+
+    One panel per candidate explanation, each plotted against per-cell FOSCTTM
+    so the reader can see which quantity actually tracks alignment quality.
+    """
     foscttm      = per_cell["foscttm"]
     time_err     = per_cell["time_err"]
     branch_match = per_cell["branch_match"]
@@ -555,52 +893,81 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
     dyn_pc       = per_cell["dyn"]
     align_pc     = per_cell["align"]
 
-    fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+    apply_style()
+    # Constrained layout, not tight_layout: it accounts for tick-label extents when
+    # spacing panels, which is what stops a stacked pair's outermost y ticks from
+    # meeting. Pruning the end ticks removes the remaining edge case.
+    fig, axes = plt.subplots(2, 3, figsize=figsize("full", 3.8),
+                             layout="constrained")
+    fig.get_layout_engine().set(h_pad=0.06, w_pad=0.05, hspace=0.06, wspace=0.05)
+    axes = axes.ravel()
+    pt = dict(s=1.2, alpha=0.30, linewidths=0, rasterized=True,
+              color=METHOD_COLORS["kot"])
 
-    # 1. FOSCTTM by branch match (correct vs incorrect); needs ground-truth branch.
+    # a. FOSCTTM split by whether the cell was mapped into the right branch.
+    ax = axes[0]
     if (branch_match >= 0).any():
         correct = foscttm[branch_match == 1]
         wrong   = foscttm[branch_match == 0]
-        axes[0].boxplot([correct, wrong], labels=["Match", "Mismatch"])
-        axes[0].set_ylabel("FOSCTTM")
-        axes[0].set_title(
-            f"FOSCTTM by branch match\n"
-            f"match={len(correct)} ({len(correct)/len(foscttm):.1%}), "
-            f"mismatch={len(wrong)}"
-        )
+        bp = ax.boxplot([correct, wrong],
+                        labels=[f"Correct\n(n={len(correct):,})",
+                                f"Wrong\n(n={len(wrong):,})"],
+                        widths=0.5, showfliers=False, patch_artist=True)
+        for patch, color in zip(bp["boxes"], [METHOD_COLORS["kot"], "#767676"]):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.45)
+            patch.set_linewidth(0.6)
+        for key in ("whiskers", "caps", "medians"):
+            for line in bp[key]:
+                line.set_color("0.25")
+                line.set_linewidth(0.7)
+        ax.set_ylabel("FOSCTTM")
+        ax.set_xlabel("Branch assignment")
+        ax.set_title("Alignment vs branch error")
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
     else:
-        axes[0].text(0.5, 0.5, "no ground-truth branch", ha="center", va="center")
-        axes[0].set_title("FOSCTTM by branch match")
+        ax.text(0.5, 0.5, "no ground-truth branch", ha="center", va="center",
+                fontsize=6, color="0.45", transform=ax.transAxes)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title("Alignment vs branch error")
+    chance_line(ax, FOSCTTM_CHANCE, axis="y", label="chance")
+    panel_letter(ax, "a")
 
-    # 2. FOSCTTM vs time abs error
-    axes[1].scatter(foscttm, time_err, alpha=0.3, s=4)
-    axes[1].set_xlabel("FOSCTTM")
-    axes[1].set_ylabel("|t_pred - t_true|")
-    axes[1].set_title("Time error vs FOSCTTM")
+    # b-e. Per-cell quantities against per-cell FOSCTTM, each with its correlation.
+    panels = [
+        ("Pseudotime error", time_err,  None,  "b", False),
+        ("ODE consistency\ncos(J$_\\phi$v, f)", cos_pc, (-1.05, 1.05), "c", False),
+        ("ODE residual", dyn_pc, None, "d", True),
+        ("Distance to nearest\nprotein cell", align_pc, None, "e", False),
+    ]
+    for ax, (ylabel, values, ylim, letter, log_y) in zip(axes[1:5], panels):
+        ax.scatter(foscttm, values, **pt)
+        ax.set_xlabel("FOSCTTM")
+        ax.set_ylabel(ylabel)
+        if ylim:
+            ax.set_ylim(*ylim)
+        if log_y:
+            ax.set_yscale("log")
+        finite = np.isfinite(foscttm) & np.isfinite(values)
+        if finite.sum() > 2:
+            r = float(np.corrcoef(foscttm[finite], values[finite])[0, 1])
+            ax.text(0.97, 0.05, f"r = {r:+.2f}", transform=ax.transAxes,
+                    fontsize=6, color="0.25", ha="right", va="bottom")
+        ax.margins(x=0.04, y=0.10)
+        if not log_y:
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
+        panel_letter(ax, letter)
 
-    # 3. FOSCTTM vs JVP/RHS cosine
-    axes[2].scatter(foscttm, cos_pc, alpha=0.3, s=4)
-    axes[2].set_xlabel("FOSCTTM")
-    axes[2].set_ylabel("cos(J_φ·v, rhs)")
-    axes[2].set_ylim(-1.05, 1.05)
-    axes[2].set_title("ODE alignment vs FOSCTTM")
+    axes[5].axis("off")
+    axes[5].text(0.06, 0.92,
+                 "Each point is one cell.\nx-axis is per-cell FOSCTTM\n"
+                 "throughout (lower = better).\n\n"
+                 "r is the Pearson correlation\nwith FOSCTTM.",
+                 transform=axes[5].transAxes, fontsize=6, color="0.35",
+                 ha="left", va="top", linespacing=1.5)
 
-    # 4. FOSCTTM vs per-cell dynamic residual
-    axes[3].scatter(foscttm, dyn_pc, alpha=0.3, s=4)
-    axes[3].set_xlabel("FOSCTTM")
-    axes[3].set_ylabel("‖J_φ·v − rhs‖²")
-    axes[3].set_yscale("log")
-    axes[3].set_title("Dyn residual vs FOSCTTM")
-
-    # 5. FOSCTTM vs per-cell align proxy (NN distance to observed protein)
-    axes[4].scatter(foscttm, align_pc, alpha=0.3, s=4)
-    axes[4].set_xlabel("FOSCTTM")
-    axes[4].set_ylabel("min_j ‖φ(r) − p_j‖")
-    axes[4].set_title("Align proxy vs FOSCTTM")
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=100, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, Path(output_path).with_suffix(""))
 
 
 def compute_full_diagnostics(
@@ -614,7 +981,12 @@ def compute_full_diagnostics(
     mask: torch.Tensor | None = None,
     align_cols: torch.Tensor | None = None,
 ) -> dict:
-    """End-of-training diagnostics: time, branch confusion, variance, plus JVP stats."""
+    """End-of-training diagnostics: time, branch confusion, variance, plus JVP stats.
+
+    The JVP/κ/α block comes back as full distributions across cells (see
+    `compute_jvp_rhs_diagnostics`); β and ‖v_eff‖ get the same treatment here, so every
+    quantity in the JSON carries a median and quantiles next to its mean.
+    """
     model.eval()
 
     with torch.no_grad():
@@ -688,7 +1060,7 @@ def compute_full_diagnostics(
 
     beta_np = beta.cpu().numpy()
 
-    return {
+    out = {
         "time_mae":                  time_mae,
         "time_spearman":             time_spearman,
         "traj_dtw_temporal":         traj_dtw_temporal,
@@ -698,21 +1070,17 @@ def compute_full_diagnostics(
         "phi_variance":              var_phi,
         "p_variance":                var_p,
         "phi_variance_ratio":        phi_var_ratio,
-        "jvp_rhs_cos":               jvp["jvp_rhs_cos"],
-        "jvp_norm":                  jvp["jvp_norm"],
-        "rhs_norm":                  jvp["rhs_norm"],
-        "kappa_mean":                jvp["kappa_mean"],
-        "kappa_std":                 jvp["kappa_std"],
-        "kappa_min":                 jvp["kappa_min"],
-        "kappa_max":                 jvp["kappa_max"],
-        "alpha_mean":                jvp["alpha_mean"],
-        "alpha_std":                 jvp["alpha_std"],
-        "alpha_min":                 jvp["alpha_min"],
-        "alpha_max":                 jvp["alpha_max"],
-        "beta_mean":                 float(beta_np.mean()),
-        "beta_std":                  float(beta_np.std()),
         "beta_values":               beta_np.tolist(),
     }
+    # JVP/RHS norms, ratios, cosine and κ/α — mean/std/min/max/median + quantiles each,
+    # plus the legacy jvp_rhs_cos / jvp_norm / rhs_norm scalars.
+    out.update(jvp)
+    # β is per protein, not per cell: the distribution is over the panel.
+    out.update(summarize_distribution(beta_np, "beta"))
+    # ‖v_eff‖ is checkpoint-independent (the velocity is fixed input), but it belongs in
+    # every diagnostics JSON so each file explains the physics numbers next to it.
+    out.update(velocity_norm_diagnostics(V_eff))
+    return out
 
 
 def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataFrame]:
@@ -990,20 +1358,24 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             f"{len(velocity_weight_np)} genes kept in JVP"
         )
 
-    # Effective velocity actually fed to the JVP: apply the RNA-side weight FIRST, then
-    # gauge-normalize on THAT vector — the gauge scalar must come from the exact velocity
-    # passed to the Jacobian, not the raw field. Use the median of NONZERO per-cell norms
-    # (robust to outliers and to the zeros the weight introduces). Training and diagnostics
-    # both receive this same V_eff_t; neither reconstructs it from raw V + a separate weight.
-    gauge_eps = 1e-8
-    V_eff = V if velocity_weight_np is None else V * velocity_weight_np[None, :]
-    if bool(cfg.get("kot_velocity_gauge_normalize", False)):
-        cell_norms = np.linalg.norm(V_eff, axis=1)
-        nonzero = cell_norms > gauge_eps
-        gauge = float(np.median(cell_norms[nonzero])) if nonzero.any() else 1.0
-        V_eff = V_eff / (gauge + gauge_eps)
-        print(f"[kot] velocity gauge-normalized: median nonzero per-cell norm {gauge:.4g} -> 1.0")
-    V_eff_t = to_tensor(V_eff.astype(np.float32), device)   # (n, D_r)
+    # Effective velocity actually fed to the JVP (see build_effective_velocity). Training
+    # and diagnostics both receive this same V_eff_t; neither reconstructs it from raw V
+    # plus a separate weight.
+    V_eff = build_effective_velocity(V, velocity_weight_np, cfg)
+    V_eff_t = to_tensor(V_eff, device)   # (n, D_r)
+
+    # Velocity-input diagnostics. V_eff is fixed for the whole run, so this is computed once
+    # and merged into every diagnostics JSON: the ‖v_eff‖ distribution and the fraction of
+    # cells with any velocity left after the RNA-side weight, plus (when
+    # kot_velocity_compare_h5ad is set) the per-cell cosine against the other backend's
+    # velocity field, which is the only way to see how much of a scVelo-vs-RegVelo result
+    # gap comes from the input rather than from KOT.
+    velocity_diag = velocity_norm_diagnostics(V_eff)
+    velocity_diag.update(compute_velocity_backend_agreement(rna_adata, V, cfg))
+    print(f"[kot] ‖v_eff‖ per cell: median={velocity_diag['v_eff_norm_median']:.4g} "
+          f"mean={velocity_diag['v_eff_norm_mean']:.4g} "
+          f"[q25={velocity_diag['v_eff_norm_q25']:.4g}, q75={velocity_diag['v_eff_norm_q75']:.4g}]  "
+          f"nonzero={velocity_diag['v_eff_nonzero_frac'] * 100:.1f}% of {velocity_diag['v_eff_n_cells']} cells")
 
     # Kinetics mask (default on in feature space): only kinetic_mask=True proteins
     # enter L_dyn. When a mapping CSV is the source of truth, its use_for_kinetics
@@ -1174,7 +1546,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
     # Fixed probe batches for the alignment-vs-kinetics gradient-interaction diagnostic. Same
     # (RNA idx, unpaired protein idx) sets every diagnostic call, so ∇L_align / ∇L_dyn norms
-    # and their cosine are comparable across epochs. Off by default (kot_grad_interaction_diag).
+    # and their cosine are comparable across epochs. On by default (kot_grad_interaction_diag);
+    # the code default stays False so a config that predates the flag behaves as it did.
     grad_diag_on = bool(cfg.get("kot_grad_interaction_diag", False))
     probe_batches = []
     if grad_diag_on:
@@ -1187,9 +1560,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             probe_batches.append((idx, pidx))
         print(f"[kot] grad-interaction diag: {n_probe} fixed batches of {probe_size} cells")
     grad_diag_nan = {"grad_align_norm": np.nan, "grad_dyn_norm": np.nan,
+                     "grad_dyn_norm_scaled": np.nan, "grad_mag_ratio": np.nan,
+                     "grad_mag_ratio_std": np.nan, "grad_lambda_dyn": np.nan,
                      "grad_cos_mean": np.nan, "grad_cos_std": np.nan,
-                     "grad_align_norms": [], "grad_dyn_norms": [], "grad_cosines": []}
+                     "grad_align_norms": [], "grad_dyn_norms": [],
+                     "grad_dyn_norms_scaled": [], "grad_mag_ratios": [], "grad_cosines": []}
     grad_interaction_rows = []
+    # Same keys the JVP diagnostic returns, all NaN — used on the epochs between diagnostic
+    # runs so every history column has one entry per epoch.
+    jvp_diag_nan = {key: float("nan") for key in jvp_diag_keys()}
 
     print(f"[kot] Training {n_epochs} epochs | n={n} | D_r={D_r} | D_p={D_p} | device={device}")
 
@@ -1217,14 +1596,20 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         print(f"[kot]   anchor disabled (λ_prior={lambda_prior})")
     print(f"[kot] initial β: {initial_beta}")
 
+    # History columns are derived from the diagnostic helpers rather than listed by hand,
+    # so adding a statistic in one place cannot leave the CSV missing a column.
+    history_beta_keys = [f"beta_{stat}" for stat in STAT_SUFFIXES]
+    history_diag_keys = jvp_diag_keys()
+    history_grad_keys = [
+        "grad_align_norm", "grad_dyn_norm", "grad_dyn_norm_scaled",
+        "grad_mag_ratio", "grad_mag_ratio_std", "grad_cos_mean", "grad_cos_std",
+    ]
     loss_history = {
-        "epoch": [], "align": [], "dyn": [], "anchor": [], "kappa_prior": [], "reg": [], "total": [],
-        "beta_mean": [], "beta_std": [],
-        "kappa_mean": [], "kappa_std": [], "kappa_min": [], "kappa_max": [],
-        "alpha_mean": [], "alpha_std": [], "alpha_min": [], "alpha_max": [],
-        "jvp_rhs_cos": [], "jvp_norm": [], "rhs_norm": [],
-        "grad_align_norm": [], "grad_dyn_norm": [], "grad_cos_mean": [], "grad_cos_std": [],
+        "epoch": [], "align": [], "dyn": [], "anchor": [], "kappa_prior": [], "reg": [],
+        "total": [], "lambda_dyn_eff": [],
     }
+    for key in history_beta_keys + history_diag_keys + history_grad_keys:
+        loss_history[key] = []
 
     best_align = float("inf")
     best_align_epoch = 0
@@ -1383,8 +1768,11 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                   f"(batch_size={batch_size}, n={n})")
 
         beta_detached = model.beta.detach()
-        beta_mean_val = float(beta_detached.mean().cpu())
-        beta_std_val  = float(beta_detached.std(unbiased=False).cpu())
+        # β is a (D_p,) parameter, so the full distribution costs nothing to summarise and
+        # is logged every epoch — unlike the JVP block, which only runs periodically.
+        beta_stats = summarize_distribution(beta_detached.cpu().numpy(), "beta")
+        beta_mean_val = beta_stats["beta_mean"]
+        beta_std_val  = beta_stats["beta_std"]
 
         # Periodic JVP-based diagnostics: every 50 epochs (and epoch 1) on a 512-cell subset.
         if epoch % 50 == 0 or epoch == 1:
@@ -1401,21 +1789,24 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                     model, probe_batches, R_t, V_eff_t, SR_t, P_t, conf_t,
                     blur, sinkhorn_backend, mask=mask_t, scale=protein_scale,
                     align_cols=align_cols,
+                    # The λ actually in force this epoch, so the scaled norm and the
+                    # magnitude ratio describe the real update, not the configured weight.
+                    lambda_dyn=lam_dyn_eff,
                 )
-                for b, (na, nd, c) in enumerate(zip(
-                        gi["grad_align_norms"], gi["grad_dyn_norms"], gi["grad_cosines"])):
+                for b, (na, nd, nds, ratio, c) in enumerate(zip(
+                        gi["grad_align_norms"], gi["grad_dyn_norms"],
+                        gi["grad_dyn_norms_scaled"], gi["grad_mag_ratios"],
+                        gi["grad_cosines"])):
                     grad_interaction_rows.append({
                         "epoch": epoch, "batch": b,
-                        "grad_align_norm": na, "grad_dyn_norm": nd, "grad_cos": c,
+                        "grad_align_norm": na, "grad_dyn_norm": nd,
+                        "grad_dyn_norm_scaled": nds, "grad_mag_ratio": ratio,
+                        "lambda_dyn_eff": float(lam_dyn_eff), "grad_cos": c,
                     })
             else:
                 gi = grad_diag_nan
         else:
-            diag = {"jvp_rhs_cos": np.nan, "jvp_norm": np.nan, "rhs_norm": np.nan,
-                    "kappa_mean": np.nan, "kappa_std": np.nan,
-                    "kappa_min": np.nan, "kappa_max": np.nan,
-                    "alpha_mean": np.nan, "alpha_std": np.nan,
-                    "alpha_min": np.nan, "alpha_max": np.nan}
+            diag = dict(jvp_diag_nan)
             gi = grad_diag_nan
 
         loss_history["epoch"].append(epoch)
@@ -1425,23 +1816,13 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         loss_history["kappa_prior"].append(kappa_prior_val)
         loss_history["reg"].append(reg_val)
         loss_history["total"].append(total_val)
-        loss_history["beta_mean"].append(beta_mean_val)
-        loss_history["beta_std"].append(beta_std_val)
-        loss_history["kappa_mean"].append(diag["kappa_mean"])
-        loss_history["kappa_std"].append(diag["kappa_std"])
-        loss_history["kappa_min"].append(diag["kappa_min"])
-        loss_history["kappa_max"].append(diag["kappa_max"])
-        loss_history["alpha_mean"].append(diag["alpha_mean"])
-        loss_history["alpha_std"].append(diag["alpha_std"])
-        loss_history["alpha_min"].append(diag["alpha_min"])
-        loss_history["alpha_max"].append(diag["alpha_max"])
-        loss_history["jvp_rhs_cos"].append(diag["jvp_rhs_cos"])
-        loss_history["jvp_norm"].append(diag["jvp_norm"])
-        loss_history["rhs_norm"].append(diag["rhs_norm"])
-        loss_history["grad_align_norm"].append(gi["grad_align_norm"])
-        loss_history["grad_dyn_norm"].append(gi["grad_dyn_norm"])
-        loss_history["grad_cos_mean"].append(gi["grad_cos_mean"])
-        loss_history["grad_cos_std"].append(gi["grad_cos_std"])
+        loss_history["lambda_dyn_eff"].append(float(lam_dyn_eff))
+        for key in history_beta_keys:
+            loss_history[key].append(beta_stats[key])
+        for key in history_diag_keys:
+            loss_history[key].append(diag[key])
+        for key in history_grad_keys:
+            loss_history[key].append(gi[key])
 
         if epoch % 50 == 0 or epoch == 1:
             print(f"[kot] epoch {epoch:4d}  align={align_val:.6f}  "
@@ -1455,9 +1836,22 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                   f"[{diag['alpha_min']:.3f},{diag['alpha_max']:.3f}]  "
                   f"cos={diag['jvp_rhs_cos']:.3f}  total={total_val:.6f}  "
                   f"[{time.perf_counter() - train_start:.0f}s, {epoch / (time.perf_counter() - train_start):.1f} ep/s]")
+            # Medians and the IQR say whether the means above describe the typical cell or
+            # are being dragged by a tail — the reason these distributions are logged at all.
+            print(f"[kot]   physics (median [q25,q75]): "
+                  f"cos={diag['jvp_rhs_cos_median']:+.3f} "
+                  f"[{diag['jvp_rhs_cos_q25']:+.3f},{diag['jvp_rhs_cos_q75']:+.3f}]  "
+                  f"|JVP|={diag['jvp_norm_median']:.3e}  |RHS|={diag['rhs_norm_median']:.3e}  "
+                  f"ratio={diag['norm_ratio_median']:.3f} "
+                  f"[{diag['norm_ratio_q25']:.3f},{diag['norm_ratio_q75']:.3f}]  "
+                  f"logratio={diag['log_norm_ratio_median']:+.3f}  "
+                  f"relres={diag['rel_residual_median']:.3f} "
+                  f"[{diag['rel_residual_q25']:.3f},{diag['rel_residual_q75']:.3f}]")
             if grad_diag_on:
                 print(f"[kot]   grad-interaction: ||∇align||={gi['grad_align_norm']:.3e}  "
                       f"||∇dyn||={gi['grad_dyn_norm']:.3e}  "
+                      f"λ||∇dyn||={gi['grad_dyn_norm_scaled']:.3e}  "
+                      f"ratio={gi['grad_mag_ratio']:.3e}±{gi['grad_mag_ratio_std']:.1e}  "
                       f"cos(∇align,∇dyn)={gi['grad_cos_mean']:+.3f}±{gi['grad_cos_std']:.3f}")
 
         # Track minima for all three checkpoints.
@@ -1562,6 +1956,11 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # the per-checkpoint loop reuses them for best_align — the model is on the same restored
     # best_align state, so recomputing the JVP + NN match there is pure waste.
     best_align_full = dict(diagnostics)
+    # Velocity-input stats (‖v_eff‖ distribution, non-zero fraction, cross-backend cosine).
+    # compute_full_diagnostics already fills the ‖v_eff‖ half from the tensor it is given;
+    # this adds the backend comparison, which needs the AnnData and so lives out here.
+    diagnostics.update(velocity_diag)
+    best_align_full.update(velocity_diag)
     diagnostics["anchor_loss_final"] = float(loss_anchor_final.item())
     diagnostics["beta_anchor_prior"] = beta_anchor_prior if use_anchor else None
     diagnostics["beta_anchor_aggregate"] = beta_anchor_aggregate if use_anchor else None
@@ -1638,6 +2037,32 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     print(f"[kot]   φ variance ratio:    {diagnostics['phi_variance_ratio']:.4f}")
     print(f"[kot]   JVP·RHS cos:         {diagnostics['jvp_rhs_cos']:.4f}")
     print(f"[kot]   |JVP| / |RHS|:       {diagnostics['jvp_norm']:.4f} / {diagnostics['rhs_norm']:.4f}")
+
+    def _dist(label: str, prefix: str, fmt: str = "+.4f") -> None:
+        """One line per distribution: mean, median and the q05..q95 ladder."""
+        print(
+            f"[kot]   {label:<20s} mean={diagnostics[f'{prefix}_mean']:{fmt}}  "
+            f"med={diagnostics[f'{prefix}_median']:{fmt}}  "
+            f"q05={diagnostics[f'{prefix}_q05']:{fmt}}  q25={diagnostics[f'{prefix}_q25']:{fmt}}  "
+            f"q75={diagnostics[f'{prefix}_q75']:{fmt}}  q95={diagnostics[f'{prefix}_q95']:{fmt}}"
+        )
+
+    print("[kot]   per-cell distributions (across cells):")
+    _dist("JVP·RHS cos", "jvp_rhs_cos")
+    _dist("|JVP|", "jvp_norm", ".4g")
+    _dist("|RHS|", "rhs_norm", ".4g")
+    _dist("|JVP|/|RHS|", "norm_ratio", ".4g")
+    _dist("log |JVP|/|RHS|", "log_norm_ratio")
+    _dist("rel. residual", "rel_residual", ".4f")
+    _dist("|v_eff|", "v_eff_norm", ".4g")
+    print(f"[kot]   v_eff nonzero cells:  "
+          f"{diagnostics['v_eff_nonzero_frac'] * 100:.1f}% of {diagnostics['v_eff_n_cells']}")
+    if diagnostics.get("velocity_backend_status") == "ok":
+        _dist("cos(v, other backend)", "velocity_backend_cos")
+    print("[kot]   parameter distributions:")
+    _dist("κ", "kappa", ".4g")
+    _dist("α", "alpha", ".4g")
+    _dist("β", "beta", ".4g")
     print(f"[kot]   κ mean/std [min,max]: {diagnostics['kappa_mean']:.4f} / {diagnostics['kappa_std']:.4f}  "
           f"[{diagnostics['kappa_min']:.4f}, {diagnostics['kappa_max']:.4f}]")
     print(f"[kot]   α mean/std [min,max]: {diagnostics['alpha_mean']:.4f} / {diagnostics['alpha_std']:.4f}  "
@@ -1724,6 +2149,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             )
             if name == "best_align":
                 best_align_per_cell = pc
+            d.update(velocity_diag)
             mean_f = float(np.mean(pc["foscttm"]))
             d["mean_foscttm"]      = mean_f
             d["checkpoint"]        = name
@@ -1734,7 +2160,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             pd.DataFrame({"foscttm": pc["foscttm"]}).to_csv(
                 out / f"foscttm_{name}.csv", index=False,
             )
-            per_ckpt_rows.append({
+            row = {
                 "checkpoint":         name,
                 "epoch":              ep,
                 "mean_foscttm":       mean_f,
@@ -1746,22 +2172,27 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 "jvp_rhs_cos":        d["jvp_rhs_cos"],
                 "jvp_norm":           d["jvp_norm"],
                 "rhs_norm":           d["rhs_norm"],
-                "kappa_mean":         d["kappa_mean"],
-                "kappa_std":          d["kappa_std"],
-                "kappa_min":          d["kappa_min"],
-                "kappa_max":          d["kappa_max"],
-                "alpha_mean":         d["alpha_mean"],
-                "alpha_std":          d["alpha_std"],
-                "alpha_min":          d["alpha_min"],
-                "alpha_max":          d["alpha_max"],
-                "beta_mean":          d["beta_mean"],
-                "beta_std":           d["beta_std"],
-            })
+            }
+            # Every per-cell / per-protein distribution, flattened into the summary CSV so a
+            # box plot across checkpoints, seeds or datasets needs nothing but this file.
+            for prefix in JVP_DIAG_PREFIXES + PARAM_DIAG_PREFIXES + ("beta", "v_eff_norm"):
+                for stat in STAT_SUFFIXES:
+                    row[f"{prefix}_{stat}"] = d[f"{prefix}_{stat}"]
+            row["v_eff_nonzero_frac"] = d["v_eff_nonzero_frac"]
+            row["velocity_backend_cos_mean"]   = d["velocity_backend_cos_mean"]
+            row["velocity_backend_cos_median"] = d["velocity_backend_cos_median"]
+            row["velocity_backend_cos_q25"]    = d["velocity_backend_cos_q25"]
+            row["velocity_backend_cos_q75"]    = d["velocity_backend_cos_q75"]
+            per_ckpt_rows.append(row)
             print(f"[kot] Eval {name}: FOSCTTM={mean_f:.4f}  "
-                  f"cos={d['jvp_rhs_cos']:+.3f}  "
-                  f"κ={d['kappa_mean']:.3f} [{d['kappa_min']:.3f},{d['kappa_max']:.3f}]  "
-                  f"α={d['alpha_mean']:.3f} [{d['alpha_min']:.3f},{d['alpha_max']:.3f}]  "
-                  f"β={d['beta_mean']:.3f}")
+                  f"cos={d['jvp_rhs_cos']:+.3f} (med {d['jvp_rhs_cos_median']:+.3f})  "
+                  f"ratio med={d['norm_ratio_median']:.3f}  "
+                  f"relres med={d['rel_residual_median']:.3f}  "
+                  f"κ={d['kappa_mean']:.3f} (med {d['kappa_median']:.3f}) "
+                  f"[{d['kappa_min']:.3f},{d['kappa_max']:.3f}]  "
+                  f"α={d['alpha_mean']:.3f} (med {d['alpha_median']:.3f}) "
+                  f"[{d['alpha_min']:.3f},{d['alpha_max']:.3f}]  "
+                  f"β={d['beta_mean']:.3f} (med {d['beta_median']:.3f})")
         if per_ckpt_rows:
             pd.DataFrame(per_ckpt_rows).to_csv(
                 out / "checkpoint_eval_summary.csv", index=False,

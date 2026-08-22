@@ -7,6 +7,8 @@ logs/
 Datasets/
 /data/
 analysis/
+results/
+.ncbi/
 
 # 文档与脚本（本地 / HPC）
 assistant.py

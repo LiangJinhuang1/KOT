@@ -76,7 +76,7 @@ MODELS = {
     "kot_oracle_learnalpha_kappa": run_kot,
     "kot_unbounded":    run_kot,
     "kot_unbounded_sn": run_kot,
-    "kot_anchor":     run_kot,
+    "kot_noanchor":   run_kot,
 }
 
 # Per-model config overrides injected automatically at runtime
@@ -176,25 +176,64 @@ MODEL_OVERRIDES = {
         "phi_spectral_norm": True,
         "g_dims": [256, 128],
     },
-    "kot_anchor":      {"use_anchor": True},
+    # `kot` already runs WITH beta-anchors (use_anchor: true in defaults and in
+    # every dataset block), so an arm that only sets use_anchor=True is a no-op and
+    # produces bit-identical results — verified across 210 paired runs. The real
+    # ablation is the arm that turns anchors OFF.
+    "kot_noanchor": {
+        "use_anchor": False,
+        "kot_anchor_indices": [],
+        "kot_anchor_betas": [],
+        "beta_anchor_csv": None,
+        "lambda_prior": 0.0,
+    },
 }
+
+# Arms that were removed because their overrides changed nothing. Kept here so a
+# stale --models list fails with an explanation instead of silently duplicating.
+RETIRED_MODELS = {
+    "kot_anchor": (
+        "kot_anchor applied {'use_anchor': True}, which is already the default, so "
+        "it produced results bit-identical to `kot` in 210/210 paired runs. Use "
+        "`kot` for the anchored arm and `kot_noanchor` for the anchor-free ablation."
+    ),
+}
+
+
+def assert_override_is_effective(model_name: str, resolved: dict, overrides: dict) -> None:
+    """Fail loudly when a model's overrides do not change the resolved config.
+
+    A no-op override silently yields a duplicate arm. Two identical rows in an
+    ablation table read as fabricated data even when they are not, so this is
+    caught at launch rather than at review time.
+    """
+    if not overrides:
+        return
+    changed = {k: v for k, v in overrides.items() if resolved.get(k) != v}
+    if not changed:
+        raise ValueError(
+            f"Model '{model_name}' declares overrides {sorted(overrides)} but none of "
+            f"them differ from the resolved config, so this arm is a duplicate of the "
+            f"base model. Either give it a real override or remove it from --models."
+        )
 
 # Name of the staged synthetic dataset that --stage / --scale apply to.
 STAGED_DATASET = "synthetic_linked_ode"
 
-# KOT feature layers per observation scale.
-#   mean = native ODE state (linear ODE holds exactly → true oracle)
-#   log  = log1p-normalized (realistic; linear ODE only approximate)
+# KOT feature layers for the staged synthetic dataset.
+#
+# Only `mean` is supported: it is the native state the linked ODE is generated
+# in, so the kinetics term is correctly specified there. A log1p scale was
+# removed rather than left as an option — under log1p the ODE picks up a
+# 1/(1+p) factor the kinetics loss does not model, so its residual can never
+# reach zero by being correct and the only route downhill is shrinking phi.
+# Every log run collapsed (phi variance ratio ~0.20 against ~0.81 on mean) and
+# landed at chance.
 SCALE_LAYERS = {
     "mean": {
         "kot_rna_layer":     "spliced_mean",
         "kot_protein_layer": "protein_mean",
         "velocity_layer":    "true_velocity_mean",
-    },
-    "log": {
-        "kot_rna_layer":     "spliced_log1p",
-        "kot_protein_layer": "protein_log1p",
-        "velocity_layer":    "true_velocity_log1p",
     },
 }
 
@@ -381,6 +420,8 @@ def coembedding_input_matrices(x, y, rna_adata, second_adata, cfg):
 
 def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
     model_name = str(run_cfg.get("model", "scot"))
+    if model_name in RETIRED_MODELS:
+        raise ValueError(f"Model '{model_name}' was retired. {RETIRED_MODELS[model_name]}")
     if model_name not in MODELS:
         raise ValueError(f"Unknown model '{model_name}'. Available: {list(MODELS)}")
 
@@ -690,13 +731,15 @@ def run_training(
             for seed in seeds:
                 # Order: dataset defaults → --set → per-model overrides (kot_nodyn
                 # still forces lambda_dyn=0 even if --set lambda_dyn=N).
-                run_cfg = {
+                pre_override = {
                     **base_cfg,
                     **cli_overrides,
                     "model": model_name,
                     "seed": seed,
-                    **MODEL_OVERRIDES.get(model_name, {}),
                 }
+                model_overrides = MODEL_OVERRIDES.get(model_name, {})
+                assert_override_is_effective(model_name, pre_override, model_overrides)
+                run_cfg = {**pre_override, **model_overrides}
                 if use_run_seed:
                     run_cfg["run_seed"] = seed
                 run_one(name, dataset, run_cfg)
@@ -755,8 +798,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", choices=["oracle", "clean", "branch"], default=None,
                         help="Staged synthetic: overrides data path, feature layers, "
                              "anchor indices, and the preprocessing cache version.")
-    parser.add_argument("--scale", choices=["mean", "log"], default=None,
-                        help="KOT feature scale: mean (ODE-exact) or log (log1p, realistic).")
+    parser.add_argument("--scale", choices=sorted(SCALE_LAYERS), default=None,
+                        help="KOT feature scale for the staged synthetic dataset. Only "
+                             "'mean' is supported: it is the space the linked ODE is "
+                             "generated in, so the kinetics term is correctly specified.")
     parser.add_argument("--models", type=str, default=None,
                         help="Models to run: a group name from the config's model_groups "
                              "(e.g. baselines, kot, all) or a comma-separated list of model "

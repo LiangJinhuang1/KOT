@@ -1,9 +1,17 @@
+"""Input-modality overview figure for the synthetic datasets."""
+
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
 from sklearn.decomposition import PCA
 
-from src.visualization import STATE_COLORS
+from src.visualization import state_color_map, state_label
+from src.visualization.style import (
+    apply_style, embedding_axes, figsize, panel_letter, save_figure,
+)
+
+_PT = dict(s=1.6, alpha=0.55, linewidths=0, rasterized=True)
 
 
 def get_2d_embedding(adata):
@@ -15,39 +23,50 @@ def get_2d_embedding(adata):
     return xy, "PC"
 
 
-def plot_modalities(rna_adata, protein_adata, save_dir):
+def plot_modalities(rna_adata, protein_adata, save_dir, *, second_label="Protein"):
+    """Both modalities carry the same branching structure and the same time ordering.
+
+    Row 1 establishes the state structure, row 2 the temporal ordering; the two
+    columns are the two modalities. Panels within a row share a colour system.
+    """
+    apply_style()
     save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(2, 2, figsize=(8, 7))
+    fig, axes = plt.subplots(2, 2, figsize=figsize("full", 4.4))
+    letters = [["a", "b"], ["c", "d"]]
+    scatter_for_bar = None
 
-    for col, (adata, label) in enumerate([(rna_adata, "RNA"), (protein_adata, "Protein")]):
-        xy, coord_label = get_2d_embedding(adata)
+    for col, (adata, label) in enumerate([(rna_adata, "RNA"), (protein_adata, second_label)]):
+        xy, coord = get_2d_embedding(adata)
         states = adata.obs["state"].values
         times = adata.obs["time"].values
 
         ax = axes[0, col]
-        for state, color in STATE_COLORS.items():
+        colors = state_color_map(states)
+        for state, color in colors.items():
             mask = states == state
-            ax.scatter(xy[mask, 0], xy[mask, 1], c=color, s=3, alpha=0.7,
-                       label=state, rasterized=True)
-        ax.set_title(f"{label} — Cell State")
-        ax.set_xlabel(f"{coord_label} 1")
-        ax.set_ylabel(f"{coord_label} 2")
+            ax.scatter(xy[mask, 0], xy[mask, 1], c=color, label=state_label(state), **_PT)
+        ax.set_title(f"{label} — cell state")
         if col == 0:
-            ax.legend(markerscale=2, frameon=False, fontsize=8)
+            ax.legend(markerscale=4, loc="best")
+        embedding_axes(ax, f"{coord} 1", f"{coord} 2")
+        panel_letter(ax, letters[0][col])
 
         ax = axes[1, col]
-        sc = ax.scatter(xy[:, 0], xy[:, 1], c=times, cmap="viridis",
-                        s=3, alpha=0.7, rasterized=True)
-        plt.colorbar(sc, ax=ax, label="Pseudotime")
-        ax.set_title(f"{label} — Pseudotime")
-        ax.set_xlabel(f"{coord_label} 1")
-        ax.set_ylabel(f"{coord_label} 2")
+        scatter_for_bar = ax.scatter(xy[:, 0], xy[:, 1], c=times, cmap="viridis", **_PT)
+        ax.set_title(f"{label} — pseudotime")
+        embedding_axes(ax, f"{coord} 1", f"{coord} 2")
+        panel_letter(ax, letters[1][col])
 
-    fig.suptitle("Synthetic Data: Input Modalities", fontsize=12, fontweight="bold")
-    plt.tight_layout()
-    path = save_dir / "input_modalities.png"
-    fig.savefig(path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {path}")
+    # One shared colourbar for the row rather than one per panel (§3.4).
+    if scatter_for_bar is not None:
+        cb = fig.colorbar(scatter_for_bar, ax=axes[1, :].tolist(),
+                          fraction=0.025, pad=0.015)
+        cb.set_label("Pseudotime")
+        cb.outline.set_visible(False)
+
+    n = len(rna_adata)
+    fig.text(0.5, -0.005, f"Synthetic linked-ODE data · n = {n:,} cells per modality",
+             ha="center", va="top", fontsize=6, color="0.35")
+
+    return save_figure(fig, save_dir / "input_modalities")

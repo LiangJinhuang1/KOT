@@ -53,7 +53,9 @@ from src.models.KOT import KOTModel
 from src.training.kot import (
     FixedAlpha,
     FixedKappa,
+    build_effective_velocity,
     build_velocity_weight,
+    compute_velocity_backend_agreement,
     compute_full_diagnostics,
     compute_per_cell_diagnostics,
     matrix_from_adata,
@@ -416,11 +418,18 @@ def build_model_and_tensors(
 
     R_t = to_tensor(x, device)
     P_t = to_tensor(y, device)
-    V_t = to_tensor(V, device)
     S_t = to_tensor(S_model, device)
     mask_t = to_tensor(kin_mask_np, device) if kin_mask_np is not None else None
+    # Effective velocity, built the same way run_kot builds it (RNA-side weight, then gauge
+    # normalisation). The diagnostics take this single vector — re-evaluating a checkpoint
+    # on a raw or differently-scaled velocity would report physics numbers that do not match
+    # the run that produced the checkpoint.
     velocity_weight_np = build_velocity_weight(rna_adata, S_np, run_cfg, use_feature_space)
-    velocity_weight_t = to_tensor(velocity_weight_np, device) if velocity_weight_np is not None else None
+    V_eff_t = to_tensor(build_effective_velocity(V, velocity_weight_np, run_cfg), device)
+    # This tool overwrites each run's diagnostics_<ckpt>.json, so it has to reproduce the
+    # cross-backend velocity cosine too — otherwise re-evaluating a run silently strips it.
+    # Checkpoint-independent (the velocity is fixed input), so it is computed once here.
+    velocity_backend = compute_velocity_backend_agreement(rna_adata, V, run_cfg)
 
     phi_dims        = list(run_cfg.get("phi_dims", [1024, 512, 256]))
     kappa_dims      = list(run_cfg.get("kappa_dims", [64, 32]))
@@ -461,7 +470,7 @@ def build_model_and_tensors(
     if fixed_beta_value is not None:
         set_fixed_beta(model, fixed_beta_value, D_p, device)
 
-    return model, R_t, V_t, P_t, S_t, rna_adata.obs, mask_t, align_cols, velocity_weight_t
+    return model, R_t, V_eff_t, P_t, S_t, rna_adata.obs, mask_t, align_cols, velocity_backend
 
 
 # ---------------------------------------------------------------------------
@@ -472,13 +481,13 @@ def evaluate_one_checkpoint(
     model,
     ckpt_path: Path,
     R_t,
-    V_t,
+    V_eff_t,
     P_t,
     S_t,
     rna_obs,
     mask_t=None,
     align_cols=None,
-    velocity_weight_t=None,
+    velocity_backend=None,
 ):
     """Load checkpoint into model, recompute diagnostics + per-cell arrays."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -491,26 +500,27 @@ def evaluate_one_checkpoint(
     diagnostics = compute_full_diagnostics(
         model,
         R_t,
-        V_t,
-        P_t,
-        S_t,
-        rna_obs,
-        mask=mask_t,
-        velocity_weight=velocity_weight_t,
-    )
-    per_cell = compute_per_cell_diagnostics(
-        model,
-        R_t,
-        V_t,
+        V_eff_t,
         P_t,
         S_t,
         rna_obs,
         mask=mask_t,
         align_cols=align_cols,
-        velocity_weight=velocity_weight_t,
+    )
+    per_cell = compute_per_cell_diagnostics(
+        model,
+        R_t,
+        V_eff_t,
+        P_t,
+        S_t,
+        rna_obs,
+        mask=mask_t,
+        align_cols=align_cols,
     )
     mean_foscttm = float(np.mean(per_cell["foscttm"]))
 
+    if velocity_backend:
+        diagnostics.update(velocity_backend)
     diagnostics["checkpoint_epoch"]  = int(ckpt["epoch"])
     diagnostics["checkpoint_losses"] = ckpt.get("losses", {})
     diagnostics["mean_foscttm"]      = mean_foscttm
@@ -538,7 +548,8 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
                 data_cache[dataset_name] = load_dataset_for_run(run_folder, dataset_name)
             rna_adata, protein_adata, run_cfg, _ = data_cache[dataset_name]
 
-            model, R_t, V_t, P_t, S_t, rna_obs, mask_t, align_cols, velocity_weight_t = build_model_and_tensors(
+            (model, R_t, V_eff_t, P_t, S_t, rna_obs, mask_t, align_cols,
+             velocity_backend) = build_model_and_tensors(
                 run_cfg, rna_adata, protein_adata, model_name, device,
             )
 
@@ -557,13 +568,13 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
                         model,
                         ckpt_path,
                         R_t,
-                        V_t,
+                        V_eff_t,
                         P_t,
                         S_t,
                         rna_obs,
                         mask_t,
                         align_cols,
-                        velocity_weight_t,
+                        velocity_backend,
                     )
 
                     # Per-checkpoint artifacts

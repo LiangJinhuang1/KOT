@@ -21,7 +21,7 @@ model_groups:
   upperbound:   [totalvi]          # paired-latent totalVI — performance ceiling
   convex:       [linear_ode]       # convex ODE baseline
   kot_main:     [kot]              # single KOT model; avoids name clash with group `kot`
-  kot:          [kot, kot_anchor, kot_nodyn]
+  kot:          [kot, kot_noanchor, kot_nodyn]
   kot_ablation: [kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle]
   kot_oracles:  [kot_oracle, kot_oracle_learnalpha, kot_oracle_learnalpha_kappa]
   all:          [kot, kot_nodyn, moscot, scot, linear_ode, uniport, glue, totalvi]
@@ -45,7 +45,7 @@ defaults:
   # Stochastic models that should run across every seed. Deterministic baselines
   # (scot, moscot, linear_ode) are intentionally absent — they run once.
   seeded_models:
-    [kot, kot_anchor, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle,
+    [kot, kot_noanchor, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle,
      kot_oracle_learnalpha, kot_oracle_learnalpha_kappa,
      uniport, glue, totalvi]
 
@@ -150,7 +150,16 @@ defaults:
   kot_velocity_rna_reliability: false     # zero velocity of non-velocity_gene RNA coords before the JVP
   kot_velocity_s_linked_only: false       # JVP uses only S-linked (panel-coding) genes' velocity; fair scVelo-vs-RegVelo control
   kot_velocity_gauge_normalize: true      # rescale velocity to unit RMS per-cell norm (κ is bounded → compare direction not magnitude)
-  kot_grad_interaction_diag: false        # every 50 epochs, on fixed probe batches, log ||∇L_align||, ||∇L_dyn|| on φ + their cosine (gradient conflict). writes grad_interaction.csv
+  # Diagnostic only (never touches the loss): a second backend's velocity h5ad to compare
+  # this run's velocity field against, per cell. scVelo and RegVelo live in separate files
+  # (datasets.yaml swaps rna_path), so without this there is no way to tell how much of a
+  # FOSCTTM gap between the two ablations comes from the velocity input rather than KOT.
+  # Reported as velocity_backend_cos_* (mean/median/quantiles) in diagnostics.json.
+  # Set per dataset — each dataset must point at ITS OWN counterpart file.
+  kot_velocity_compare_h5ad: null
+  kot_velocity_compare_layer: velocity
+  kot_velocity_compare_label: null
+  kot_grad_interaction_diag: true         # every 50 epochs, on fixed probe batches, log ||∇L_align||, ||∇L_dyn|| and λ_dyn·||∇L_dyn|| on φ, their magnitude ratio + cosine (gradient conflict). writes grad_interaction.csv/.png
   kot_grad_interaction_batches: 4         # number of fixed probe batches for the gradient-interaction diagnostic
   kot_require_full_panel_mapping: true    # hard error if the mapping CSV misses any panel protein
   kot_allow_empty_kinetic_mask: false     # explicit opt-in for alignment-only panels with no usable RNA gene links
@@ -248,7 +257,7 @@ datasets:
     kot_alpha_max: 3.0             # keep α bounded (null / unbounded hurt PBMC: 0.50±0.18 vs 0.27)
     sinkhorn_max_points: 8192      # ~90k cells: minibatch the align Sinkhorn (full n×n OOMs)
     align_batch_key: batch         # OT baselines (scot/moscot/linear_ode) run per biological batch
-    seeds: [42, 123, 2026]
+    seeds: [42, 123, 2026, 6, 9]
 
   pbmc:
     modality_pair: rna_protein
@@ -265,7 +274,7 @@ datasets:
     kot_kinetics_require_velocity_gene: true
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0             # same bound as successful PBMC run_20260715_190847
-    seeds: [42, 123, 2026]
+    seeds: [42, 123, 2026, 6, 9]
 
   # #3 variants: same config, but read the ADT-gene-retained velocity file so S
   # coverage jumps (PBMC 17→29, BMMC 51→115). Same mapping CSV — present-in-RNA
@@ -275,6 +284,9 @@ datasets:
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
+    # Diagnostic: per-cell cosine against the other velocity backend's field.
+    kot_velocity_compare_h5ad: cache/velocity/pbmc/pbmc_regvelo_results_retained.h5ad
+    kot_velocity_compare_label: regvelo
     kot_protein_layer: null
     kot_use_explicit_links: true
     adt_mapping_csv: cache/results/mapping/adt_mapping_pbmc_retained.csv   # built against the retained matrix
@@ -304,7 +316,7 @@ datasets:
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0
-    seeds: [42, 123, 2026]
+    seeds: [42, 123, 2026, 6, 9]
 
   # Velocity-provider ablation: identical KOT config to pbmc_retained, but the
   # dataset's rna_path (in datasets.yaml) points at the RegVelo velocity h5ad.
@@ -313,6 +325,9 @@ datasets:
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
+    # Diagnostic: per-cell cosine against the other velocity backend's field.
+    kot_velocity_compare_h5ad: cache/velocity/pbmc/pbmc_scvelo_results_retained.h5ad
+    kot_velocity_compare_label: scvelo
     kot_protein_layer: null
     kot_use_explicit_links: true
     adt_mapping_csv: cache/results/mapping/adt_mapping_pbmc_retained.csv
@@ -330,13 +345,16 @@ datasets:
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0
-    seeds: [42, 123, 2026]
+    seeds: [42, 123, 2026, 6, 9]
 
   bmmc_cite_retained:
     modality_pair: rna_protein
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
+    # Diagnostic: per-cell cosine against the other velocity backend's field.
+    kot_velocity_compare_h5ad: cache/velocity/bmmc_cite/bmmc_cite_regvelo_results_retained.h5ad
+    kot_velocity_compare_label: regvelo
     kot_protein_layer: null
     kot_use_explicit_links: true
     adt_mapping_csv: cache/results/mapping/adt_mapping_bmmc_cite_retained.csv   # built against the retained matrix
@@ -363,7 +381,7 @@ datasets:
     kot_alpha_max: 3.0
     sinkhorn_max_points: 8192
     align_batch_key: batch
-    seeds: [42, 123, 2026]
+    seeds: [42, 123, 2026, 6, 9]
 
   # Velocity-provider ablation: identical KOT config to bmmc_cite_retained, but the
   # dataset's rna_path (in datasets.yaml) points at the RegVelo velocity h5ad.
@@ -372,6 +390,9 @@ datasets:
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
+    # Diagnostic: per-cell cosine against the other velocity backend's field.
+    kot_velocity_compare_h5ad: cache/velocity/bmmc_cite/bmmc_cite_scvelo_results_retained.h5ad
+    kot_velocity_compare_label: scvelo
     kot_protein_layer: null
     kot_use_explicit_links: true
     adt_mapping_csv: cache/results/mapping/adt_mapping_bmmc_cite_retained.csv
@@ -391,7 +412,7 @@ datasets:
     kot_alpha_max: 3.0
     sinkhorn_max_points: 8192
     align_batch_key: batch
-    seeds: [42, 123, 2026]
+    seeds: [42, 123, 2026, 6, 9]
 
   # Papalexi ECCITE-seq (GSE153056). Only a 4-marker checkpoint ADT panel (CD86,
   # PD-L1, PD-L2, TIM3), so the alignment metric is inherently noisy — this is a
@@ -403,6 +424,9 @@ datasets:
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
+    # Diagnostic: per-cell cosine against the other velocity backend's field.
+    kot_velocity_compare_h5ad: cache/velocity/papalexi/papalexi_regvelo_results_retained.h5ad
+    kot_velocity_compare_label: regvelo
     kot_protein_layer: null
     kot_use_explicit_links: true
     adt_mapping_csv: cache/results/mapping/adt_mapping_papalexi.csv
@@ -416,7 +440,7 @@ datasets:
     kot_alpha_max: 3.0
     kot_velocity_gauge_normalize: false
     sinkhorn_max_points: 8192            # ~20k cells: minibatch the align Sinkhorn
-    seeds: [42, 123, 2026]
+    seeds: [42, 123, 2026, 6, 9]
 
   # Velocity-provider ablation: identical KOT config to papalexi_retained, but the
   # dataset's rna_path (datasets.yaml) points at the RegVelo velocity h5ad.
@@ -426,6 +450,9 @@ datasets:
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
+    # Diagnostic: per-cell cosine against the other velocity backend's field.
+    kot_velocity_compare_h5ad: cache/velocity/papalexi/papalexi_scvelo_results_retained.h5ad
+    kot_velocity_compare_label: scvelo
     kot_protein_layer: null
     kot_use_explicit_links: true
     adt_mapping_csv: cache/results/mapping/adt_mapping_papalexi.csv
@@ -439,4 +466,4 @@ datasets:
     kot_alpha_max: 3.0
     kot_velocity_gauge_normalize: false
     sinkhorn_max_points: 8192
-    seeds: [42, 123, 2026]
+    seeds: [42, 123, 2026, 6, 9]

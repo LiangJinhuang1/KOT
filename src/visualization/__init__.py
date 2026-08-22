@@ -1,17 +1,113 @@
+"""Shared colour vocabulary for every figure in the project.
+
+Three independent palettes, each bound to one kind of entity. A colour never
+means two things: cell state, modality, and method are separate systems, so a
+reader who learns one mapping in Fig. 1 can carry it through the whole paper.
+
+All three are drawn from the Okabe-Ito colourblind-safe set or from published
+CVD-safe pairs. There is deliberately no red/green opposition anywhere.
+"""
+
 import numpy as np
 
+# --- Cell state (Okabe-Ito) ------------------------------------------------
+# Blue vs vermillion is the canonical CVD-safe opposition; the previous
+# Branch_B red / Trunk green pair was a deuteranopia failure.
 STATE_COLORS = {
-    "Progenitor": "#7f7f7f",
-    "Branch_A": "#1f77b4",
-    "Branch_B": "#d62728",
-    "Trunk": "#2ca02c",
+    "Progenitor": "#767676",   # neutral grey — the root, not a branch
+    "Branch_A":   "#0072B2",   # blue
+    "Branch_B":   "#D55E00",   # vermillion
+    "Trunk":      "#009E73",   # bluish green
 }
-MODALITY_COLORS = {"RNA": "#1f77b4", "Protein": "#ff7f0e"}
 
-TAB10_FALLBACK_COLORS = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+# --- Modality --------------------------------------------------------------
+# A distinct hue family from STATE_COLORS so a co-embedding panel coloured by
+# modality can never be misread against a panel coloured by state. Reinforced by
+# marker shape (circle = RNA, triangle = second modality) wherever both appear.
+# Both clear 4.5:1 on white, so they double as line and label colours.
+MODALITY_COLORS = {
+    "RNA":     "#5D3A9B",   # deep purple
+    "Protein": "#9C6500",   # dark amber
+    "ATAC":    "#9C6500",
+}
+
+MODALITY_MARKERS = {"RNA": "o", "Protein": "^", "ATAC": "^"}
+
+# --- Method (hierarchical: family picks hue, member samples within) ---------
+# KOT is the focal series and carries the only saturated blue; comparators sit
+# at lower visual weight so the contrast reads without a legend lookup.
+METHOD_COLORS = {
+    # KOT family — blues, focal
+    "kot":                          "#0072B2",
+    "kot_anchor":                   "#3E92C8",
+    "kot_noanchor":                 "#7BB6DC",
+    "kot_nodyn":                    "#9ECAE1",
+    "kot_fixedkappa":               "#6BAED6",
+    "kot_fixedalpha":               "#4292C6",
+    "kot_oracle":                   "#08519C",
+    "kot_oracle_learnalpha":        "#2171B5",
+    "kot_oracle_learnalpha_kappa":  "#4292C6",
+    # Optimal-transport baselines — vermillion family
+    "scot":       "#D55E00",
+    "moscot":     "#E8873A",
+    # Deep-generative baselines — green family
+    "glue":       "#009E73",
+    "uniport":    "#4CB79A",
+    "totalvi":    "#8CCFBC",
+    # Convex ODE baseline — neutral
+    "linear_ode": "#767676",
+}
+
+# Human-readable method names. Internal codenames never reach an axis (§5.6).
+METHOD_LABELS = {
+    "kot":                         "KOT (ours)",
+    "kot_anchor":                  "KOT + β-anchor",
+    "kot_noanchor":                "KOT, no β-anchor",
+    "kot_nodyn":                   "KOT, no kinetics",
+    "kot_fixedkappa":              "KOT, κ fixed",
+    "kot_fixedalpha":              "KOT, α fixed",
+    "kot_oracle":                  "KOT, oracle kinetics",
+    "kot_oracle_learnalpha":       "KOT, oracle κ",
+    "kot_oracle_learnalpha_kappa": "KOT, oracle β",
+    "scot":       "SCOT",
+    "moscot":     "moscot",
+    "glue":       "GLUE",
+    "uniport":    "uniPort",
+    "totalvi":    "totalVI (paired)",
+    "linear_ode": "Linear ODE",
+}
+
+# Dataset display names. Internal keys never reach a panel title (§5.6).
+DATASET_LABELS = {
+    "pbmc_retained":      "PBMC CITE-seq",
+    "pbmc_regvelo":       "PBMC CITE-seq (RegVelo)",
+    "bmmc_cite_retained": "BMMC CITE-seq",
+    "bmmc_cite_regvelo":  "BMMC CITE-seq (RegVelo)",
+    "papalexi_retained":  "Papalexi ECCITE-seq",
+    "papalexi_regvelo":   "Papalexi ECCITE-seq (RegVelo)",
+    "synthetic_linked_ode": "Synthetic linked ODE",
+    "synthetic":            "Synthetic",
+}
+
+
+def dataset_label(name: str) -> str:
+    return DATASET_LABELS.get(str(name), str(name).replace("_", " "))
+
+
+FOCAL_METHOD = "kot"
+
+# FOSCTTM of a random alignment. Every FOSCTTM axis is drawn against this.
+FOSCTTM_CHANCE = 0.5
+
+# Neutral fallback ramp for categories with no assigned colour. Okabe-Ito order,
+# so an unplanned category is still CVD-safe.
+FALLBACK_COLORS = [
+    "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+    "#56B4E9", "#E69F00", "#767676", "#F0E442",
 ]
+
+# Kept for backwards compatibility with older scripts.
+TAB10_FALLBACK_COLORS = FALLBACK_COLORS
 
 
 def state_color_map(states) -> dict[str, str]:
@@ -22,6 +118,23 @@ def state_color_map(states) -> dict[str, str]:
         if state in STATE_COLORS:
             colors[state] = STATE_COLORS[state]
         else:
-            colors[state] = TAB10_FALLBACK_COLORS[fallback_i % len(TAB10_FALLBACK_COLORS)]
+            colors[state] = FALLBACK_COLORS[fallback_i % len(FALLBACK_COLORS)]
             fallback_i += 1
     return colors
+
+
+def state_label(name: str) -> str:
+    """Plain-language cell-state name. Internal codes never reach an axis (§5.6)."""
+    return str(name).replace("_", " ")
+
+
+def method_color(name: str) -> str:
+    return METHOD_COLORS.get(str(name), "#767676")
+
+
+def method_label(name: str) -> str:
+    return METHOD_LABELS.get(str(name), str(name))
+
+
+def method_is_focal(name: str) -> bool:
+    return str(name) == FOCAL_METHOD
