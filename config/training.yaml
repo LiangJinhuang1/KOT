@@ -233,6 +233,14 @@ datasets:
     kot_alpha_max: 1.5
     use_anchor: true
     kot_anchor_betas: []
+    # Canonical run weights (baked in so no --set needed). λ_dyn=10 restores the
+    # effective dynamics weight from before kinetics_loss became a mean over the 10
+    # active proteins (which made λ_dyn=1 10× weaker). Gauge normalization must stay
+    # off: with it on, λ_dyn=10 drives JVP·RHS cos to 0.995 but FOSCTTM to 0.447 —
+    # dyn overpowers align. Verified on branch (12 seeds): FOSCTTM 0.0193±0.0006,
+    # cos 0.933±0.008 — matches run_branch_mean_20260701 (0.0198±0.0006, 0.933).
+    lambda_dyn: 10
+    kot_velocity_gauge_normalize: false
     seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
   # Real CITE-seq (paired RNA + protein). No ground-truth time/state: KOT
