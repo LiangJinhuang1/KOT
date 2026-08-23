@@ -398,6 +398,13 @@ def velocity_norm_diagnostics(v_eff) -> dict:
     return out
 
 
+def velocity_backend_skip(out: dict, reason: str) -> dict:
+    """Record a velocity-backend comparison that could not be made, and say why."""
+    print(f"[kot] velocity-backend comparison skipped: {reason}")
+    out["velocity_backend_status"] = reason
+    return out
+
+
 def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dict) -> dict:
     """Per-cell cos(v_i from this run, v_i from a second velocity backend).
 
@@ -408,9 +415,9 @@ def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dic
     other backend's h5ad and this measures that difference directly, per cell, over the
     cells and genes the two files share.
 
-    Anything that goes wrong (no path configured, missing file, missing layer, no shared
-    cells/genes, velocity not in gene space) is reported as NaN with a reason: this is a
-    diagnostic and must never take a training run down with it.
+    A configuration that cannot be compared (no path configured, missing file, missing
+    layer, no shared cells/genes, velocity not in gene space) is reported as NaN with a
+    reason rather than raising. A file that exists but cannot be read does raise.
     """
     compare_path = cfg.get("kot_velocity_compare_h5ad")
     layer = str(cfg.get("kot_velocity_compare_layer", "velocity"))
@@ -426,44 +433,37 @@ def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dic
     if not compare_path:
         return out
 
-    def fail(reason: str) -> dict:
-        print(f"[kot] velocity-backend comparison skipped: {reason}")
-        out["velocity_backend_status"] = reason
-        return out
-
     if velocity.shape[1] != rna_adata.n_vars:
-        return fail(
+        return velocity_backend_skip(
+            out,
             f"velocity has {velocity.shape[1]} columns but the AnnData has "
             f"{rna_adata.n_vars} genes (representation mode: no gene axis to match on)"
         )
     if not Path(compare_path).exists():
-        return fail(f"'{compare_path}' not found")
+        return velocity_backend_skip(out, f"'{compare_path}' not found")
 
-    try:
-        other = ad.read_h5ad(compare_path)
-    except Exception as exc:                      # noqa: BLE001 - diagnostic must not raise
-        return fail(f"could not read '{compare_path}': {exc}")
+    other = ad.read_h5ad(compare_path)
 
-    try:
-        if layer not in other.layers:
-            return fail(f"layer '{layer}' missing from '{compare_path}' "
-                        f"(has: {list(other.layers.keys())})")
+    if layer not in other.layers:
+        return velocity_backend_skip(
+            out, f"layer '{layer}' missing from '{compare_path}' "
+                 f"(has: {list(other.layers.keys())})")
 
-        self_cells = pd.Index(rna_adata.obs_names)
-        self_genes = pd.Index(rna_adata.var_names)
-        cells = self_cells.intersection(pd.Index(other.obs_names))
-        genes = self_genes.intersection(pd.Index(other.var_names))
-        if len(cells) == 0 or len(genes) == 0:
-            return fail(f"no shared cells/genes with '{compare_path}' "
-                        f"({len(cells)} cells, {len(genes)} genes)")
+    self_cells = pd.Index(rna_adata.obs_names)
+    self_genes = pd.Index(rna_adata.var_names)
+    cells = self_cells.intersection(pd.Index(other.obs_names))
+    genes = self_genes.intersection(pd.Index(other.var_names))
+    if len(cells) == 0 or len(genes) == 0:
+        return velocity_backend_skip(
+            out, f"no shared cells/genes with '{compare_path}' "
+                 f"({len(cells)} cells, {len(genes)} genes)")
 
-        v_self = velocity[self_cells.get_indexer(cells)][:, self_genes.get_indexer(genes)]
-        v_other = np.nan_to_num(to_dense(other.layers[layer], np.float32), nan=0.0)
-        v_other = v_other[pd.Index(other.obs_names).get_indexer(cells)][
-            :, pd.Index(other.var_names).get_indexer(genes)
-        ]
-    finally:
-        del other
+    v_self = velocity[self_cells.get_indexer(cells)][:, self_genes.get_indexer(genes)]
+    v_other = np.nan_to_num(to_dense(other.layers[layer], np.float32), nan=0.0)
+    v_other = v_other[pd.Index(other.obs_names).get_indexer(cells)][
+        :, pd.Index(other.var_names).get_indexer(genes)
+    ]
+    del other                          # free the comparison AnnData before the einsum
 
     dot = np.einsum("ij,ij->i", v_self, v_other).astype(np.float64)
     denom = np.linalg.norm(v_self, axis=1) * np.linalg.norm(v_other, axis=1)
@@ -568,6 +568,13 @@ def compute_jvp_rhs_diagnostics(
     return out
 
 
+def phi_output(model, R_t: torch.Tensor) -> np.ndarray:
+    """φ over every cell as NumPy, on CPU. Leaves the model in eval mode."""
+    model.eval()
+    with torch.no_grad():
+        return model.phi(R_t).cpu().numpy()
+
+
 def resolve_pseudotime(rna_obs: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
     """Pseudotime coordinate for a run.
 
@@ -579,6 +586,19 @@ def resolve_pseudotime(rna_obs: pd.DataFrame) -> tuple[np.ndarray | None, str | 
         if key in rna_obs.columns:
             return np.asarray(rna_obs[key].values, dtype=np.float64), key
     return None, None
+
+
+def flat_gradient(grads, params) -> torch.Tensor:
+    """One flat vector from a per-parameter gradient list.
+
+    ``torch.autograd.grad(..., allow_unused=True)`` returns None for a parameter the loss
+    did not touch; those become zeros so the two losses' gradients stay the same length
+    and remain comparable.
+    """
+    return torch.cat([
+        (g if g is not None else torch.zeros_like(p)).reshape(-1)
+        for g, p in zip(grads, params)
+    ])
 
 
 def compute_grad_interaction(
@@ -618,12 +638,6 @@ def compute_grad_interaction(
     model.eval()
     phi_params = [p for p in model.phi.parameters() if p.requires_grad]
 
-    def flat(grads):
-        return torch.cat([
-            (g if g is not None else torch.zeros_like(p)).reshape(-1)
-            for g, p in zip(grads, phi_params)
-        ])
-
     align_norms, dyn_norms, cosines = [], [], []
     dyn_norms_scaled, mag_ratios = [], []
     for idx, pidx in probe_batches:
@@ -631,14 +645,16 @@ def compute_grad_interaction(
         phi_a = phi_r if align_cols is None else phi_r[:, align_cols]
         P_a = (P_t[pidx] if align_cols is None else P_t[pidx][:, align_cols])
         loss_align = sinkhorn_divergence(phi_a, P_a, blur=blur, backend=backend)
-        g_align = flat(torch.autograd.grad(loss_align, phi_params, allow_unused=True))
+        g_align = flat_gradient(
+            torch.autograd.grad(loss_align, phi_params, allow_unused=True), phi_params)
 
         loss_dyn, _ = kinetics_loss(
             model.phi, model.kappa, model.g,
             R_t[idx], V_eff_t[idx], SR_t[idx], model.beta, conf_t[idx],
             mask=mask, scale=scale,
         )
-        g_dyn = flat(torch.autograd.grad(loss_dyn, phi_params, allow_unused=True))
+        g_dyn = flat_gradient(
+            torch.autograd.grad(loss_dyn, phi_params, allow_unused=True), phi_params)
 
         na = float(g_align.norm())
         nd = float(g_dyn.norm())
@@ -1081,6 +1097,21 @@ def compute_full_diagnostics(
     # every diagnostics JSON so each file explains the physics numbers next to it.
     out.update(velocity_norm_diagnostics(V_eff))
     return out
+
+
+def print_distribution(diagnostics: dict, label: str, prefix: str, fmt: str = "+.4f") -> None:
+    """One line per distribution: mean, median and the q05..q95 ladder.
+
+    The physics diagnostics are reported as a median and quantiles rather than a mean
+    alone because a handful of cells with near-zero velocity dominate the mean and hide
+    what the bulk of the cells are doing.
+    """
+    print(
+        f"[kot]   {label:<20s} mean={diagnostics[f'{prefix}_mean']:{fmt}}  "
+        f"med={diagnostics[f'{prefix}_median']:{fmt}}  "
+        f"q05={diagnostics[f'{prefix}_q05']:{fmt}}  q25={diagnostics[f'{prefix}_q25']:{fmt}}  "
+        f"q75={diagnostics[f'{prefix}_q75']:{fmt}}  q95={diagnostics[f'{prefix}_q95']:{fmt}}"
+    )
 
 
 def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataFrame]:
@@ -1630,6 +1661,25 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     stop_epoch = n_epochs
     current_phase = 0   # for use_phases mode; tracks transitions
 
+    # phi at initialisation, before any gradient step. This is the only honest
+    # "before alignment" view on real data: RNA features and protein features have
+    # no shared coordinate system, so the two modalities cannot be co-embedded
+    # until phi maps one into the other's space. phi_init(R) and the observed
+    # protein DO share that space, so a before/after pair drawn from them is a
+    # like-for-like comparison. One forward pass, so it costs nothing.
+    #
+    # Sliced to the alignment panel exactly as aligned_rna.npy is (see where
+    # `aligned` is built from align_np below), so the before/after pair spans the
+    # same protein columns. Without the slice the two arrays have different widths
+    # on every dataset that sets use_for_alignment.
+    if output_dir is not None:
+        phi_init = phi_output(model, R_t)
+        if align_np is not None:
+            phi_init = phi_init[:, align_np]
+        np.save(Path(output_dir) / "phi_init.npy", phi_init)
+        print(f"[kot] Saved untrained phi output: {Path(output_dir) / 'phi_init.npy'} "
+              f"{phi_init.shape}")
+
     train_start = time.perf_counter()
     for epoch in range(1, n_epochs + 1):
         model.train()
@@ -1924,7 +1974,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # Final aligned representations
     model.eval()
     with torch.no_grad():
-        phi_final = model.phi(R_t).cpu().numpy()        # (n, D_p)
+        phi_final = phi_output(model, R_t)              # (n, D_p)
         p_np = y                                         # (n, D_p) observed
         loss_anchor_final = (
             beta_anchor_prior_loss(
@@ -2038,31 +2088,22 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     print(f"[kot]   JVP·RHS cos:         {diagnostics['jvp_rhs_cos']:.4f}")
     print(f"[kot]   |JVP| / |RHS|:       {diagnostics['jvp_norm']:.4f} / {diagnostics['rhs_norm']:.4f}")
 
-    def _dist(label: str, prefix: str, fmt: str = "+.4f") -> None:
-        """One line per distribution: mean, median and the q05..q95 ladder."""
-        print(
-            f"[kot]   {label:<20s} mean={diagnostics[f'{prefix}_mean']:{fmt}}  "
-            f"med={diagnostics[f'{prefix}_median']:{fmt}}  "
-            f"q05={diagnostics[f'{prefix}_q05']:{fmt}}  q25={diagnostics[f'{prefix}_q25']:{fmt}}  "
-            f"q75={diagnostics[f'{prefix}_q75']:{fmt}}  q95={diagnostics[f'{prefix}_q95']:{fmt}}"
-        )
-
     print("[kot]   per-cell distributions (across cells):")
-    _dist("JVP·RHS cos", "jvp_rhs_cos")
-    _dist("|JVP|", "jvp_norm", ".4g")
-    _dist("|RHS|", "rhs_norm", ".4g")
-    _dist("|JVP|/|RHS|", "norm_ratio", ".4g")
-    _dist("log |JVP|/|RHS|", "log_norm_ratio")
-    _dist("rel. residual", "rel_residual", ".4f")
-    _dist("|v_eff|", "v_eff_norm", ".4g")
+    print_distribution(diagnostics, "JVP·RHS cos", "jvp_rhs_cos")
+    print_distribution(diagnostics, "|JVP|", "jvp_norm", ".4g")
+    print_distribution(diagnostics, "|RHS|", "rhs_norm", ".4g")
+    print_distribution(diagnostics, "|JVP|/|RHS|", "norm_ratio", ".4g")
+    print_distribution(diagnostics, "log |JVP|/|RHS|", "log_norm_ratio")
+    print_distribution(diagnostics, "rel. residual", "rel_residual", ".4f")
+    print_distribution(diagnostics, "|v_eff|", "v_eff_norm", ".4g")
     print(f"[kot]   v_eff nonzero cells:  "
           f"{diagnostics['v_eff_nonzero_frac'] * 100:.1f}% of {diagnostics['v_eff_n_cells']}")
     if diagnostics.get("velocity_backend_status") == "ok":
-        _dist("cos(v, other backend)", "velocity_backend_cos")
+        print_distribution(diagnostics, "cos(v, other backend)", "velocity_backend_cos")
     print("[kot]   parameter distributions:")
-    _dist("κ", "kappa", ".4g")
-    _dist("α", "alpha", ".4g")
-    _dist("β", "beta", ".4g")
+    print_distribution(diagnostics, "κ", "kappa", ".4g")
+    print_distribution(diagnostics, "α", "alpha", ".4g")
+    print_distribution(diagnostics, "β", "beta", ".4g")
     print(f"[kot]   κ mean/std [min,max]: {diagnostics['kappa_mean']:.4f} / {diagnostics['kappa_std']:.4f}  "
           f"[{diagnostics['kappa_min']:.4f}, {diagnostics['kappa_max']:.4f}]")
     print(f"[kot]   α mean/std [min,max]: {diagnostics['alpha_mean']:.4f} / {diagnostics['alpha_std']:.4f}  "

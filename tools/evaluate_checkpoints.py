@@ -47,6 +47,7 @@ import torch
 from src.utils.io import load_yaml
 from src.utils.arrays import to_dense
 from src.data.preprocessing import load_and_preprocess_cached
+from src.data.synthetic_linked_ode import stage_output_paths
 from src.data.projection import projection_matrix_from_adatas
 from src.data.adt_gene_map import load_mapping_records
 from src.models.KOT import KOTModel
@@ -206,13 +207,6 @@ def config_path_for_run(run_folder: Path) -> Path:
     raise FileNotFoundError(f"No training.yaml or training_resume_*.yaml in {run_folder}")
 
 
-def stage_data_paths(stage: str) -> tuple[str, str]:
-    """Stage-specific paths used by src.training.runner at training time."""
-    rna = f"cache/velocity/synthetic_linked_ode/{stage}/rna.h5ad"
-    protein = f"cache/synthetic_linked_ode/{stage}/protein.h5ad"
-    return rna, protein
-
-
 def staged_run_args(run_folder: Path) -> tuple[str | None, str | None]:
     """Recover --stage/--scale from run.log or resume logs, last entry wins."""
     log_paths = [run_folder / "run.log", *sorted(run_folder.glob("run_resume_*.log"))]
@@ -267,7 +261,7 @@ def apply_staged_dataset_overrides(
     if eff_scale not in SCALE_LAYERS:
         raise ValueError(f"Unsupported synthetic scale in {run_folder}: {eff_scale!r}")
 
-    rna_path, protein_path = stage_data_paths(stage)
+    rna_path, protein_path = stage_output_paths(stage)
     dataset_meta = {**dataset_meta, "rna_path": rna_path, "protein_path": protein_path}
     run_cfg = dict(run_cfg)
     run_cfg.update((cfg.get("stage_overrides") or {}).get(stage, {}))

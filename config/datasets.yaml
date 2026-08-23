@@ -50,12 +50,6 @@ datasets:
     protein_path: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
     protein_label: Antibody Capture
 
-  perturb:
-    name: Perturb-CITE-seq
-    rna_path: cache/velocity/perturb/perturb_scvelo_results.h5ad
-    protein_path: Datasets/Perturb_CITE_Seq/SCP1064/documentation/Protein_expression.csv.gz
-    protein_label: Protein
-
   papalexi_retained:
     name: Papalexi ECCITE-seq (ADT-genes retained)
     rna_path: cache/velocity/papalexi/papalexi_scvelo_results_retained.h5ad

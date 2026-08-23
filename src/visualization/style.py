@@ -44,7 +44,10 @@ FONT_LADDER = (8.0, 7.0, 6.0)
 # Panel letters are the documented exception to the three-size ladder.
 PANEL_LETTER_SIZE = 9.0
 
-_state: dict[str, object] = {"venue": DEFAULT_VENUE, "ladder": FONT_LADDER,
+# Scatter defaults tuned for a 5.5in-wide figure at 300 dpi.
+SCATTER_STYLE = dict(s=1.6, alpha=0.55, linewidths=0, rasterized=True)
+
+STYLE_STATE: dict[str, object] = {"venue": DEFAULT_VENUE, "ladder": FONT_LADDER,
                              "verify": False}
 
 
@@ -54,7 +57,7 @@ def set_verify(enabled: bool = True) -> None:
     Off by default because it forces an extra draw; a QA pass turns it on
     once and then every figure the run produces is checked.
     """
-    _state["verify"] = bool(enabled)
+    STYLE_STATE["verify"] = bool(enabled)
 
 
 def apply_style(venue: str = DEFAULT_VENUE, sizes: tuple[float, float, float] = FONT_LADDER) -> None:
@@ -63,8 +66,8 @@ def apply_style(venue: str = DEFAULT_VENUE, sizes: tuple[float, float, float] = 
     if venue not in VENUE_WIDTHS:
         raise ValueError(f"Unknown venue '{venue}'. Use one of {sorted(VENUE_WIDTHS)}.")
     base, small, tick = sizes
-    _state["venue"] = venue
-    _state["ladder"] = sizes
+    STYLE_STATE["venue"] = venue
+    STYLE_STATE["ladder"] = sizes
 
     mpl.rcParams.update({
         # Typography — Liberation Sans is the Arial-metric substitute present in
@@ -130,7 +133,7 @@ def figsize(width: str | float = "full", height: float = 2.0,
     """Return ``(w, h)`` inches for a named venue width or an explicit width."""
     if isinstance(width, (int, float)):
         return (float(width), float(height))
-    venue = (venue or _state["venue"]).lower()  # type: ignore[union-attr]
+    venue = (venue or STYLE_STATE["venue"]).lower()  # type: ignore[union-attr]
     widths = VENUE_WIDTHS[venue]
     if width not in widths:
         raise ValueError(f"Unknown width '{width}' for {venue}. Use one of {sorted(widths)}.")
@@ -149,7 +152,7 @@ def panel_letter(ax, letter: str, *, dy_points: float | None = None,
     text = letter.lower() if case == "lower" else letter.upper()
     if dy_points is None:
         base = float(mpl.rcParams["axes.titlesize"]) if isinstance(
-            mpl.rcParams["axes.titlesize"], (int, float)) else _state["ladder"][0]  # type: ignore[index]
+            mpl.rcParams["axes.titlesize"], (int, float)) else STYLE_STATE["ladder"][0]  # type: ignore[index]
         dy_points = float(mpl.rcParams["axes.titlepad"]) + float(base) + 2.0
     return ax.annotate(
         text, xy=(0.0, 1.0), xycoords="axes fraction",
@@ -169,8 +172,23 @@ def direction_cue(ax, text: str = "lower = better", *, loc: str = "upper right")
     }[loc]
     x, y, ha, va = xy
     return ax.text(x, y, text, transform=ax.transAxes,
-                   fontsize=_state["ladder"][1], color="0.35",  # type: ignore[index]
+                   fontsize=STYLE_STATE["ladder"][1], color="0.35",  # type: ignore[index]
                    ha=ha, va=va, rotation=0)
+
+
+def median_tick(ax, value: float, position: float, *, half: float = 0.30,
+                color: str = "#1A1A1A", lw: float = 1.0,
+                orient: str = "vertical", zorder: int = 5):
+    """A median marker that stays readable on top of its own scatter.
+
+    Drawn twice — a white halo, then the darker tick just inside it — so the
+    median reads against overlapping points without hiding them (§6.1).
+    """
+    for extra, stroke, width in ((0.01, "white", 2 * lw), (0.0, color, lw)):
+        lo, hi = position - half - extra, position + half + extra
+        span, const = ([value, value], [lo, hi]) if orient == "vertical" else ([lo, hi], [value, value])
+        ax.plot(span, const, color=stroke, lw=width, solid_capstyle="butt",
+                zorder=zorder + (0 if extra else 1))
 
 
 def save_figure(fig, path, *, formats: tuple[str, ...] = ("pdf", "png"),
@@ -184,7 +202,7 @@ def save_figure(fig, path, *, formats: tuple[str, ...] = ("pdf", "png"),
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if verify if verify is not None else _state["verify"]:
+    if verify if verify is not None else STYLE_STATE["verify"]:
         findings = check_overlaps(fig, verbose=False)
         if findings:
             print(f"[style] {path.name}: {len(findings)} bbox overlap(s)")
@@ -262,7 +280,7 @@ def embedding_axes(ax, x_label: str = "Dim 1", y_label: str = "Dim 2",
     for spine in ax.spines.values():
         spine.set_visible(False)
 
-    small = _state["ladder"][1]  # type: ignore[index]
+    small = STYLE_STATE["ladder"][1]  # type: ignore[index]
     arrow = dict(arrowstyle="-|>", lw=0.7, color="0.35", mutation_scale=5)
     ax.annotate("", xy=(pad + frac, pad), xytext=(pad, pad),
                 xycoords="axes fraction", arrowprops=arrow)
@@ -282,7 +300,7 @@ def chance_line(ax, value: float = 0.5, *, axis: str = "y",
     number rather than what it is, which is a failure. Always drawn dashed and
     neutral so it cannot be mistaken for a plotted series (§8).
     """
-    small = _state["ladder"][1]  # type: ignore[index]
+    small = STYLE_STATE["ladder"][1]  # type: ignore[index]
     if axis == "y":
         ax.axhline(value, color="0.45", lw=0.7, ls=(0, (4, 2)), zorder=1)
         ax.text(text_x, value, f" {label} ", transform=ax.get_yaxis_transform(),
@@ -293,7 +311,7 @@ def chance_line(ax, value: float = 0.5, *, axis: str = "y",
                 fontsize=small, color="0.45", ha="left", va="top")
 
 
-def _relative_luminance(hex_color: str) -> float:
+def relative_luminance(hex_color: str) -> float:
     h = hex_color.lstrip("#")
     channels = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
     channels = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
@@ -302,7 +320,7 @@ def _relative_luminance(hex_color: str) -> float:
 
 
 def contrast_ratio(hex_color: str, background: str = "#FFFFFF") -> float:
-    la, lb = _relative_luminance(hex_color), _relative_luminance(background)
+    la, lb = relative_luminance(hex_color), relative_luminance(background)
     hi, lo = max(la, lb), min(la, lb)
     return (hi + 0.05) / (lo + 0.05)
 

@@ -8,10 +8,8 @@ from sklearn.decomposition import PCA
 
 from src.visualization import state_color_map, state_label
 from src.visualization.style import (
-    apply_style, embedding_axes, figsize, panel_letter, save_figure,
+    SCATTER_STYLE, apply_style, embedding_axes, figsize, panel_letter, save_figure,
 )
-
-_PT = dict(s=1.6, alpha=0.55, linewidths=0, rasterized=True)
 
 
 def get_2d_embedding(adata):
@@ -45,7 +43,7 @@ def plot_modalities(rna_adata, protein_adata, save_dir, *, second_label="Protein
         colors = state_color_map(states)
         for state, color in colors.items():
             mask = states == state
-            ax.scatter(xy[mask, 0], xy[mask, 1], c=color, label=state_label(state), **_PT)
+            ax.scatter(xy[mask, 0], xy[mask, 1], c=color, label=state_label(state), **SCATTER_STYLE)
         ax.set_title(f"{label} — cell state")
         if col == 0:
             ax.legend(markerscale=4, loc="best")
@@ -53,7 +51,7 @@ def plot_modalities(rna_adata, protein_adata, save_dir, *, second_label="Protein
         panel_letter(ax, letters[0][col])
 
         ax = axes[1, col]
-        scatter_for_bar = ax.scatter(xy[:, 0], xy[:, 1], c=times, cmap="viridis", **_PT)
+        scatter_for_bar = ax.scatter(xy[:, 0], xy[:, 1], c=times, cmap="viridis", **SCATTER_STYLE)
         ax.set_title(f"{label} — pseudotime")
         embedding_axes(ax, f"{coord} 1", f"{coord} 2")
         panel_letter(ax, letters[1][col])

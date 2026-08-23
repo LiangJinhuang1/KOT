@@ -34,12 +34,6 @@ datasets:
     protein_path: Datasets/PBMC/5k_pbmc_protein_v3_nextgem_filtered_feature_bc_matrix.h5
     protein_label: Antibody Capture
 
-  perturb:
-    rna_path: cache/velocity/perturb/perturb_scvelo_results.h5ad
-    # protein CSV loaded separately
-    protein_path: Datasets/Perturb_CITE_Seq/SCP1064/documentation/Protein_expression.csv.gz
-    protein_label: Protein
-
   synthetic:
     # run: python -m src.data.synthetic  (generates both files below)
     rna_path: cache/velocity/synthetic/synthetic_scvelo_results.h5ad

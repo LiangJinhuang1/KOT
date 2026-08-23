@@ -123,6 +123,52 @@ def state_color_map(states) -> dict[str, str]:
     return colors
 
 
+# Coarse haematopoietic lineages. The BMMC annotation has 45 cell types, far past
+# what a legible panel can carry, and the fine distinctions (CD57+ vs TIGIT+ CD8 T)
+# are not what an alignment figure is about. Order runs progenitor -> differentiated.
+LINEAGE_ORDER = ["HSC / progenitor", "Erythroid", "Monocyte", "Dendritic",
+                 "B lineage", "CD4 T", "CD8 T", "NK / ILC", "Other"]
+
+LINEAGE_COLORS = {
+    "HSC / progenitor": "#767676",
+    "Erythroid":        "#D55E00",
+    "Monocyte":         "#E69F00",
+    "Dendritic":        "#F0E442",
+    "B lineage":        "#0072B2",
+    "CD4 T":            "#56B4E9",
+    "CD8 T":            "#009E73",
+    "NK / ILC":         "#CC79A7",
+    "Other":            "#BBBBBB",
+}
+
+
+def lineage(cell_type: str) -> str:
+    """Map a fine-grained BMMC/PBMC cell-type label to a coarse lineage."""
+    t = str(cell_type)
+    tl = t.lower()
+    if "prog" in tl or tl.startswith("hsc"):
+        return "HSC / progenitor"
+    if any(k in tl for k in ("erythro", "reticulocyte", "normoblast", "proerythro")):
+        return "Erythroid"
+    if "mono" in tl:
+        return "Monocyte"
+    if "dc" in tl.split() or tl.startswith(("pdc", "cdc")) or "dendritic" in tl:
+        return "Dendritic"
+    # After the dendritic test on purpose, so "Plasmacytoid DC" is a DC, not a
+    # plasma cell. "plasma" also covers "plasmablast"; " b " (padded) covers the
+    # bare-B labels like "B1 B" and "Naive CD20+ B".
+    if (" b " in f" {tl} " or "cd20+ b" in tl
+            or tl.startswith("transitional b") or "plasma" in tl):
+        return "B lineage"
+    if tl.startswith("cd4") or tl.startswith("t reg") or tl == "dnt":
+        return "CD4 T"
+    if tl.startswith("cd8") or tl.startswith("mait") or tl.startswith("gdt"):
+        return "CD8 T"
+    if tl.startswith("nk") or tl.startswith("ilc"):
+        return "NK / ILC"
+    return "Other"
+
+
 def state_label(name: str) -> str:
     """Plain-language cell-state name. Internal codes never reach an axis (§5.6)."""
     return str(name).replace("_", " ")

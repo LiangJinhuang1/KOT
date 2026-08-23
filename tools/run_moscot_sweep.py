@@ -33,8 +33,8 @@ from src.training.runner import (
     get_repr,
     save_diagnostics,
     split_model_result,
-    stage_data_paths,
 )
+from src.data.synthetic_linked_ode import stage_output_paths
 from src.utils.io import load_yaml
 
 
@@ -72,7 +72,7 @@ def effective_dataset_and_config(args, train_cfg: dict, datasets: dict) -> tuple
     overrides = dict((train_cfg.get("datasets", {}) or {}).get(args.dataset, {}) or {})
 
     if args.dataset == STAGED_DATASET and args.stage is not None:
-        rna_path, protein_path = stage_data_paths(args.stage)
+        rna_path, protein_path = stage_output_paths(args.stage)
         dataset_cfg = {**dataset_cfg, "rna_path": rna_path, "protein_path": protein_path}
         overrides.update(stage_overrides.get(args.stage, {}))
         overrides.update(SCALE_LAYERS[args.scale])

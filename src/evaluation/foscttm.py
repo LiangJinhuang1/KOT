@@ -84,6 +84,7 @@ def evaluate_and_save(
     model_name: str = None,
     obs_names=None,
     foscttm_scores=None,
+    save_prediction: bool = True,
 ) -> float:
     degenerate = is_degenerate_embedding(aligned[0]) or is_degenerate_embedding(aligned[1])
     # foscttm_scores may be precomputed (e.g. per-batch alignment, where a global
@@ -105,7 +106,12 @@ def evaluate_and_save(
     np.save(output_dir / "aligned_rna.npy", aligned[0])
     np.save(output_dir / f"aligned_{second_label}.npy", aligned[1])
 
-    if model_name is not None and obs_names is not None:
+    # The prediction h5ad path is GLOBAL (data/predictions/), keyed only by model +
+    # dataset + seed — so two runs that differ only in hyperparameters write the same
+    # file. In a parallel sweep that is a live HDF5 lock collision that kills the run
+    # (BlockingIOError), not just an overwrite. Sweeps pass save_prediction=False; the
+    # per-run copies under output_dir (aligned_*.npy, foscttm.csv) are unaffected.
+    if save_prediction and model_name is not None and obs_names is not None:
         save_prediction_h5ad(
             aligned, foscttm_scores, mean_foscttm,
             name, model_name, second_label, obs_names,

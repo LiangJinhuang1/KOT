@@ -14,23 +14,30 @@ from src.utils.arrays import to_dense
 PROTEIN_OBSM_KEY = "protein_expression"
 
 
+REDUCE_LR_SCHEDULER = torch.optim.lr_scheduler.ReduceLROnPlateau
+
+
+def init_dropping_verbose(self, *args, **kwargs) -> None:
+    """Replacement ReduceLROnPlateau.__init__ that drops the kwarg torch 2.10 removed.
+
+    The original __init__ is parked on the class as ``kot_original_init`` by
+    :func:`drop_reduce_lr_verbose_kwarg`, which is the only thing that installs this.
+    """
+    kwargs.pop("verbose", None)
+    REDUCE_LR_SCHEDULER.kot_original_init(self, *args, **kwargs)
+
+
 def drop_reduce_lr_verbose_kwarg() -> None:
     """scvi 1.2.0 passes verbose= to torch's ReduceLROnPlateau, which torch 2.10 removed.
 
     Wrap its __init__ to drop the now-unsupported kwarg. Idempotent, so calling it before
     every totalVI train is safe.
     """
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau
-    if getattr(scheduler, "kot_verbose_dropped", False):
+    if getattr(REDUCE_LR_SCHEDULER, "kot_verbose_dropped", False):
         return
-    original_init = scheduler.__init__
-
-    def init_dropping_verbose(self, *args, **kwargs):
-        kwargs.pop("verbose", None)
-        original_init(self, *args, **kwargs)
-
-    scheduler.__init__ = init_dropping_verbose
-    scheduler.kot_verbose_dropped = True
+    REDUCE_LR_SCHEDULER.kot_original_init = REDUCE_LR_SCHEDULER.__init__
+    REDUCE_LR_SCHEDULER.__init__ = init_dropping_verbose
+    REDUCE_LR_SCHEDULER.kot_verbose_dropped = True
 
 
 def attach_protein_expression(

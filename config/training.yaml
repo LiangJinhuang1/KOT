@@ -33,6 +33,17 @@ default_models: kot_main
 defaults:
   output_root: cache/training
   synthetic_seed: 42
+  # Write data/predictions/<model>_<dataset>_seed_<n>.h5ad after evaluation. That path
+  # carries no run id, so two runs differing only in hyperparameters target the same
+  # file and collide on the HDF5 lock when run in parallel (BlockingIOError kills the
+  # run — it took out 2 of 8 real-data arms in run_20260823_215339).
+  #
+  # OFF for the hyperparameter search: every sweep run would fight over the same paths,
+  # and the per-run outputs (aligned_*.npy, foscttm.csv, diagnostics.json) carry
+  # everything the sweep needs. Flip back to true once the settings are frozen — the
+  # final paper runs and scripts/04_evaluate_all.py + tools/papalexi_perturbation_
+  # benchmark.py read data/predictions/. One-off: --set save_prediction_h5ad=true.
+  save_prediction_h5ad: false
   preprocessing_cache_version: default
   force_preprocess: false
   add_log_velocity_layer: false

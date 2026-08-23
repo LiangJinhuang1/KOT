@@ -86,14 +86,6 @@ datasets:
     velocity_backend: regvelo
     grn_prior_csv: cache/results/grn/grn_prior_pbmc.csv
 
-  perturb:
-    # TODO: set mode once STARsolo alignment is complete for Perturb-CITE-seq.
-    # Expected inputs: spliced/unspliced loom or h5ad from STARsolo.
-    mode: h5ad
-    input_h5ad: Datasets/Perturb_CITE_Seq/SCP1064/velocity/perturb_velocity_input.h5ad
-    label: perturb
-    n_top_genes: 2000
-
   # Papalexi ECCITE-seq (GSE153056), pooled 8-lane STARsolo. RNA input h5ad is built
   # by tools/build_papalexi.py (spliced/unspliced from STARsolo Velocyto, cells matched
   # to the ECCITE metadata on the core barcode). Retains the 4 checkpoint-ADT target

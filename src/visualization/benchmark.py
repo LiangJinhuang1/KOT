@@ -16,7 +16,6 @@ Two data-fidelity rules are enforced here rather than left to the caller:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import numpy as np
@@ -31,8 +30,9 @@ from src.visualization import (
     method_label,
     method_is_focal,
 )
+from src.visualization.runs import PHI_COLLAPSE_THRESHOLD, read_diagnostics
 from src.visualization.style import (
-    apply_style, chance_line, figsize, ink, panel_letter, save_figure,
+    apply_style, chance_line, figsize, median_tick, panel_letter, save_figure,
 )
 
 
@@ -47,8 +47,12 @@ def collect_benchmark(cache_dir: str | Path = "cache/training") -> pd.DataFrame:
                 record[key.strip()] = value.strip()
         if "mean_foscttm" not in record or "model" not in record:
             continue
+        # The run dir name, whatever it is. Collapsing every non-`run_*` dir to a
+        # single "(legacy)" label made the curated runs indistinguishable from each
+        # other, so the drop_duplicates below silently discarded every curated run
+        # after the first that shared a (dataset, model, seed) with it.
         parts = summary.relative_to(cache_dir).parts
-        record["run"] = parts[0] if parts[0].startswith("run_") else "(legacy)"
+        record["run"] = parts[0]
         record["mean_foscttm"] = float(record["mean_foscttm"])
         record["seed"] = record.get("seed", "-")
         # phi_variance_ratio lives in diagnostics.json, not summary.txt, but a
@@ -57,10 +61,7 @@ def collect_benchmark(cache_dir: str | Path = "cache/training") -> pd.DataFrame:
         diag = summary.parent / "diagnostics.json"
         record["phi_variance_ratio"] = None
         if diag.exists():
-            try:
-                record["phi_variance_ratio"] = json.load(open(diag)).get("phi_variance_ratio")
-            except Exception:
-                pass
+            record["phi_variance_ratio"] = read_diagnostics(diag).get("phi_variance_ratio")
         rows.append(record)
 
     df = pd.DataFrame(rows)
@@ -79,10 +80,7 @@ def find_degenerate(df: pd.DataFrame, *, tol: float = 1e-12) -> list[str]:
     return sorted(degenerate)
 
 
-PHI_COLLAPSE_THRESHOLD = 0.5
-
-
-def find_collapsed(df: pd.DataFrame, threshold: float = PHI_COLLAPSE_THRESHOLD) -> pd.Series:
+def find_collapsed(df: pd.DataFrame) -> pd.Series:
     """Runs where phi collapsed: its output variance is a fraction of the target's.
 
     The kinetics residual is scale-degenerate — shrinking phi (and kappa, alpha
@@ -93,7 +91,7 @@ def find_collapsed(df: pd.DataFrame, threshold: float = PHI_COLLAPSE_THRESHOLD) 
     from the physics metrics alone.
     """
     ratio = pd.to_numeric(df.get("phi_variance_ratio"), errors="coerce")
-    return ratio.notna() & (ratio < threshold)
+    return ratio.notna() & (ratio < PHI_COLLAPSE_THRESHOLD)
 
 
 def find_duplicate_arms(df: pd.DataFrame, *, tol: float = 1e-9) -> list[tuple[str, str, int]]:
@@ -174,7 +172,6 @@ def plot_benchmark(
 
     for panel, (ax, dataset) in enumerate(zip(axes, datasets)):
         sub = data[data["dataset"] == dataset]
-        runs_used = sub.groupby("model")["run"].nunique()
         multi_run = sub["run"].nunique() > 1
 
         for row, model in enumerate(order):
@@ -195,13 +192,8 @@ def plot_benchmark(
             # With n < 3 the observations are the summary (§6.2); a median tick
             # there adds no information and its halo would hide the only points.
             if len(vals) >= 3:
-                median = float(np.median(vals))
-                ax.plot([median, median], [row - 0.32, row + 0.32],
-                        color="white", lw=(2.8 if focal else 2.2),
-                        solid_capstyle="butt", zorder=5)
-                ax.plot([median, median], [row - 0.30, row + 0.30],
-                        color="#1A1A1A", lw=(1.4 if focal else 1.0),
-                        solid_capstyle="butt", zorder=6)
+                median_tick(ax, float(np.median(vals)), row,
+                            lw=1.4 if focal else 1.0, zorder=5)
 
         chance_line(ax, FOSCTTM_CHANCE, axis="x", label="chance")
         ax.set_ylim(-0.7, len(order) - 0.3)

@@ -12,6 +12,7 @@ import numpy as np
 
 from src.utils.io import load_yaml, save_yaml
 from src.data.preprocessing import load_and_preprocess_cached
+from src.data.synthetic_linked_ode import stage_output_paths
 from src.training.scot import run_scot
 from src.training.moscot import run_moscot
 from src.training.glue import run_glue
@@ -241,13 +242,6 @@ SCALE_LAYERS = {
 COUNT_MODELS = {"glue", "totalvi"}
 
 
-def stage_data_paths(stage: str) -> tuple[str, str]:
-    """Stage-specific h5ad paths (mirror of synthetic_linked_ode.stage_output_paths)."""
-    rna = f"cache/velocity/synthetic_linked_ode/{stage}/rna.h5ad"
-    protein = f"cache/synthetic_linked_ode/{stage}/protein.h5ad"
-    return rna, protein
-
-
 def get_repr(adata, obsm_key: str, label: str) -> np.ndarray:
     if adata is None:
         raise ValueError(f"{label} AnnData is None — check dataset config.")
@@ -386,14 +380,21 @@ def resolve_models(spec, model_groups: dict) -> list[str]:
     return [str(name) for name in names]
 
 
+def parse_seed_spec(spec) -> list[int]:
+    """Seeds from an int, a list, or a comma-separated string ("42,123,2026")."""
+    if isinstance(spec, int):
+        return [spec]
+    if isinstance(spec, str):
+        return [int(part) for part in spec.split(",") if part.strip()]
+    return [int(seed) for seed in spec]
+
+
 def seed_list_from_cfg(run_cfg: dict) -> tuple[list[int], bool]:
     """Return (seeds, is_multi_seed). is_multi_seed True if 'seeds' is explicitly set."""
     seeds = run_cfg.get("seeds")
     if seeds is None:
         return [int(run_cfg.get("seed", 42))], False
-    if isinstance(seeds, int):
-        return [seeds], True
-    return [int(seed) for seed in seeds], True
+    return parse_seed_spec(seeds), True
 
 
 def seeded_models_from_cfg(run_cfg: dict, all_models: list[str]) -> set[str]:
@@ -539,6 +540,7 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
         model_name=model_name,
         obs_names=rna_adata.obs_names,
         foscttm_scores=batch_foscttm,
+        save_prediction=bool(run_cfg.get("save_prediction_h5ad", True)),
     )
     diagnostics["mean_foscttm"] = float(mean_foscttm)
     save_diagnostics(output_dir, diagnostics)
@@ -694,18 +696,22 @@ def run_training(
         # layers, per-stage models/anchors (stage_overrides), and the cache version.
         if name == STAGED_DATASET and stage is not None:
             eff_scale = scale or "mean"
-            rna_path, protein_path = stage_data_paths(stage)
+            rna_path, protein_path = stage_output_paths(stage)
             dataset = {**dataset, "rna_path": rna_path, "protein_path": protein_path}
             overrides.update(stage_overrides_cfg.get(stage, {}))
             overrides.update(SCALE_LAYERS[eff_scale])
             overrides["preprocessing_cache_version"] = f"synthetic_linked_ode_{stage}_{eff_scale}"
             print(f"[runner] stage={stage} scale={eff_scale} | rna={rna_path}")
 
-        base_cfg = {**defaults, **overrides}
+        # --set / --seeds are folded in HERE, not later at the per-model merge: the
+        # seed list and the seeded-model set are read off base_cfg below, so an
+        # override applied after this point would be accepted, written into
+        # run_config.yaml, and still have no effect on which seeds actually run.
+        base_cfg = {**defaults, **overrides, **cli_overrides}
 
         # Fail fast on a missing anchor CSV: a wrong path (e.g. a typo'd filename)
         # would otherwise fall through to a silent no-anchor run.
-        effective_csv = cli_overrides.get("beta_anchor_csv", base_cfg.get("beta_anchor_csv"))
+        effective_csv = base_cfg.get("beta_anchor_csv")
         if effective_csv and not Path(effective_csv).exists():
             raise FileNotFoundError(
                 f"beta_anchor_csv for dataset '{name}' does not exist: {effective_csv}"
@@ -730,13 +736,9 @@ def run_training(
             seeds = multi_seeds if model_name in seeded else default_seeds
             for seed in seeds:
                 # Order: dataset defaults → --set → per-model overrides (kot_nodyn
-                # still forces lambda_dyn=0 even if --set lambda_dyn=N).
-                pre_override = {
-                    **base_cfg,
-                    **cli_overrides,
-                    "model": model_name,
-                    "seed": seed,
-                }
+                # still forces lambda_dyn=0 even if --set lambda_dyn=N). base_cfg
+                # already carries --set.
+                pre_override = {**base_cfg, "model": model_name, "seed": seed}
                 model_overrides = MODEL_OVERRIDES.get(model_name, {})
                 assert_override_is_effective(model_name, pre_override, model_overrides)
                 run_cfg = {**pre_override, **model_overrides}
@@ -812,6 +814,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets", type=str, default=None,
                         help="Comma-separated subset of the config's datasets to run "
                              "(e.g. bmmc_cite). Defaults to every dataset in the config.")
+    parser.add_argument("--seeds", type=str, default=None,
+                        help="Comma-separated seeds for the stochastic models, e.g. "
+                             "--seeds 42,123,2026. Overrides the dataset's `seeds:` list "
+                             "for this run only, so a sweep can change seed count without "
+                             "editing config/training.yaml (which would race with jobs "
+                             "still launching).")
+    parser.add_argument("--no-predictions", action="store_true",
+                        help="Skip the global data/predictions/*.h5ad write. Use this for "
+                             "every parallel sweep: that path is keyed only by model + "
+                             "dataset + seed, so runs differing only in hyperparameters "
+                             "collide on the HDF5 file lock and die.")
     parser.add_argument(
         "--set",
         dest="set_overrides",
@@ -827,6 +840,11 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    overrides = parse_set_overrides(args.set_overrides)
+    if args.seeds is not None:
+        overrides["seeds"] = parse_seed_spec(args.seeds)
+    if args.no_predictions:
+        overrides["save_prediction_h5ad"] = False
     run_training(
         config_path=args.config,
         stage=args.stage,
@@ -834,5 +852,5 @@ if __name__ == "__main__":
         run_dir=args.run_dir,
         models=args.models,
         datasets_filter=args.datasets,
-        set_overrides=parse_set_overrides(args.set_overrides),
+        set_overrides=overrides,
     )

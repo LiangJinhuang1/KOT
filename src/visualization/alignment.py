@@ -6,11 +6,14 @@ each one lands as an embeddable vector PDF alongside a 300-dpi PNG.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.lines import Line2D
-from pathlib import Path
+from scipy.stats import gaussian_kde
+from sklearn.neighbors import NearestNeighbors
 
 from src.visualization import (
     FOSCTTM_CHANCE,
@@ -20,6 +23,7 @@ from src.visualization import (
     state_label,
 )
 from src.visualization.style import (
+    SCATTER_STYLE,
     apply_style,
     chance_line,
     embedding_axes,
@@ -35,23 +39,16 @@ from src.visualization.reduce import (
     reduction_title,
 )
 
-# Scatter defaults tuned for a 5.5in-wide figure at 300 dpi.
-_PT = dict(s=1.6, alpha=0.55, linewidths=0, rasterized=True)
-
 
 def prefer_time_coloring(obs) -> bool:
     return "state" in obs.columns and "time" in obs.columns and obs["state"].nunique() == 1
-
-
-def _second_label(obs=None, default: str = "Protein") -> str:
-    return default
 
 
 def scatter_state_panel(ax, xy, obs, *, show_legend: bool = False, cbar: bool = False):
     """Colour an embedding by cell state, or by time when there is only one state."""
     if prefer_time_coloring(obs):
         sc = ax.scatter(xy[:, 0], xy[:, 1], c=obs["time"].values,
-                        cmap="viridis", **_PT)
+                        cmap="viridis", **SCATTER_STYLE)
         if cbar:
             cb = plt.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
             cb.set_label("Pseudotime")
@@ -62,7 +59,7 @@ def scatter_state_panel(ax, xy, obs, *, show_legend: bool = False, cbar: bool = 
     colors = state_color_map(states)
     for state, color in colors.items():
         mask = states == state
-        ax.scatter(xy[mask, 0], xy[mask, 1], c=color, label=state_label(state), **_PT)
+        ax.scatter(xy[mask, 0], xy[mask, 1], c=color, label=state_label(state), **SCATTER_STYLE)
     if show_legend and colors:
         ax.legend(markerscale=4, loc="best")
     return colors
@@ -73,9 +70,9 @@ def scatter_dual_modality_panel(ax, xy_rna, xy_prot, obs, *, second_label="Prote
     if prefer_time_coloring(obs):
         time = obs["time"].values
         ax.scatter(xy_rna[:, 0], xy_rna[:, 1], c=time, cmap="viridis",
-                   marker=MODALITY_MARKERS["RNA"], **_PT)
+                   marker=MODALITY_MARKERS["RNA"], **SCATTER_STYLE)
         ax.scatter(xy_prot[:, 0], xy_prot[:, 1], c=time, cmap="viridis",
-                   marker=MODALITY_MARKERS.get(second_label, "^"), **_PT)
+                   marker=MODALITY_MARKERS.get(second_label, "^"), **SCATTER_STYLE)
         return
 
     states = obs["state"].values
@@ -83,9 +80,9 @@ def scatter_dual_modality_panel(ax, xy_rna, xy_prot, obs, *, second_label="Prote
     for state, color in colors.items():
         mask = states == state
         ax.scatter(xy_rna[mask, 0], xy_rna[mask, 1], c=color,
-                   marker=MODALITY_MARKERS["RNA"], **_PT)
+                   marker=MODALITY_MARKERS["RNA"], **SCATTER_STYLE)
         ax.scatter(xy_prot[mask, 0], xy_prot[mask, 1], c=color,
-                   marker=MODALITY_MARKERS.get(second_label, "^"), **_PT)
+                   marker=MODALITY_MARKERS.get(second_label, "^"), **SCATTER_STYLE)
 
     # Two palettes, two legends (§4.6): state carries hue, modality carries shape.
     state_handles = [
@@ -124,11 +121,6 @@ def modality_mixing(xy_rna: np.ndarray, xy_prot: np.ndarray, *, k: int = 15,
     is the number the "after alignment, by modality" panel is really asking about,
     so it is reported on the panel rather than left to the reader's eye.
     """
-    try:
-        from sklearn.neighbors import NearestNeighbors
-    except ImportError:
-        return None
-
     rng = np.random.default_rng(random_state)
     n_r, n_p = len(xy_rna), len(xy_prot)
     if n_r == 0 or n_p == 0:
@@ -208,10 +200,10 @@ def plot_coembedding(
     # --- Row 2: after alignment. One shared coordinate system ----------------
     ax = axes[1, 0]
     ax.scatter(xy_rna_after[:, 0], xy_rna_after[:, 1], c=MODALITY_COLORS["RNA"],
-               marker=MODALITY_MARKERS["RNA"], label="RNA", **_PT)
+               marker=MODALITY_MARKERS["RNA"], label="RNA", **SCATTER_STYLE)
     ax.scatter(xy_prot_after[:, 0], xy_prot_after[:, 1],
                c=MODALITY_COLORS.get(second_label, MODALITY_COLORS["Protein"]),
-               marker=MODALITY_MARKERS.get(second_label, "^"), label=second_label, **_PT)
+               marker=MODALITY_MARKERS.get(second_label, "^"), label=second_label, **SCATTER_STYLE)
     mixing = modality_mixing(xy_rna_after, xy_prot_after, random_state=random_state)
     title = "Co-embedding, by modality"
     if mixing is not None:
@@ -301,19 +293,16 @@ def plot_foscttm_sorted(foscttm_csv, save_dir, model_name):
     return save_figure(fig, save_dir / "foscttm_sorted")
 
 
-def _density(values: np.ndarray, grid: np.ndarray):
-    """Gaussian KDE with a histogram fallback for degenerate inputs."""
+def density(values: np.ndarray, grid: np.ndarray):
+    """Gaussian KDE of ``values`` over ``grid``, or None if the input is degenerate.
+
+    A KDE needs spread to estimate: fewer than three points, or a constant
+    vector, has none, so those return None and the caller skips the ridge.
+    """
     values = values[np.isfinite(values)]
     if len(values) < 3 or np.allclose(values, values[0]):
         return None
-    try:
-        from scipy.stats import gaussian_kde
-        return gaussian_kde(values)(grid)
-    except Exception:
-        counts, edges = np.histogram(values, bins=40, range=(grid[0], grid[-1]),
-                                     density=True)
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        return np.interp(grid, centers, counts)
+    return gaussian_kde(values)(grid)
 
 
 def plot_foscttm_distribution(foscttm_csv, obs, save_dir, model_name):
@@ -346,14 +335,14 @@ def plot_foscttm_distribution(foscttm_csv, obs, save_dir, model_name):
     step = 1.0
     peak = 0.0
     for i, (_, vals, _) in enumerate(groups):
-        d = _density(vals, grid)
+        d = density(vals, grid)
         if d is not None:
             peak = max(peak, float(d.max()))
     scale = (step * 0.9) / peak if peak > 0 else 1.0
 
     for i, (name, vals, color) in enumerate(reversed(groups)):
         base = i * step
-        d = _density(vals, grid)
+        d = density(vals, grid)
         if d is None:
             continue
         ax.fill_between(grid, base, base + d * scale, color=color, alpha=0.75,
@@ -381,8 +370,8 @@ def plot_foscttm_distribution(foscttm_csv, obs, save_dir, model_name):
     return save_figure(fig, save_dir / "foscttm_distribution")
 
 
-def _settling_epoch(epochs: np.ndarray, values: np.ndarray,
-                    tol: float = 0.5) -> float | None:
+def settling_epoch(epochs: np.ndarray, values: np.ndarray,
+                   tol: float = 0.5) -> float | None:
     """First epoch after which the loss stays within ``tol`` (relative) of its final value.
 
     Computed rather than asserted: a hard-coded "converges by epoch 40" in the
@@ -434,7 +423,7 @@ def plot_training_loss(loss_csv, save_dir, model_name):
         ax.annotate(label, xy=(x_max, safe[-1]),
                     xytext=(3, 0), textcoords="offset points",
                     fontsize=6, color=ink(color), va="center", ha="left")
-        settle_epochs.append(_settling_epoch(df["epoch"].to_numpy(), safe))
+        settle_epochs.append(settling_epoch(df["epoch"].to_numpy(), safe))
 
     ax.set_yscale("log")
     ax.set_xlabel("Epoch")
