@@ -1,0 +1,4 @@
+include README.md
+include environment.yml
+recursive-include config *.csv *.md *.yaml
+recursive-include slurm *.sh

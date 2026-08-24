@@ -1,8 +1,8 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import anndata as ad
-import torch
-from pathlib import Path
+from scipy.spatial.distance import cdist
 
 PREDICTIONS_DIR = Path("data/predictions")
 
@@ -15,9 +15,28 @@ def calc_frac_idx(x1_mat: np.ndarray, x2_mat: np.ndarray, batch_size: int = 1000
     dense NumPy version, but the O(n²) distance work is the bottleneck at large
     n (e.g. 90k cells), so the device matters. Row-batched to bound memory.
     """
+    x1_array = np.asarray(x1_mat, dtype=np.float32)
+    x2_array = np.asarray(x2_mat, dtype=np.float32)
+    if x1_array.ndim != 2 or x2_array.ndim != 2:
+        raise ValueError("FOSCTTM inputs must both be two-dimensional matrices.")
+    if x1_array.shape != x2_array.shape:
+        raise ValueError(
+            "FOSCTTM inputs must have the same paired shape; "
+            f"got {x1_array.shape} and {x2_array.shape}."
+        )
+    if x1_array.shape[0] < 2:
+        raise ValueError("FOSCTTM requires at least two paired observations.")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
+
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return _calc_frac_idx_numpy(x1_array, x2_array, batch_size)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    x1 = torch.as_tensor(np.asarray(x1_mat), dtype=torch.float32, device=device)
-    x2 = torch.as_tensor(np.asarray(x2_mat), dtype=torch.float32, device=device)
+    x1 = torch.as_tensor(x1_array, dtype=torch.float32, device=device)
+    x2 = torch.as_tensor(x2_array, dtype=torch.float32, device=device)
     n = x1.shape[0]
     fracs = torch.empty(n, dtype=torch.float32, device=device)
 
@@ -30,6 +49,22 @@ def calc_frac_idx(x1_mat: np.ndarray, x2_mat: np.ndarray, batch_size: int = 1000
         fracs[start:end] = (dists < true_dists[:, None]).sum(dim=1).float() / (n - 1)
 
     return fracs.cpu().tolist()
+
+
+def _calc_frac_idx_numpy(
+    x1: np.ndarray, x2: np.ndarray, batch_size: int
+) -> list[float]:
+    """CPU fallback used when PyTorch is not installed."""
+    n = x1.shape[0]
+    fracs = np.empty(n, dtype=np.float32)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        dists = cdist(x1[start:end], x2)
+        rows = np.arange(end - start)
+        cols = np.arange(start, end)
+        true_dists = dists[rows, cols]
+        fracs[start:end] = np.sum(dists < true_dists[:, None], axis=1) / (n - 1)
+    return fracs.tolist()
 
 
 def calc_domainAveraged_FOSCTTM(x1_mat: np.ndarray, x2_mat: np.ndarray) -> list[float]:
@@ -61,6 +96,8 @@ def save_prediction_h5ad(
     second_label: str,
     obs_names,
 ) -> None:
+    import anndata as ad
+
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     adata = ad.AnnData(X=aligned[0])
     adata.obs_names = list(obs_names)
@@ -91,7 +128,12 @@ def evaluate_and_save(
     # FOSCTTM across independently-aligned batches would be meaningless).
     if foscttm_scores is None:
         foscttm_scores = calc_domainAveraged_FOSCTTM(aligned[0], aligned[1])
-    mean_foscttm = float(np.mean(foscttm_scores))
+    finite_scores = np.asarray(foscttm_scores, dtype=np.float64)
+    mean_foscttm = (
+        float(np.mean(finite_scores[np.isfinite(finite_scores)]))
+        if np.isfinite(finite_scores).any()
+        else float("nan")
+    )
     if degenerate:
         print(
             f"[{name}] WARNING: aligned embedding collapsed to a single point — "

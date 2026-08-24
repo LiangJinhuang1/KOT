@@ -57,6 +57,7 @@ from src.training.kot import (
     build_effective_velocity,
     build_velocity_weight,
     compute_velocity_backend_agreement,
+    DiagInputs,
     compute_full_diagnostics,
     compute_per_cell_diagnostics,
     matrix_from_adata,
@@ -491,26 +492,9 @@ def evaluate_one_checkpoint(
     state_dict = {k: v.to(target_device) for k, v in ckpt["state_dict"].items()}
     model.load_state_dict(state_dict)
 
-    diagnostics = compute_full_diagnostics(
-        model,
-        R_t,
-        V_eff_t,
-        P_t,
-        S_t,
-        rna_obs,
-        mask=mask_t,
-        align_cols=align_cols,
-    )
-    per_cell = compute_per_cell_diagnostics(
-        model,
-        R_t,
-        V_eff_t,
-        P_t,
-        S_t,
-        rna_obs,
-        mask=mask_t,
-        align_cols=align_cols,
-    )
+    diag_inputs = DiagInputs(R_t, V_eff_t, P_t, S_t, rna_obs, mask_t, align_cols)
+    diagnostics = compute_full_diagnostics(model, diag_inputs)
+    per_cell = compute_per_cell_diagnostics(model, diag_inputs)
     mean_foscttm = float(np.mean(per_cell["foscttm"]))
 
     if velocity_backend:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import importlib
 import json
 import re
 import sys
@@ -11,15 +13,9 @@ from pathlib import Path
 import numpy as np
 
 from src.utils.io import load_yaml, save_yaml
+from src.utils.arrays import matrix_from_adata
 from src.data.preprocessing import load_and_preprocess_cached
 from src.data.synthetic_linked_ode import stage_output_paths
-from src.training.scot import run_scot
-from src.training.moscot import run_moscot
-from src.training.glue import run_glue
-from src.training.uniport import run_uniport
-from src.training.totalvi import run_totalvi
-from src.training.linear_ode import run_linear_ode
-from src.training.kot import run_kot, matrix_from_adata
 from src.evaluation.foscttm import evaluate_and_save, calc_domainAveraged_FOSCTTM
 from src.visualization.alignment import (
     coembedding_plot_kwargs,
@@ -30,6 +26,7 @@ from src.visualization.alignment import (
     plot_training_loss,
 )
 from src.visualization.results import save_comparison_table
+from src.visualization.runs import run_flags
 
 DATASETS_CONFIG = Path("config/datasets.yaml")
 TRAINING_CONFIG = Path("config/training.yaml")
@@ -38,8 +35,9 @@ TRAINING_CONFIG = Path("config/training.yaml")
 class Tee:
     """Duplicate writes to multiple streams (e.g., stdout + file)."""
 
-    def __init__(self, *streams):
+    def __init__(self, *streams, close_streams=()):
         self.streams = streams
+        self.close_streams = tuple(close_streams)
 
     def write(self, data):
         for s in self.streams:
@@ -53,6 +51,10 @@ class Tee:
     def isatty(self):
         return False
 
+    def close(self):
+        for stream in self.close_streams:
+            stream.close()
+
 # Registry: model name → alignment function
 # Each function accepts (context, cfg) and returns (aligned, coupling).
 # context keys:
@@ -62,23 +64,49 @@ class Tee:
 #   second_adata — full second modality AnnData
 #   second_label — "protein" or "atac"
 MODELS = {
-    "scot":        run_scot,
-    "moscot":      run_moscot,
-    "glue":        run_glue,
-    "uniport":     run_uniport,
-    "totalvi":        run_totalvi,
-    "linear_ode":  run_linear_ode,
-    "kot":            run_kot,
-    "kot_nodyn":      run_kot,
-    "kot_fixedkappa": run_kot,
-    "kot_fixedalpha": run_kot,
-    "kot_oracle":     run_kot,
-    "kot_oracle_learnalpha":       run_kot,
-    "kot_oracle_learnalpha_kappa": run_kot,
-    "kot_unbounded":    run_kot,
-    "kot_unbounded_sn": run_kot,
-    "kot_noanchor":   run_kot,
+    "scot": ("src.training.scot", "run_scot"),
+    "moscot": ("src.training.moscot", "run_moscot"),
+    "glue": ("src.training.glue", "run_glue"),
+    "uniport": ("src.training.uniport", "run_uniport"),
+    "totalvi": ("src.training.totalvi", "run_totalvi"),
+    "linear_ode": ("src.training.linear_ode", "run_linear_ode"),
+    "kot": ("src.training.kot", "run_kot"),
+    "kot_nodyn": ("src.training.kot", "run_kot"),
+    "kot_fixedkappa": ("src.training.kot", "run_kot"),
+    "kot_fixedalpha": ("src.training.kot", "run_kot"),
+    "kot_oracle": ("src.training.kot", "run_kot"),
+    "kot_oracle_learnalpha": ("src.training.kot", "run_kot"),
+    "kot_oracle_learnalpha_kappa": ("src.training.kot", "run_kot"),
+    "kot_unbounded": ("src.training.kot", "run_kot"),
+    "kot_unbounded_sn": ("src.training.kot", "run_kot"),
+    "kot_noanchor": ("src.training.kot", "run_kot"),
 }
+
+MODEL_EXTRAS = {
+    "kot": "kot",
+    "moscot": "baselines",
+    "glue": "baselines",
+    "totalvi": "baselines",
+}
+
+
+def load_model_runner(model_name: str):
+    """Import a selected model backend without importing every optional stack."""
+    module_name, function_name = MODELS[model_name]
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        extra = MODEL_EXTRAS.get("kot" if model_name.startswith("kot") else model_name)
+        install_hint = (
+            f" Install the optional dependencies with `pip install -e '.[{extra}]'`."
+            if extra
+            else " Check that the repository's vendor dependencies are available."
+        )
+        raise ModuleNotFoundError(
+            f"Cannot load model '{model_name}' because dependency "
+            f"'{exc.name}' is missing.{install_hint}"
+        ) from exc
+    return getattr(module, function_name)
 
 # Per-model config overrides injected automatically at runtime
 MODEL_OVERRIDES = {
@@ -270,6 +298,94 @@ def json_ready_value(value):
     return value
 
 
+# The columns a sweep is actually read on: what was configured, what came out, and
+# whether the run is usable at all. Everything else stays in diagnostics.json — this is
+# the short list you can hold in your head, not a second copy of the diagnostics.
+# Baselines leave the KOT-only columns empty rather than being given a separate shape.
+SUMMARY_CONFIG_KEYS = [
+    "lambda_dyn", "lambda_prior", "lambda_kappa_prior", "kot_kappa_prior",
+    "lr", "lr_phi", "lr_alpha_kappa", "lr_beta",
+    "lr_warmup_epochs", "lr_warmup_start_factor", "lr_min_factor",
+    "n_epochs", "early_stopping_patience", "batch_size", "sinkhorn_reg",
+    "dyn_warmup_epochs", "g_freeze_epochs",
+    "kot_velocity_gauge_normalize", "use_anchor",
+]
+SUMMARY_METRIC_KEYS = [
+    "mean_foscttm", "runtime_seconds",
+    "jvp_rhs_cos_median", "rel_residual_median", "time_spearman", "time_mae",
+    "phi_variance_ratio", "kappa_median", "alpha_median", "beta_mean",
+    "grad_norm_median",
+    "best_align", "best_align_epoch", "best_total", "stop_epoch",
+]
+
+
+def merged_diagnostics(output_dir: Path, diagnostics: dict) -> dict:
+    """The complete metric set for this arm, which only exists on disk.
+
+    run_kot writes its own diagnostics.json before returning and hands back a 3-tuple
+    with no diagnostics dict, so split_model_result yields {} and the in-memory dict
+    here holds ONLY what the runner added: dataset, model, seed, runtime, FOSCTTM.
+    save_diagnostics has already merged the two into the file, so reading it back is
+    what stops summary.txt, run_row.csv and the flag from being computed on a fifth of
+    the metrics -- a run whose cosine says dyn-dead was being labelled "ok".
+    """
+    on_disk = json.loads((output_dir / "diagnostics.json").read_text())
+    return {**on_disk, **diagnostics}
+
+
+def summary_record(name: str, model_name: str, run_seed, run_cfg: dict,
+                   diagnostics: dict, output_dir: Path) -> dict:
+    """One flat record per finished arm: identity, config, metrics, verdict.
+
+    `flag` is the point of writing this at all. A dyn-dead or collapsed run still
+    produces a FOSCTTM that ranks perfectly respectably, so the verdict has to travel
+    WITH the run — by the time a sweep is being read as a table, nobody re-derives it.
+    """
+    record = {
+        "dataset": name,
+        "model": model_name,
+        "seed": "-" if run_seed is None else int(run_seed),
+        "run_dir": str(output_dir),
+        # "ok" rather than "" so a healthy run says so out loud: an absent flag line
+        # would be indistinguishable from a summary written before flags existed.
+        "flag": run_flags(diagnostics) or "ok",
+    }
+    record.update({key: diagnostics.get(key) for key in SUMMARY_METRIC_KEYS})
+    record.update({key: run_cfg.get(key) for key in SUMMARY_CONFIG_KEYS})
+    return record
+
+
+def save_summary(output_dir: Path, record: dict, provenance: dict) -> None:
+    """summary.txt to read, run_row.csv to concatenate — the same run, two shapes.
+
+    run_row.csv carries `record` ONLY, so every arm writes the identical column set and
+    a directory of them concatenates without aligning headers:
+
+        head -1 <any>/run_row.csv; tail -qn +2 cache/training/*/*/*/*/run_row.csv
+
+    Provenance (which representation, which modality pair, baseline-specific fields)
+    varies per model, so it goes to summary.txt alone rather than making the CSV ragged.
+
+    summary.txt stays the resume marker — run_one skips any arm that has one — so it is
+    written LAST: a crash between the two leaves the arm looking unfinished and it gets
+    retried, rather than looking finished with half a row on disk.
+    """
+    with open(output_dir / "run_row.csv", "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(record))
+        writer.writeheader()
+        writer.writerow(record)
+
+    lines = {**record, **provenance}
+    width = max(len(key) for key in lines) + 2
+    with open(output_dir / "summary.txt", "w") as handle:
+        for key, value in lines.items():
+            if value is None or value == "":
+                continue
+            # %g, not a fixed 6 decimals: `lambda_dyn: 1000` reads, `1000.000000` does not.
+            text = f"{value:g}" if isinstance(value, float) else str(value)
+            handle.write(f"{key + ':':{width}}{text}\n")
+
+
 def save_diagnostics(output_dir: Path, diagnostics: dict) -> None:
     if not diagnostics:
         return
@@ -349,9 +465,14 @@ def run_alignment_per_batch(align_fn, x, y, rna_adata, second_adata,
             aligned_second = np.zeros((n, pb.shape[1]), dtype=np.float32)
         aligned_rna[idx] = rb
         aligned_second[idx] = pb
-        foscttm[idx] = np.asarray(calc_domainAveraged_FOSCTTM(rb, pb))
+        if len(idx) < 2:
+            foscttm[idx] = np.nan
+            print(f"    [batch {b}] 1 cell | FOSCTTM undefined; recording NaN")
+        else:
+            foscttm[idx] = np.asarray(calc_domainAveraged_FOSCTTM(rb, pb))
         batch_diags.append(diag_b)
-        print(f"    [batch {b}] {len(idx)} cells | FOSCTTM={foscttm[idx].mean():.4f}")
+        if len(idx) >= 2:
+            print(f"    [batch {b}] {len(idx)} cells | FOSCTTM={foscttm[idx].mean():.4f}")
 
     return [aligned_rna, aligned_second], foscttm.tolist(), aggregate_batch_diagnostics(batch_diags)
 
@@ -504,7 +625,7 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
     context = build_context(x, y, rna_adata, second_adata, second_label, modality_pair)
     context["output_dir"] = output_dir
 
-    align_fn = MODELS[model_name]
+    align_fn = load_model_runner(model_name)
     batch_key = run_cfg.get("align_batch_key")
     per_batch = (
         batch_key is not None
@@ -552,24 +673,23 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
         loss_df.to_csv(loss_csv, index=False)
         plot_training_loss(loss_csv, output_dir, model_name)
 
-    with open(output_dir / "summary.txt", "w") as f:
-        f.write(f"dataset:        {name}\n")
-        f.write(f"model:          {model_name}\n")
-        if run_seed is not None:
-            f.write(f"seed:           {run_seed}\n")
-        f.write(f"modality_pair:  {modality_pair}\n")
-        f.write(f"rna_repr:       {rna_repr_key} {x.shape}\n")
-        f.write(f"second_repr:    {second_repr_key} {y.shape}\n")
-        f.write(f"mean_foscttm:   {mean_foscttm:.6f}\n")
-        f.write(f"runtime_sec:    {runtime_seconds:.6f}\n")
-        for key in (
-            "moscot_converged",
-            "moscot_cost",
-            "coupling_entropy",
-            "coupling_effective_sparsity",
-        ):
-            if key in diagnostics:
-                f.write(f"{key}: {diagnostics[key]}\n")
+    provenance = {
+        "modality_pair": modality_pair,
+        "rna_repr":      f"{rna_repr_key} {x.shape}",
+        "second_repr":   f"{second_repr_key} {y.shape}",
+    }
+    provenance.update({
+        key: diagnostics[key] for key in (
+            "moscot_converged", "moscot_cost",
+            "coupling_entropy", "coupling_effective_sparsity",
+        ) if key in diagnostics
+    })
+    save_summary(
+        output_dir,
+        summary_record(name, model_name, run_seed, run_cfg,
+                       merged_diagnostics(output_dir, diagnostics), output_dir),
+        provenance,
+    )
 
     # FOSCTTM plots are modality-agnostic (distribution degrades to a plain
     # histogram without ground-truth branches), so they run on real data too.
@@ -595,8 +715,9 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
     print(f"[runner] results saved to {output_dir}/")
 
 
-def run_training(
+def _run_training(
     config_path: Path = TRAINING_CONFIG,
+    datasets_config_path: Path | None = None,
     stage: str | None = None,
     scale: str | None = None,
     run_dir: Path | None = None,
@@ -605,7 +726,10 @@ def run_training(
     set_overrides: dict | None = None,
 ) -> None:
     train_cfg = load_yaml(config_path)
-    datasets = load_yaml(DATASETS_CONFIG).get("datasets", {})
+    if datasets_config_path is None:
+        sibling_config = Path(config_path).with_name("datasets.yaml")
+        datasets_config_path = sibling_config if sibling_config.exists() else DATASETS_CONFIG
+    datasets = load_yaml(datasets_config_path).get("datasets", {})
     defaults = train_cfg.get("defaults", {})
     stage_overrides_cfg = train_cfg.get("stage_overrides", {})
     cli_overrides = dict(set_overrides or {})
@@ -668,7 +792,7 @@ def run_training(
 
     log_path = run_root / log_name
     log_file = open(log_path, "w", buffering=1)
-    sys.stdout = Tee(sys.stdout, log_file)
+    sys.stdout = Tee(sys.stdout, log_file, close_streams=(log_file,))
     sys.stderr = Tee(sys.stderr, log_file)
 
     print(f"[runner] Run timestamp: {timestamp}")
@@ -686,7 +810,7 @@ def run_training(
         if selected_datasets is not None and name not in selected_datasets:
             continue
         if name not in datasets:
-            raise ValueError(f"Dataset '{name}' is not defined in {DATASETS_CONFIG}.")
+            raise ValueError(f"Dataset '{name}' is not defined in {datasets_config_path}.")
         if name not in trained_datasets:
             trained_datasets.append(name)
         dataset = datasets[name]
@@ -758,6 +882,39 @@ def run_training(
         )
 
 
+def run_training(
+    config_path: Path = TRAINING_CONFIG,
+    datasets_config_path: Path | None = None,
+    stage: str | None = None,
+    scale: str | None = None,
+    run_dir: Path | None = None,
+    models: str | None = None,
+    datasets_filter: str | None = None,
+    set_overrides: dict | None = None,
+) -> None:
+    """Run training while keeping process-global output streams well scoped."""
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    try:
+        _run_training(
+            config_path=config_path,
+            datasets_config_path=datasets_config_path,
+            stage=stage,
+            scale=scale,
+            run_dir=run_dir,
+            models=models,
+            datasets_filter=datasets_filter,
+            set_overrides=set_overrides,
+        )
+    finally:
+        active_streams = (sys.stdout, sys.stderr)
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        for stream in active_streams:
+            if stream not in (original_stdout, original_stderr) and isinstance(stream, Tee):
+                stream.close()
+
+
 INT_PATTERN = re.compile(r"[+-]?\d+$")
 FLOAT_PATTERN = re.compile(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?$")
 
@@ -793,10 +950,17 @@ def parse_set_overrides(items: list[str] | None) -> dict:
     return out
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run KOT / baseline training from config.")
     parser.add_argument("--config", type=Path, default=TRAINING_CONFIG,
                         help="Training config YAML.")
+    parser.add_argument(
+        "--datasets-config",
+        type=Path,
+        default=None,
+        help="Dataset config YAML. Defaults to datasets.yaml beside --config, then "
+             "config/datasets.yaml.",
+    )
     parser.add_argument("--stage", choices=["oracle", "clean", "branch"], default=None,
                         help="Staged synthetic: overrides data path, feature layers, "
                              "anchor indices, and the preprocessing cache version.")
@@ -835,11 +999,12 @@ def parse_args() -> argparse.Namespace:
              "Applied after dataset defaults; per-model overrides (e.g. kot_nodyn "
              "forces lambda_dyn=0) still win.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    """Console entry point for installed and module-based execution."""
+    args = parse_args(argv)
     overrides = parse_set_overrides(args.set_overrides)
     if args.seeds is not None:
         overrides["seeds"] = parse_seed_spec(args.seeds)
@@ -847,6 +1012,7 @@ if __name__ == "__main__":
         overrides["save_prediction_h5ad"] = False
     run_training(
         config_path=args.config,
+        datasets_config_path=args.datasets_config,
         stage=args.stage,
         scale=args.scale,
         run_dir=args.run_dir,
@@ -854,3 +1020,7 @@ if __name__ == "__main__":
         datasets_filter=args.datasets,
         set_overrides=overrides,
     )
+
+
+if __name__ == "__main__":
+    main()

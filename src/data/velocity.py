@@ -3,12 +3,10 @@ from __future__ import annotations
 import argparse
 import gc
 import importlib
-import os
 import re
 from pathlib import Path
 
 import anndata as ad
-import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -17,6 +15,7 @@ import scvelo as scv
 from scipy import sparse
 from scipy.io import mmread
 
+from src.data.io import is_valid_h5ad, write_h5ad_atomic
 from src.data.transforms import reduce_rna
 from src.data.adt_gene_map import (
     aliases_for_positions,
@@ -49,26 +48,6 @@ def as_path(config: dict, key: str, required: bool = False) -> Path | None:
             raise ValueError(f"Missing required config value: {key}")
         return None
     return Path(value)
-
-
-def is_valid_h5ad(path: Path) -> bool:
-    if not path.exists() or path.stat().st_size == 0:
-        return False
-    if not h5py.is_hdf5(path):
-        return False
-    with h5py.File(path, "r") as handle:
-        return "obs" in handle and "var" in handle
-
-
-def write_h5ad_atomic(adata: ad.AnnData, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
-    if tmp_path.exists():
-        tmp_path.unlink()
-    adata.write_h5ad(tmp_path)
-    if not is_valid_h5ad(tmp_path):
-        raise OSError(f"Temporary h5ad failed validation after write: {tmp_path}")
-    tmp_path.replace(output_path)
 
 
 def load_regvelo_runner():

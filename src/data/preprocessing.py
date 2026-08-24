@@ -5,6 +5,7 @@ import pandas as pd
 import scanpy as sc
 from scipy.sparse import csr_matrix
 
+from src.data.io import write_h5ad_atomic
 from src.data.transforms import (
     qc_rna,
     qc_protein,
@@ -17,19 +18,6 @@ from src.data.transforms import (
     reduce_protein,
     reduce_atac,
 )
-
-
-def write_h5ad_atomic(adata, path: str) -> None:
-    """Write to a per-process temp file then os.replace into place.
-
-    os.replace is atomic on the filesystem, so concurrent jobs that share a preprocessing
-    cache key (e.g. many runs of the same dataset packed on one GPU) never see a partial
-    file: readers get either the old or a complete new h5ad, and racing writers just
-    redundantly recompute — the last replace wins with a valid file.
-    """
-    tmp = f"{path}.tmp.{os.getpid()}"
-    adata.write_h5ad(tmp)
-    os.replace(tmp, path)
 
 
 # --- UMAP utilities ---

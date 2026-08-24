@@ -16,6 +16,17 @@ Usage
   python tools/collect_run_diagnostics.py --aggregate          # mean±sd over seeds
   python tools/collect_run_diagnostics.py --all-checkpoints    # + best_align/best_dyn/...
   python tools/collect_run_diagnostics.py --hparams lambda_dyn,lr --all-diagnostics
+  python tools/collect_run_diagnostics.py --group-by lambda_dyn,lambda_kappa_prior
+
+--group-by is the one to reach for on a sweep: it keys the table on the values a run was
+CONFIGURED with instead of the string its directory is named, so an axis becomes a
+sortable column rather than a substring like `lam1000_lkp0p1_kt0p69`. It also pools a
+sweep that was interrupted and resumed under a second stamp, and writes a small
+<out>_by_config.csv -- one row per cell -- next to the per-seed CSV.
+
+Cells are flagged (degenerate / collapsed / dyn-dead) because none of those failures is
+visible in the FOSCTTM ranking and one of them sorts first. A flagged cell is not a
+result no matter where it ranks.
 
 A run that crashed mid-arm still gets a row with status=missing_foscttm/no_diagnostics,
 so a silently lost sweep cell shows up instead of just being absent from the table.
@@ -54,9 +65,34 @@ DEFAULT_METRICS = [
     "velocity_backend_cos_median",
     "best_align", "best_align_epoch", "best_dyn", "best_dyn_epoch",
     "best_total", "best_total_epoch", "stop_epoch",
+    # Pre-clip gradient norm. It sits ~100-6000x above the fixed 1.0 budget, so the
+    # clip binds on every step and acts as a renormalizer rather than a spike guard.
+    "grad_norm_median",
 ]
 
 CHECKPOINTS = ["training", "final", "best_align", "best_dyn", "best_total"]
+
+# Metrics carried into the per-config table as mean ± sd over every seed in the cell.
+AGGREGATE_METRICS = [
+    "mean_foscttm", "jvp_rhs_cos_median", "rel_residual_median", "time_spearman",
+    "phi_variance_ratio", "kappa_median", "alpha_median", "beta_mean",
+    # beta_anchor_mean_abs_err is the identifiability claim itself -- how far the
+    # learned beta lands from its anchor target. It moves independently of FOSCTTM,
+    # so it has to be in the table rather than looked up per-run afterwards.
+    "beta_anchor_mean_abs_err",
+    "grad_norm_median", "runtime_seconds",
+]
+
+# Kept in step with PHI_COLLAPSE_THRESHOLD in src/visualization/runs.py BY HAND: that
+# module is the single source of truth for the figures, but importing it pulls
+# src/visualization/__init__.py and numpy, which would cost this tool the stdlib-only
+# property that lets it run on the login node without the container. Change both.
+PHI_COLLAPSE_THRESHOLD = 0.5
+
+# Below this JVP·RHS cosine the kinetics term is being carried but not fit. Bimodality
+# in the 20260824 tier-A sweep sets the value: healthy cells sat at 0.75-0.96 and dead
+# ones at 0.04-0.18, with nothing in between, and BOTH scored the same FOSCTTM.
+DYN_COS_MIN = 0.5
 
 # Any one of these marks a directory as a real training arm rather than a
 # run-level folder like results/. run_config.yaml is written before training
@@ -156,44 +192,119 @@ def mean_sd(values: list[float]) -> tuple[float, float]:
     return mean, var ** 0.5
 
 
-def mean_over_seeds(group: list[dict], key: str) -> str:
-    """Mean of one metric across a group's seeds, or "-" when no seed reported it.
+def numeric_values(group: list[dict], key: str) -> list[float]:
+    """A metric across a group's seeds, skipping seeds that did not report it.
 
     The per-seed value is itself usually a median over cells (jvp_rhs_cos_median,
-    rel_residual_median); this averages those medians across seeds.
+    rel_residual_median), so the mean of these is a mean of medians.
     """
-    values = [row[key] for row in group if row.get(key) is not None]
-    return f"{sum(values) / len(values):.3f}" if values else "-"
+    return [row[key] for row in group
+            if isinstance(row.get(key), (int, float)) and not isinstance(row.get(key), bool)]
 
 
-def print_aggregate(rows: list[dict], checkpoint: str) -> None:
-    """mean±sd over seeds per (run, model, dataset), ranked by FOSCTTM."""
+def cell_flag(record: dict, dyn_cos_min: float) -> str:
+    """Why a cell is not a usable result, or "" when it is.
+
+    Three failure modes, none visible in the FOSCTTM ranking -- one of them is actively
+    flattered by it -- which is the whole reason the flag exists:
+
+    degenerate -- FOSCTTM exactly 0: a shared-latent model scored against itself. It
+                 sorts FIRST, so a ranking alone presents it as the winner.
+    collapsed -- phi shrank instead of the ODE being satisfied. The kinetics residual
+                 is scale-degenerate, so this lowers the loss without fitting anything.
+    dyn-dead  -- the JVP-RHS cosine never rose: the kinetics term is carried but not
+                 fit. In the 20260824 tier-A sweep every lambda_dyn block contained one
+                 kappa-prior cell at cos < 0.2 scoring the SAME FOSCTTM as its cos > 0.9
+                 neighbour, so ranking on FOSCTTM alone picks these at random.
+    """
+    flags = []
+    score = record.get("mean_foscttm_mean")
+    if score is not None and abs(score) < 1e-12:
+        flags.append("degenerate")
+    phi = record.get("phi_variance_ratio_mean")
+    if phi is not None and phi < PHI_COLLAPSE_THRESHOLD:
+        flags.append("collapsed")
+    cos = record.get("jvp_rhs_cos_median_mean")
+    if cos is not None and cos < dyn_cos_min:
+        flags.append("dyn-dead")
+    return ",".join(flags)
+
+
+def aggregate_rows(rows: list[dict], checkpoint: str, key_columns: list[str],
+                   dyn_cos_min: float) -> list[dict]:
+    """One record per key_columns group: mean ± sd over every seed it contains.
+
+    key_columns is (run, model, dataset) by default. Passing hyperparameter names
+    instead groups by the values a run was CONFIGURED with rather than by the string
+    its directory happens to be named, which is what makes a sweep readable: the axis
+    becomes a sortable column instead of a substring like `lam1000_lkp0p1_kt0p69`. It
+    also pools an interrupted sweep that was resumed under a second stamp, since the
+    two run dirs carry the same config.
+    """
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
         if row.get("checkpoint") != checkpoint:
             continue
-        groups.setdefault((row["run"], row["model"], row["dataset"]), []).append(row)
+        groups.setdefault(tuple(row.get(col) for col in key_columns), []).append(row)
 
-    summary = []
-    for (run, model, dataset), group in groups.items():
-        scores = [r["mean_foscttm"] for r in group if r.get("mean_foscttm") is not None]
-        incomplete = len(group) - len(scores)
-        if not scores:
-            summary.append((float("inf"), run, model, dataset, None, None, 0, incomplete, group))
-            continue
-        mean, sd = mean_sd(scores)
-        summary.append((mean, run, model, dataset, mean, sd, len(scores), incomplete, group))
+    records = []
+    for key, group in groups.items():
+        record = dict(zip(key_columns, key))
+        scores = numeric_values(group, "mean_foscttm")
+        record["n"] = len(scores)
+        record["bad"] = len(group) - len(scores)
+        record["n_runs"] = len({row["run"] for row in group})
+        for metric in AGGREGATE_METRICS:
+            values = numeric_values(group, metric)
+            mean, sd = mean_sd(values) if values else (None, None)
+            record[f"{metric}_mean"] = mean
+            record[f"{metric}_sd"] = sd
+        record["flag"] = cell_flag(record, dyn_cos_min)
+        records.append(record)
 
-    summary.sort(key=lambda s: s[0])
-    print(f"{'run':44}{'model':14}{'dataset':22}{'FOSCTTM':>18}{'n':>4}{'bad':>5}"
-          f"{'cos':>8}{'relres':>8}{'tSpear':>8}")
-    for _, run, model, dataset, mean, sd, n, incomplete, group in summary:
+    records.sort(key=lambda r: (float("inf") if r["mean_foscttm_mean"] is None
+                                else r["mean_foscttm_mean"]))
+    return records
+
+
+def format_cell(value) -> str:
+    """Compact, so 0.6931471805599453 does not set the column width on its own."""
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def format_metric(value) -> str:
+    return "-" if value is None else f"{value:.3f}"
+
+
+def print_aggregate(records: list[dict], key_columns: list[str]) -> None:
+    """Ranked table, one row per config cell. Column widths follow the content.
+
+    Widths are computed rather than fixed: a sweep's run dirs share a long
+    run_<stamp>_sw<tier>_<dataset>_ prefix and differ only at the END, so the previous
+    fixed 44-char column truncated exactly the part being compared -- the 20260824
+    tier-A table printed 25 pbmc cells as five identical-looking names.
+    """
+    widths = {
+        col: max(len(col), max(len(format_cell(r.get(col))) for r in records)) + 2
+        for col in key_columns
+    }
+    print("".join(f"{col:{widths[col]}}" for col in key_columns)
+          + f"{'FOSCTTM':>18}{'n':>4}{'bad':>5}{'cos':>8}{'relres':>8}{'tSpear':>8}"
+            f"{'βerr':>8}  flag")
+    for record in records:
+        mean, sd = record["mean_foscttm_mean"], record["mean_foscttm_sd"]
         score = f"{mean:.4f} ± {sd:.4f}" if mean is not None else "CRASHED"
-        flag = "" if incomplete == 0 else f"  <-- {incomplete} incomplete"
-        print(f"{run[:43]:44}{model:14}{dataset[:21]:22}{score:>18}{n:>4}{incomplete:>5}"
-              f"{mean_over_seeds(group, 'jvp_rhs_cos_median'):>8}"
-              f"{mean_over_seeds(group, 'rel_residual_median'):>8}"
-              f"{mean_over_seeds(group, 'time_spearman'):>8}{flag}")
+        print("".join(f"{format_cell(record.get(col)):{widths[col]}}" for col in key_columns)
+              + f"{score:>18}{record['n']:>4}{record['bad']:>5}"
+              + f"{format_metric(record['jvp_rhs_cos_median_mean']):>8}"
+              + f"{format_metric(record['rel_residual_median_mean']):>8}"
+              + f"{format_metric(record['time_spearman_mean']):>8}"
+              + f"{format_metric(record['beta_anchor_mean_abs_err_mean']):>8}"
+              + (f"  {record['flag']}" if record["flag"] else ""))
 
 
 def main() -> int:
@@ -215,6 +326,14 @@ def main() -> int:
                         help="Comma-separated extra run_config keys to add as columns.")
     parser.add_argument("--aggregate", action="store_true",
                         help="Also print mean±sd over seeds, ranked by FOSCTTM.")
+    parser.add_argument("--group-by", default=None,
+                        help="Comma-separated run_config keys to key the aggregate on "
+                             "instead of the run-dir name, e.g. "
+                             "lambda_dyn,lambda_kappa_prior. model and dataset stay in "
+                             "the key. Implies --aggregate and writes <out>_by_config.csv.")
+    parser.add_argument("--dyn-cos-min", type=float, default=DYN_COS_MIN,
+                        help=f"Flag a cell dyn-dead below this JVP·RHS cosine "
+                             f"(default {DYN_COS_MIN}).")
     args = parser.parse_args()
 
     run_globs = args.runs or ["cache/training/*"]
@@ -223,6 +342,12 @@ def main() -> int:
     if args.hparams:
         hparams += [k.strip() for k in args.hparams.split(",")
                     if k.strip() and k.strip() not in hparams]
+
+    group_by = [k.strip() for k in args.group_by.split(",") if k.strip()] if args.group_by else []
+    # A --group-by key that is not collected is silently None for every row, which
+    # would collapse the whole sweep into one meaningless cell.
+    hparams += [k for k in group_by if k not in hparams]
+    key_columns = ["model", "dataset"] + group_by if group_by else ["run", "model", "dataset"]
 
     rows, metric_keys = collect(run_globs, checkpoints, hparams, args.all_diagnostics)
     if not rows:
@@ -249,9 +374,24 @@ def main() -> int:
         if len(bad) > 20:
             print(f"  ... and {len(bad) - 20} more", file=sys.stderr)
 
-    if args.aggregate:
+    if args.aggregate or group_by:
+        checkpoint = args.checkpoint if not args.all_checkpoints else "training"
+        records = aggregate_rows(rows, checkpoint, key_columns, args.dyn_cos_min)
+        if group_by:
+            by_config = args.out.with_name(f"{args.out.stem}_by_config{args.out.suffix}")
+            columns = (key_columns + ["n", "bad", "n_runs", "flag"]
+                       + [f"{m}_{stat}" for m in AGGREGATE_METRICS for stat in ("mean", "sd")])
+            with open(by_config, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(records)
+            print(f"Wrote {by_config}: {len(records)} config cells")
         print()
-        print_aggregate(rows, args.checkpoint if not args.all_checkpoints else "training")
+        print_aggregate(records, key_columns)
+        flagged = [r for r in records if r["flag"]]
+        if flagged:
+            print(f"\n{len(flagged)} of {len(records)} cells flagged — see cell_flag(). "
+                  f"A dyn-dead cell can still rank well on FOSCTTM; it is not a result.")
     return 0
 
 

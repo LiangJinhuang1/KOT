@@ -234,9 +234,8 @@ def load_mapping_records(path: Path) -> list[dict]:
     Load the full ADT→gene mapping CSV: one normalized record per row with every
     column (decision flags parsed to bool), validated by validate_mapping_records.
 
-    Unlike load_mapping_csv (which returns only the gene alias), this preserves
-    mapping_type, present_in_rna, use_for_alignment, use_for_kinetics and
-    excluded_because so the projection can honour the curated decisions.
+    Preserves mapping_type, present_in_rna, use_for_alignment, use_for_kinetics
+    and excluded_because so the projection can honour the curated decisions.
     """
     records: list[dict] = []
     with open(path) as f:
@@ -258,20 +257,6 @@ def load_mapping_records(path: Path) -> list[dict]:
             })
     validate_mapping_records(records)
     return records
-
-
-def load_mapping_csv(path: Path) -> dict[str, str]:
-    """
-    {adt_name: gene_symbol} from a validated mapping CSV (see load_mapping_records).
-
-    Backward-compatible alias loader; loading now also validates the whole table,
-    so a malformed CSV is caught here before it reaches training.
-    """
-    return {
-        r["adt_name"]: r["gene_symbol"]
-        for r in load_mapping_records(path)
-        if r["gene_symbol"]
-    }
 
 
 def build_mapping_rows(protein_names, rna_symbols=None, hgnc_path: Path = HGNC_PATH,

@@ -9,9 +9,11 @@ with L_anchor active only when an explicit anchor set H is configured.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import anndata as ad
 import numpy as np
@@ -22,7 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch.func import jvp as torch_jvp
 
-from src.utils.arrays import to_dense
+from src.utils.arrays import matrix_from_adata, to_dense
 from src.models.KOT import KOTModel
 from src.losses.sinkhorn import sinkhorn_divergence
 from src.losses.jvp_physics import kinetics_loss
@@ -72,7 +74,7 @@ def beta_anchor_prior_loss(
     lambda_prior: float,
     prior_kind: str,
 ) -> torch.Tensor:
-    """Soft β prior: l2 | gaussian | log_normal (supervisor: not hard-fixed).
+    """Soft β prior: l2 | gaussian | log_normal (not hard-fixed).
 
     A WEIGHTED MEAN over anchors, not a sum — so a 24-anchor set does not impose 6x
     the total prior force of a 4-anchor set (which would confound anchor-count
@@ -104,21 +106,89 @@ def beta_anchor_prior_loss(
     return lambda_prior * scale * loss
 
 
-def build_kot_optimiser(model, lr: float, n_epochs: int, use_phases: bool):
-    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = None if use_phases else torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimiser, T_max=n_epochs,
+def kot_param_groups(model, lr: float, lr_phi, lr_alpha_kappa, lr_beta) -> list[dict]:
+    """One Adam group per head, so phi, (alpha, kappa) and beta can take different steps.
+
+    alpha and kappa share a group deliberately: they are the two heads of the same
+    kinetics term and trade against each other (kappa absorbs the pseudotime scale that
+    alpha is measured on), so separate step sizes would change WHICH head wins that
+    trade rather than just how fast both converge.
+
+    A head with no parameters is dropped -- the FixedKappa / FixedAlpha ablations
+    register buffers, not parameters. `base_lr` is the unscheduled rate; both the
+    scheduler and phase3_lr_scale multiply it rather than the current `lr`, so neither
+    compounds on the other's output.
+    """
+    heads = [
+        ("phi",         lr_phi,         list(model.phi.parameters())),
+        ("alpha_kappa", lr_alpha_kappa,
+         list(model.g.parameters()) + list(model.kappa.parameters())),
+        ("beta",        lr_beta,        [model.beta_raw]),
+    ]
+    groups = []
+    for name, head_lr, params in heads:
+        if not params:
+            continue
+        resolved = float(lr if head_lr is None else head_lr)
+        groups.append({"name": name, "params": params, "lr": resolved, "base_lr": resolved})
+    return groups
+
+
+def lr_schedule_factor(epoch_index: int, warmup_epochs: int, n_epochs: int,
+                       start_factor: float, min_factor: float) -> float:
+    """Multiplier on every group's base lr: start_factor -> 1 -> min_factor.
+
+    Linear warmup over the first `warmup_epochs`, then a cosine down to `min_factor`
+    over the remaining n_epochs - warmup_epochs. `epoch_index` is 0-based, which is
+    what LambdaLR passes.
+
+    ONE factor for ALL groups, applied multiplicatively: the ratios between the
+    per-head learning rates then hold for the whole run. A per-group schedule would
+    silently re-weight the heads against each other as training progressed, which is
+    exactly the confound the separate rates are meant to control.
+
+    warmup_epochs=0 with start_factor=1 and min_factor=0 reproduces the
+    CosineAnnealingLR(T_max=n_epochs) this replaced, epoch for epoch.
+    """
+    if warmup_epochs > 0 and epoch_index < warmup_epochs:
+        return start_factor + (1.0 - start_factor) * epoch_index / warmup_epochs
+    span = max(1, n_epochs - warmup_epochs)
+    progress = min(1.0, max(0.0, (epoch_index - warmup_epochs) / span))
+    return min_factor + (1.0 - min_factor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def format_group_lrs(optimiser, factor: float) -> str:
+    """`lr=1.00e-03` when the heads share a rate, else one field per head.
+
+    Takes the schedule factor rather than reading pg["lr"]: the scheduler has already
+    advanced by the time an epoch is logged, so reading the group would report the rate
+    the NEXT epoch will use. base_lr × factor is the rate this epoch actually stepped
+    with, and it is correct in phase mode too (factor = phase3_lr_scale there).
+    """
+    lrs = {pg["name"]: pg["base_lr"] * factor for pg in optimiser.param_groups}
+    if len(set(f"{v:.6e}" for v in lrs.values())) == 1:
+        return f"lr={next(iter(lrs.values())):.2e}"
+    return " ".join(f"lr[{name}]={value:.2e}" for name, value in lrs.items())
+
+
+def build_kot_optimiser(model, lr: float, n_epochs: int, use_phases: bool, cfg: dict):
+    optimiser = torch.optim.Adam(kot_param_groups(
+        model, lr, cfg.get("lr_phi"), cfg.get("lr_alpha_kappa"), cfg.get("lr_beta"),
+    ))
+    if use_phases:
+        # Phase mode runs its own lr control (phase3_lr_scale); stacking a decay on
+        # top would make the phase-3 rate depend on where the cosine happened to be.
+        return optimiser, None
+    warmup_epochs = int(cfg.get("lr_warmup_epochs", 0))
+    start_factor  = float(cfg.get("lr_warmup_start_factor", 1.0))
+    min_factor    = float(cfg.get("lr_min_factor", 0.0))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimiser,
+        lr_lambda=lambda e: lr_schedule_factor(
+            e, warmup_epochs, n_epochs, start_factor, min_factor,
+        ),
     )
     return optimiser, scheduler
-
-
-def matrix_from_adata(adata, layer_key: str | None, label: str) -> np.ndarray:
-    if layer_key in (None, "", "X"):
-        return to_dense(adata.X, np.float32)
-    if layer_key not in adata.layers:
-        available = list(adata.layers.keys())
-        raise ValueError(f"KOT {label} layer '{layer_key}' not found. Available layers: {available}")
-    return to_dense(adata.layers[layer_key], np.float32)
 
 
 def array_debug_stats(values: np.ndarray) -> dict:
@@ -266,6 +336,34 @@ def set_fixed_beta(model, value: float | list[float], d_protein: int, device: to
     return target
 
 
+def resolve_velocity_matrix(rna_adata, velocity_layer: str | None, d_rna: int,
+                            use_feature_space: bool) -> tuple[np.ndarray, str]:
+    """The RNA velocity layer, projected into the KOT input's coordinate system.
+
+    Takes the configured layer when one is named, else the first of
+    `true_velocity` / `velocity` that exists. In representation mode a
+    gene-space velocity is carried into PCA coordinates by the same PCs the
+    RNA input uses; in feature space it must already match the gene axis.
+    """
+    candidates = [velocity_layer] if velocity_layer else ["true_velocity", "velocity"]
+    for key in candidates:
+        if key in rna_adata.layers:
+            raw = np.nan_to_num(to_dense(rna_adata.layers[key], np.float32), nan=0.0)
+            print(f"[kot] Using velocity layer: '{key}'")
+            break
+    else:
+        named = f"layer '{velocity_layer}' not found" if velocity_layer else "requires a velocity layer"
+        raise ValueError(f"KOT {named}. Available layers: {list(rna_adata.layers.keys())}")
+
+    if raw.shape[1] == d_rna:
+        return raw.astype(np.float32), key
+    if not use_feature_space and "PCs" in rna_adata.varm:
+        return raw @ np.array(rna_adata.varm["PCs"]), key
+    raise ValueError(
+        f"KOT velocity shape {raw.shape} is incompatible with a {d_rna}-column KOT input."
+    )
+
+
 def build_velocity_weight(rna_adata, S_np: np.ndarray, cfg: dict, use_feature_space: bool) -> np.ndarray | None:
     """RNA genes whose velocity can enter the JVP, or None for unweighted velocity."""
     if not use_feature_space:
@@ -361,6 +459,26 @@ def jvp_rhs_per_cell(dphi_dv: torch.Tensor, rhs: torch.Tensor) -> dict:
         "rel_residual":   res_n / (jvp_n + rhs_n + DIAG_EPS),
     }
     return {name: t.detach().cpu().numpy() for name, t in per_cell.items()}
+
+
+def jvp_and_rhs(model, r: torch.Tensor, v: torch.Tensor, S_t: torch.Tensor,
+                mask: torch.Tensor | None):
+    """One forward-mode pass giving both sides of the ODE, masked to the kinetic panel.
+
+    Returns (phi_r, dphi_dv, rhs, kappa, alpha) — φ(r), the LHS J_φ(r)·v, the RHS
+    κ(α⊙Sr − β⊙φ), and the two learned parameter fields the caller summarises.
+    Every physics diagnostic reads the two sides from here rather than rebuilding
+    them, so a change to the ODE cannot leave one diagnostic on the old form.
+    JVP needs autograd: do not call inside torch.no_grad().
+    """
+    phi_r, dphi_dv = torch_jvp(model.phi, (r,), (v,))
+    kappa = model.kappa(r)
+    alpha = model.g(r)
+    rhs = kappa * (alpha * (S_t @ r.T).T - model.beta * phi_r)
+    if mask is not None:
+        dphi_dv = dphi_dv * mask
+        rhs = rhs * mask
+    return phi_r, dphi_dv, rhs, kappa, alpha
 
 
 def jvp_diag_keys() -> list[str]:
@@ -511,6 +629,24 @@ def build_effective_velocity(
     return v_eff.astype(np.float32)
 
 
+class DiagInputs(NamedTuple):
+    """The fixed inputs every end-of-training diagnostic reads.
+
+    These seven never change within a run — only the model weights do — so they
+    travel as one bundle rather than as a seven-argument list repeated at each
+    call site. `V_eff_t` is the exact velocity training pushed through the
+    Jacobian (see `build_effective_velocity`), so a checkpoint is always scored
+    on the same vector that produced it.
+    """
+    R_t: torch.Tensor
+    V_eff: torch.Tensor
+    P_t: torch.Tensor
+    S_t: torch.Tensor
+    rna_obs: pd.DataFrame
+    mask: torch.Tensor | None = None
+    align_cols: torch.Tensor | None = None
+
+
 def compute_jvp_rhs_diagnostics(
     model,
     R_t: torch.Tensor,
@@ -536,19 +672,7 @@ def compute_jvp_rhs_diagnostics(
     model.eval()
 
     m = min(subset, R_t.shape[0])
-    r = R_t[:m]
-    v = V_eff[:m]
-
-    phi_r, dphi_dv = torch_jvp(model.phi, (r,), (v,))
-    kappa = model.kappa(r)
-    alpha = model.g(r)
-    Sr = (S_t @ r.T).T
-    beta = model.beta
-    rhs = kappa * (alpha * Sr - beta * phi_r)
-
-    if mask is not None:
-        dphi_dv = dphi_dv * mask
-        rhs = rhs * mask
+    _, dphi_dv, rhs, kappa, alpha = jvp_and_rhs(model, R_t[:m], V_eff[:m], S_t, mask)
 
     per_cell = jvp_rhs_per_cell(dphi_dv, rhs)
     out = {}
@@ -566,6 +690,17 @@ def compute_jvp_rhs_diagnostics(
     if was_training:
         model.train()
     return out
+
+
+def clone_state(model) -> dict:
+    """Detached copy of the model's weights, safe to keep past further training."""
+    return {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+
+def kappa_prior_loss(kappa: torch.Tensor, target: torch.Tensor,
+                     lambda_kappa_prior: float) -> torch.Tensor:
+    """Log-space pull of κ toward its configured target."""
+    return lambda_kappa_prior * torch.log(kappa / target).pow(2).mean()
 
 
 def phi_output(model, R_t: torch.Tensor) -> np.ndarray:
@@ -704,16 +839,7 @@ def nearest_protein_match(
     return idx, vals
 
 
-def compute_per_cell_diagnostics(
-    model,
-    R_t: torch.Tensor,
-    V_eff: torch.Tensor,
-    P_t: torch.Tensor,
-    S_t: torch.Tensor,
-    rna_obs: pd.DataFrame,
-    mask: torch.Tensor | None = None,
-    align_cols: torch.Tensor | None = None,
-) -> dict:
+def compute_per_cell_diagnostics(model, inputs: DiagInputs) -> dict:
     """Per-cell arrays for FOSCTTM-correlated diagnostic plots.
 
     FOSCTTM and the nearest-neighbour matching are computed on the alignment panel
@@ -726,22 +852,14 @@ def compute_per_cell_diagnostics(
     statistics in the diagnostics JSON are computed from, so a box plot or a scatter
     against FOSCTTM can be drawn from the saved npz without rerunning the model.
     """
+    R_t, V_eff, P_t, S_t, rna_obs, mask, align_cols = inputs
     model.eval()
 
     # All-cell JVP and RHS (single forward-mode pass) on the exact training velocity.
-    phi_r, dphi_dv = torch_jvp(model.phi, (R_t,), (V_eff,))
-    kappa = model.kappa(R_t)
-    alpha = model.g(R_t)
-    Sr = (S_t @ R_t.T).T
-    beta = model.beta
-    rhs = kappa * (alpha * Sr - beta * phi_r)
-    if mask is not None:
-        dphi_dv = dphi_dv * mask
-        rhs = rhs * mask
-    residual = dphi_dv - rhs
+    phi_r, dphi_dv, rhs, kappa, alpha = jvp_and_rhs(model, R_t, V_eff, S_t, mask)
 
     physics_per_cell = jvp_rhs_per_cell(dphi_dv, rhs)
-    dyn_per_cell = residual.pow(2).sum(dim=1).detach().cpu().numpy()
+    dyn_per_cell = (dphi_dv - rhs).pow(2).sum(dim=1).detach().cpu().numpy()
 
     # κ is one scalar per cell; α is per (cell, protein), so average it over the proteins
     # the kinetic term actually uses — an α mean over masked-out proteins is meaningless.
@@ -986,23 +1104,14 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
     save_figure(fig, Path(output_path).with_suffix(""))
 
 
-def compute_full_diagnostics(
-    model,
-    R_t: torch.Tensor,
-    V_eff: torch.Tensor,
-    P_t: torch.Tensor,
-    S_t: torch.Tensor,
-    rna_obs: pd.DataFrame,
-    subset: int = 1024,
-    mask: torch.Tensor | None = None,
-    align_cols: torch.Tensor | None = None,
-) -> dict:
+def compute_full_diagnostics(model, inputs: DiagInputs, subset: int = 1024) -> dict:
     """End-of-training diagnostics: time, branch confusion, variance, plus JVP stats.
 
     The JVP/κ/α block comes back as full distributions across cells (see
     `compute_jvp_rhs_diagnostics`); β and ‖v_eff‖ get the same treatment here, so every
     quantity in the JSON carries a median and quantiles next to its mean.
     """
+    R_t, V_eff, P_t, S_t, rna_obs, mask, align_cols = inputs
     model.eval()
 
     with torch.no_grad():
@@ -1099,6 +1208,63 @@ def compute_full_diagnostics(
     return out
 
 
+def anchor_diagnostics(beta: torch.Tensor, use_anchor: bool, anchor_indices: list,
+                       anchor_target: torch.Tensor | None, kin_mask, protein_names: list,
+                       prior_kind: str, aggregate: str, anchor_scale) -> dict:
+    """What the β-anchor asked for and what β actually did, per anchored protein.
+
+    Judged on the anchored proteins alone: the global beta_mean averages the ~130
+    unanchored ones and hides whether anchored β moved toward its target at all.
+    `beta_anchor_*_in_kinetic` intersects the anchor set with the runtime kinetic
+    mask, because an anchored protein outside that mask constrains nothing.
+
+    An anchor-free run reports the same keys with empty values, so every run's
+    diagnostics.json has one shape and a sweep table never has ragged columns.
+    """
+    out = {
+        "beta_anchor_prior":            prior_kind if use_anchor else None,
+        "beta_anchor_aggregate":        aggregate if use_anchor else None,
+        "beta_anchor_n":                int(len(anchor_indices)) if use_anchor else 0,
+        "beta_anchor_scale":            float(anchor_scale) if anchor_scale is not None else None,
+        "beta_anchor_in_kinetic_mask":  [],
+        "beta_anchor_names_in_kinetic": [],
+        "beta_anchor_n_in_kinetic":     0,
+        "beta_anchor_indices":          [],
+        "beta_anchor_names":            [],
+        "beta_anchor_targets":          [],
+        "beta_anchor_final":            [],
+        "beta_anchor_abs_err":          [],
+        "beta_anchor_mean_abs_err":     None,
+        "beta_anchor_final_mean":       None,
+    }
+    if not use_anchor:
+        return out
+
+    if anchor_indices:
+        in_mask = [bool(kin_mask[j]) for j in anchor_indices]
+        out["beta_anchor_in_kinetic_mask"] = in_mask
+        out["beta_anchor_names_in_kinetic"] = [
+            protein_names[j] for j, ok in zip(anchor_indices, in_mask) if ok
+        ]
+        out["beta_anchor_n_in_kinetic"] = int(sum(in_mask))
+        print(f"[kot] anchors in runtime kinetic mask: "
+              f"{out['beta_anchor_n_in_kinetic']}/{len(anchor_indices)}")
+
+    targets = anchor_target.cpu().numpy()
+    final = beta.detach().cpu().numpy()[anchor_indices]
+    abs_err = [abs(float(f) - float(t)) for f, t in zip(final, targets)]
+    out.update({
+        "beta_anchor_indices":      [int(j) for j in anchor_indices],
+        "beta_anchor_names":        [protein_names[j] for j in anchor_indices],
+        "beta_anchor_targets":      [float(t) for t in targets],
+        "beta_anchor_final":        [float(f) for f in final],
+        "beta_anchor_abs_err":      abs_err,
+        "beta_anchor_mean_abs_err": float(sum(abs_err) / len(abs_err)),
+        "beta_anchor_final_mean":   float(final.mean()),
+    })
+    return out
+
+
 def print_distribution(diagnostics: dict, label: str, prefix: str, fmt: str = "+.4f") -> None:
     """One line per distribution: mean, median and the q05..q95 ladder.
 
@@ -1112,6 +1278,296 @@ def print_distribution(diagnostics: dict, label: str, prefix: str, fmt: str = "+
         f"q05={diagnostics[f'{prefix}_q05']:{fmt}}  q25={diagnostics[f'{prefix}_q25']:{fmt}}  "
         f"q75={diagnostics[f'{prefix}_q75']:{fmt}}  q95={diagnostics[f'{prefix}_q95']:{fmt}}"
     )
+
+
+def print_end_of_training(diagnostics: dict, beta: torch.Tensor, use_anchor: bool,
+                          anchor_target: torch.Tensor | None, anchor_loss: float,
+                          stop_epoch: int, n_epochs: int) -> None:
+    """The end-of-run report: fit quality, parameter distributions, anchor recovery."""
+    print("[kot] end-of-training diagnostics:")
+    print(f"[kot]   time MAE / Spearman: {diagnostics['time_mae']:.4f} / {diagnostics['time_spearman']:.4f}")
+    print(f"[kot]   φ variance ratio:    {diagnostics['phi_variance_ratio']:.4f}")
+    print(f"[kot]   JVP·RHS cos:         {diagnostics['jvp_rhs_cos']:.4f}")
+    print(f"[kot]   |JVP| / |RHS|:       {diagnostics['jvp_norm']:.4f} / {diagnostics['rhs_norm']:.4f}")
+
+    print("[kot]   per-cell distributions (across cells):")
+    print_distribution(diagnostics, "JVP·RHS cos", "jvp_rhs_cos")
+    print_distribution(diagnostics, "|JVP|", "jvp_norm", ".4g")
+    print_distribution(diagnostics, "|RHS|", "rhs_norm", ".4g")
+    print_distribution(diagnostics, "|JVP|/|RHS|", "norm_ratio", ".4g")
+    print_distribution(diagnostics, "log |JVP|/|RHS|", "log_norm_ratio")
+    print_distribution(diagnostics, "rel. residual", "rel_residual", ".4f")
+    print_distribution(diagnostics, "|v_eff|", "v_eff_norm", ".4g")
+    print(f"[kot]   v_eff nonzero cells:  "
+          f"{diagnostics['v_eff_nonzero_frac'] * 100:.1f}% of {diagnostics['v_eff_n_cells']}")
+    if diagnostics.get("velocity_backend_status") == "ok":
+        print_distribution(diagnostics, "cos(v, other backend)", "velocity_backend_cos")
+    print("[kot]   parameter distributions:")
+    print_distribution(diagnostics, "κ", "kappa", ".4g")
+    print_distribution(diagnostics, "α", "alpha", ".4g")
+    print_distribution(diagnostics, "β", "beta", ".4g")
+    print(f"[kot]   κ mean/std [min,max]: {diagnostics['kappa_mean']:.4f} / {diagnostics['kappa_std']:.4f}  "
+          f"[{diagnostics['kappa_min']:.4f}, {diagnostics['kappa_max']:.4f}]")
+    print(f"[kot]   α mean/std [min,max]: {diagnostics['alpha_mean']:.4f} / {diagnostics['alpha_std']:.4f}  "
+          f"[{diagnostics['alpha_min']:.4f}, {diagnostics['alpha_max']:.4f}]")
+    print(f"[kot]   β mean/std:          {diagnostics['beta_mean']:.4f} / {diagnostics['beta_std']:.4f}")
+    print(f"[kot]   anchor loss:         {anchor_loss:.6f}")
+    print(f"[kot]   branch labels:       {diagnostics['branch_confusion_labels']}")
+    print("[kot]   branch confusion:")
+    for row, label in zip(diagnostics["branch_confusion_matrix"], diagnostics["branch_confusion_labels"]):
+        print(f"[kot]     {label:>12s}: {row}")
+    print(f"[kot]   final β: {beta.detach().cpu().numpy()}")
+    if use_anchor:
+        print(
+            f"[kot]   anchor recovery: mean|β−β*|={diagnostics['beta_anchor_mean_abs_err']:.4f}  "
+            f"anchored β mean={diagnostics['beta_anchor_final_mean']:.4f}  "
+            f"(target mean={float(anchor_target.cpu().numpy().mean()):.4f})"
+        )
+        for name, tgt, fin, err in zip(
+            diagnostics["beta_anchor_names"],
+            diagnostics["beta_anchor_targets"],
+            diagnostics["beta_anchor_final"],
+            diagnostics["beta_anchor_abs_err"],
+        ):
+            print(f"[kot]     {name:<18} β*={tgt:.4f}  β={fin:.4f}  |Δ|={err:.4f}")
+    print(f"[kot] stopped at epoch {stop_epoch} / {n_epochs}")
+
+
+def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
+                        velocity_diag: dict, checkpoints: list, best_align_state,
+                        model, diag_inputs: DiagInputs, model_name: str, seed: int,
+                        grad_interaction_rows: list) -> None:
+    """Everything a finished run leaves on disk, in one place.
+
+    Writes diagnostics.json, the four checkpoint .pt files, a per-checkpoint
+    diagnostics/FOSCTTM pair plus the summary CSV, the best_align per-cell arrays
+    and their scatter panel, and the gradient-interaction trace.
+
+    The model is left on the best_align state, so whatever the caller does next
+    matches the `aligned` matrices it returns.
+    """
+    out = Path(output_dir)
+
+    # 1. Save best_align diagnostics (downstream FOSCTTM eval uses this).
+    diag_path = out / "diagnostics.json"
+    with open(diag_path, "w") as f:
+        json.dump(diagnostics, f, indent=2)
+    print(f"[kot] Saved diagnostics: {diag_path}")
+
+    # 2. Save the 4 checkpoint state dicts to disk.
+    for name, state, ep, lo in checkpoints:
+        if state is None:
+            continue
+        ckpt_path = out / f"checkpoint_{name}.pt"
+        torch.save(
+            {
+                "state_dict": state,
+                "epoch":      ep,
+                "losses":     lo,
+                "model_name": model_name,
+                "seed":       seed,
+            },
+            ckpt_path,
+        )
+        print(f"[kot] Saved checkpoint: {ckpt_path} (epoch {ep})")
+
+    # 3. Evaluate FOSCTTM + diagnostics at EACH checkpoint (not just best_align).
+    # best_align reuses the full-diagnostics already computed above and caches its
+    # per-cell result for the scatter panel below — computed once, not three times.
+    per_ckpt_rows = []
+    best_align_per_cell = None
+    for name, state, ep, lo in checkpoints:
+        if state is None:
+            continue
+        model.load_state_dict(state)
+        if name == "best_align":
+            d = dict(best_align_full)
+        else:
+            d = compute_full_diagnostics(model, diag_inputs)
+        pc = compute_per_cell_diagnostics(model, diag_inputs)
+        if name == "best_align":
+            best_align_per_cell = pc
+        d.update(velocity_diag)
+        mean_f = float(np.mean(pc["foscttm"]))
+        d["mean_foscttm"]      = mean_f
+        d["checkpoint"]        = name
+        d["checkpoint_epoch"]  = ep
+        d["checkpoint_losses"] = lo
+        with open(out / f"diagnostics_{name}.json", "w") as f:
+            json.dump(d, f, indent=2)
+        pd.DataFrame({"foscttm": pc["foscttm"]}).to_csv(
+            out / f"foscttm_{name}.csv", index=False,
+        )
+        row = {
+            "checkpoint":         name,
+            "epoch":              ep,
+            "mean_foscttm":       mean_f,
+            "time_mae":           d["time_mae"],
+            "time_spearman":      d["time_spearman"],
+            "traj_dtw_temporal":  d["traj_dtw_temporal"],
+            "traj_dtw_recon":     d["traj_dtw_recon"],
+            "phi_variance_ratio": d["phi_variance_ratio"],
+            "jvp_rhs_cos":        d["jvp_rhs_cos"],
+            "jvp_norm":           d["jvp_norm"],
+            "rhs_norm":           d["rhs_norm"],
+        }
+        # Every per-cell / per-protein distribution, flattened into the summary CSV so a
+        # box plot across checkpoints, seeds or datasets needs nothing but this file.
+        for prefix in JVP_DIAG_PREFIXES + PARAM_DIAG_PREFIXES + ("beta", "v_eff_norm"):
+            for stat in STAT_SUFFIXES:
+                row[f"{prefix}_{stat}"] = d[f"{prefix}_{stat}"]
+        row["v_eff_nonzero_frac"] = d["v_eff_nonzero_frac"]
+        row["velocity_backend_cos_mean"]   = d["velocity_backend_cos_mean"]
+        row["velocity_backend_cos_median"] = d["velocity_backend_cos_median"]
+        row["velocity_backend_cos_q25"]    = d["velocity_backend_cos_q25"]
+        row["velocity_backend_cos_q75"]    = d["velocity_backend_cos_q75"]
+        per_ckpt_rows.append(row)
+        print(f"[kot] Eval {name}: FOSCTTM={mean_f:.4f}  "
+              f"cos={d['jvp_rhs_cos']:+.3f} (med {d['jvp_rhs_cos_median']:+.3f})  "
+              f"ratio med={d['norm_ratio_median']:.3f}  "
+              f"relres med={d['rel_residual_median']:.3f}  "
+              f"κ={d['kappa_mean']:.3f} (med {d['kappa_median']:.3f}) "
+              f"[{d['kappa_min']:.3f},{d['kappa_max']:.3f}]  "
+              f"α={d['alpha_mean']:.3f} (med {d['alpha_median']:.3f}) "
+              f"[{d['alpha_min']:.3f},{d['alpha_max']:.3f}]  "
+              f"β={d['beta_mean']:.3f} (med {d['beta_median']:.3f})")
+    if per_ckpt_rows:
+        pd.DataFrame(per_ckpt_rows).to_csv(
+            out / "checkpoint_eval_summary.csv", index=False,
+        )
+
+    # 4. Restore best_align state so downstream artifacts (foscttm.csv, plots)
+    # reflect the same checkpoint as the returned `aligned`.
+    if best_align_state is not None:
+        model.load_state_dict(best_align_state)
+
+    # 5. Per-cell arrays + the FOSCTTM-vs-diagnostics scatter panel for best_align.
+    # Reuse the per-cell result already computed for best_align in the loop above (same
+    # restored state); only recompute in the edge case where best_align was never a
+    # checkpoint (best_align_per_cell stays None).
+    if best_align_per_cell is not None:
+        per_cell = best_align_per_cell
+    else:
+        per_cell = compute_per_cell_diagnostics(model, diag_inputs)
+    per_cell_path = out / "per_cell_diagnostics.npz"
+    np.savez(per_cell_path, **per_cell)
+    plot_path = out / "foscttm_diagnostics.png"
+    plot_foscttm_diagnostics(per_cell, plot_path)
+    print(f"[kot] Saved per-cell arrays: {per_cell_path}")
+    print(f"[kot] Saved FOSCTTM diagnostics plot: {plot_path}")
+
+    # Per-batch alignment-vs-kinetics gradient interaction (epoch × probe batch).
+    if grad_interaction_rows:
+        gi_path = out / "grad_interaction.csv"
+        pd.DataFrame(grad_interaction_rows).to_csv(gi_path, index=False)
+        gi_plot = out / "grad_interaction.png"
+        plot_grad_interaction(grad_interaction_rows, gi_plot)
+        print(f"[kot] Saved grad-interaction diagnostics: {gi_path} + {gi_plot}")
+
+
+def anchor_tensors(indices: list, betas: list, sigmas: list, weights: list,
+                   default_beta: float, prior_sigma_floor: float, target_beta: float,
+                   device: torch.device):
+    """The β-anchor spec as (indices, targets, sigmas, weights) tensors.
+
+    Targets fall back to a single `default_beta` for every anchor when no
+    per-protein β* was resolved, and sigmas to a flat floor when the CSV carried
+    no cross-cell-type dispersion. Weights stay None when none were given, which
+    `beta_anchor_prior_loss` reads as an unweighted mean.
+    """
+    if betas and len(betas) != len(indices):
+        raise ValueError("kot_anchor_betas must have the same length as kot_anchor_indices.")
+
+    idx_t = torch.tensor(indices, dtype=torch.long, device=device)
+    if betas:
+        target = torch.tensor(betas, dtype=torch.float32, device=device)
+    else:
+        target = torch.full((idx_t.numel(),), default_beta, device=device)
+
+    if sigmas and len(sigmas) == len(indices):
+        sigma_t = torch.tensor(sigmas, dtype=torch.float32, device=device)
+    else:
+        sigma_t = torch.full((idx_t.numel(),), prior_sigma_floor * target_beta, device=device)
+
+    weight_t = None
+    if weights and len(weights) == len(indices):
+        weight_t = torch.tensor(weights, dtype=torch.float32, device=device)
+    return idx_t, target, sigma_t, weight_t
+
+
+def alignment_step(model, R_t: torch.Tensor, P_t: torch.Tensor, n: int, device,
+                   max_points: int | None, align_cols: torch.Tensor | None,
+                   blur: float, backend: str, lam_align: float) -> float:
+    """One Sinkhorn step on φ, backward already applied. Returns the raw loss.
+
+    Full-batch when small (exact); a fresh random minibatch each epoch once
+    `max_points` caps it, so large real datasets (bmmc_cite at ~90k cells) stay
+    within GPU memory instead of building an n×n cost matrix. RNA and protein
+    cells are sampled INDEPENDENTLY — the data is unpaired, and drawing the same
+    rows would put each cell's true partner in the batch and leak the alignment.
+
+    Backward runs here so the φ/Sinkhorn graph is freed before the kinetics loop.
+    """
+    if max_points is not None and n > max_points:
+        rna_idx = torch.randperm(n, device=device)[:max_points]
+        protein_idx = torch.randperm(n, device=device)[:max_points]
+        phi_align = model.phi(R_t[rna_idx])          # (b, D_p), φ predicts full panel
+        P_align = P_t[protein_idx]
+    else:
+        phi_align = model.phi(R_t)                   # (n, D_p)
+        P_align = P_t
+    if align_cols is not None:                       # only use_for_alignment proteins
+        phi_align = phi_align[:, align_cols]
+        P_align = P_align[:, align_cols]
+    loss_align = sinkhorn_divergence(phi_align, P_align, blur=blur, backend=backend)
+    (lam_align * loss_align).backward()
+    return loss_align.item()
+
+
+def kinetics_step(model, R_t: torch.Tensor, V_eff_t: torch.Tensor, SR_t: torch.Tensor,
+                  conf_t: torch.Tensor, n: int, batch_size: int, device,
+                  mask_t: torch.Tensor | None, protein_scale: torch.Tensor | None,
+                  lam_dyn: float, kappa_target_t: torch.Tensor | None,
+                  lambda_kappa_prior: float) -> tuple[float, float]:
+    """The ODE residual and the κ prior, accumulated over batches. Returns both losses.
+
+    Shuffles once on-GPU and splits; each batch's JVP graph is freed by its own
+    backward() rather than every graph living until the end of the epoch. Batches
+    are cell-weighted (len_b/n) so the accumulated gradient equals one backward()
+    on the full-data mean. κ from each batch is reused for the prior instead of a
+    second κ(R_t) pass.
+
+    With the kinetics term off, the κ prior still needs its own pass — but only
+    while κ is trainable, since otherwise it has nowhere to go.
+    """
+    dyn_val = 0.0
+    kappa_prior_val = 0.0
+    prior_on = lambda_kappa_prior > 0.0 and kappa_target_t is not None
+
+    if lam_dyn > 0.0:
+        for idx in torch.randperm(n, device=device).split(batch_size):
+            weight = idx.numel() / n
+            loss_dyn_b, kappa_b = kinetics_loss(
+                model.phi, model.kappa, model.g,
+                R_t[idx], V_eff_t[idx], SR_t[idx], model.beta, conf_t[idx],
+                mask=mask_t, scale=protein_scale,
+            )
+            batch_obj = (lam_dyn * weight) * loss_dyn_b
+            dyn_val += weight * loss_dyn_b.item()
+            if prior_on:
+                kp_b = kappa_prior_loss(kappa_b, kappa_target_t, lambda_kappa_prior)
+                batch_obj = batch_obj + weight * kp_b
+                kappa_prior_val += weight * kp_b.item()
+            batch_obj.backward()
+        return dyn_val, kappa_prior_val
+
+    if prior_on and any(param.requires_grad for param in model.kappa.parameters()):
+        for idx in torch.randperm(n, device=device).split(batch_size):
+            weight = idx.numel() / n
+            kp_b = kappa_prior_loss(model.kappa(R_t[idx]), kappa_target_t, lambda_kappa_prior)
+            (weight * kp_b).backward()
+            kappa_prior_val += weight * kp_b.item()
+    return dyn_val, kappa_prior_val
 
 
 def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataFrame]:
@@ -1230,6 +1686,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     )
     g_freeze_epochs = int(cfg.get("g_freeze_epochs", 0))
     dyn_warmup_epochs       = int(cfg.get("dyn_warmup_epochs",       n_epochs // 2))
+    # Per-head rates (null = fall back to `lr`) and the shared warmup->cosine schedule.
+    # Read here only to print and to record in diagnostics; build_kot_optimiser takes
+    # them straight off cfg so there is one place that resolves them.
+    lr_phi          = cfg.get("lr_phi")
+    lr_alpha_kappa  = cfg.get("lr_alpha_kappa")
+    lr_beta         = cfg.get("lr_beta")
+    lr_warmup_epochs      = int(cfg.get("lr_warmup_epochs", 0))
+    lr_warmup_start_factor = float(cfg.get("lr_warmup_start_factor", 1.0))
+    lr_min_factor          = float(cfg.get("lr_min_factor", 0.0))
     early_stopping_patience = int(cfg.get("early_stopping_patience", 100))
 
     # Alternating-phase optimization. If any phase{1,2,3}_epochs > 0, phase mode
@@ -1305,30 +1770,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         raise ValueError("KOT representation mode requires RNA PCA components in .varm['PCs'].")
 
     # RNA velocity in the same coordinate system as the KOT RNA input.
-    V_raw = None
-    selected_velocity_layer = None
-    velocity_candidates = [velocity_layer] if velocity_layer else ["true_velocity", "velocity"]
-    for key in velocity_candidates:
-        if key in rna_adata.layers:
-            V_raw = np.nan_to_num(to_dense(rna_adata.layers[key], np.float32), nan=0.0)
-            selected_velocity_layer = key
-            print(f"[kot] Using velocity layer: '{key}'")
-            break
-    if velocity_layer and V_raw is None:
-        available = list(rna_adata.layers.keys())
-        raise ValueError(f"KOT velocity layer '{velocity_layer}' not found. Available layers: {available}")
-    if V_raw is None:
-        available = list(rna_adata.layers.keys())
-        raise ValueError(f"KOT requires a velocity layer. Available layers: {available}")
-
-    if V_raw.shape[1] == D_r:
-        V = V_raw.astype(np.float32)
-    elif not use_feature_space and "PCs" in rna_adata.varm:
-        V = V_raw @ np.array(rna_adata.varm["PCs"])
-    else:
-        raise ValueError(
-            f"KOT velocity shape {V_raw.shape} is incompatible with KOT input shape {x.shape}."
-        )
+    V, selected_velocity_layer = resolve_velocity_matrix(
+        rna_adata, velocity_layer, D_r, use_feature_space,
+    )
 
     # (Velocity gauge normalisation now happens on the EFFECTIVE velocity V_eff below,
     # after the RNA-side weight is applied — the gauge must be measured from the exact
@@ -1448,6 +1892,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     else:
         align_np = None
         align_cols = None
+    # One bundle of the fixed diagnostic inputs, built once and reused at every
+    # checkpoint evaluation below.
+    diag_inputs = DiagInputs(R_t, V_eff_t, P_t, S_t, rna_adata.obs, mask_t, align_cols)
+
     # Optional per-protein normalisation (off by default). The scale is floored at
     # the median std so it only DOWN-weights high-abundance proteins; without the
     # floor, near-constant proteins get a tiny std and their residual explodes.
@@ -1527,22 +1975,11 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 else:
                     raise ValueError(message)
         if use_anchor:
-            anchor_idx_t = torch.tensor(anchor_indices, dtype=torch.long, device=device)
-            if anchor_betas:
-                if len(anchor_betas) != len(anchor_indices):
-                    raise ValueError(
-                        "kot_anchor_betas must have the same length as kot_anchor_indices."
-                    )
-                anchor_target = torch.tensor(anchor_betas, dtype=torch.float32, device=device)
-            else:
-                anchor_target = torch.full((anchor_idx_t.numel(),), anchor_beta, device=device)
-            if anchor_sigmas_list and len(anchor_sigmas_list) == len(anchor_indices):
-                anchor_sigma_t = torch.tensor(anchor_sigmas_list, dtype=torch.float32, device=device)
-            else:
-                floor = prior_sigma_floor * float(cfg.get("beta_anchor_target", anchor_beta))
-                anchor_sigma_t = torch.full((anchor_idx_t.numel(),), floor, device=device)
-            if anchor_weights_list and len(anchor_weights_list) == len(anchor_indices):
-                anchor_weight_t = torch.tensor(anchor_weights_list, dtype=torch.float32, device=device)
+            anchor_idx_t, anchor_target, anchor_sigma_t, anchor_weight_t = anchor_tensors(
+                anchor_indices, anchor_betas, anchor_sigmas_list, anchor_weights_list,
+                anchor_beta, prior_sigma_floor,
+                float(cfg.get("beta_anchor_target", anchor_beta)), device,
+            )
 
     # Warm-start β at the resolved anchor targets: β starts where the anchor wants
     # it (β = softplus(β_raw)+1e-6), stays trainable, and the soft prior holds it
@@ -1562,7 +1999,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         + list(model.kappa.parameters())
         + list(model.g.parameters())
     )
-    optimiser, scheduler = build_kot_optimiser(model, lr, n_epochs, use_phases)
+    optimiser, scheduler = build_kot_optimiser(model, lr, n_epochs, use_phases, cfg)
 
     # SR_t = S·r for every cell (fixed projection, computed once). V_eff_t (weight + gauge
     # already applied above) is the other per-cell quantity the kinetics term reuses each
@@ -1608,6 +2045,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     print(f"[kot] κ-prior: target={kappa_prior_target} λ_κ={lambda_kappa_prior}  |  "
           f"φ_spectral_norm={phi_spectral_norm}  g_freeze={g_freeze_epochs}  "
           f"dyn_warmup={dyn_warmup_epochs}  early_stop_patience={early_stopping_patience}")
+    print(f"[kot] lr: base={lr:.2e}  φ={lr_phi or 'base'}  α/κ={lr_alpha_kappa or 'base'}  "
+          f"β={lr_beta or 'base'}  |  warmup={lr_warmup_epochs}ep "
+          f"×{lr_warmup_start_factor}→1→×{lr_min_factor} (cosine)")
     if any(v is not None for v in (fixed_kappa_value, fixed_alpha_value, fixed_beta_value)):
         print(f"[kot] fixed params: κ={fixed_kappa_value}  α={fixed_alpha_value}  β={fixed_beta_value}")
     print(f"[kot] use_anchor: {use_anchor}")
@@ -1637,8 +2077,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     ]
     loss_history = {
         "epoch": [], "align": [], "dyn": [], "anchor": [], "kappa_prior": [], "reg": [],
-        "total": [], "lambda_dyn_eff": [],
+        "total": [], "lambda_dyn_eff": [], "lr_factor": [],
     }
+    loss_history["grad_norm"] = []
     for key in history_beta_keys + history_diag_keys + history_grad_keys:
         loss_history[key] = []
 
@@ -1701,19 +2142,23 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                 for p in model.g.parameters():     p.requires_grad = dyn_train
                 model.beta_raw.requires_grad = dyn_train and fixed_beta_value is None
                 if current_phase == 3:
+                    # Each head's own base_lr, so phase 3 preserves the ratios between
+                    # the per-head rates instead of flattening all three onto `lr`.
                     for pg in optimiser.param_groups:
-                        pg["lr"] = lr * phase3_lr_scale
+                        pg["lr"] = pg["base_lr"] * phase3_lr_scale
                 print(f"[kot] >>> Phase {current_phase} at epoch {epoch} "
                       f"(phi={'train' if phi_train else 'frozen'}, "
                       f"κ/α/β={'train' if dyn_train else 'frozen'}, "
-                      f"lr={optimiser.param_groups[0]['lr']:.2e})")
+                      f"{format_group_lrs(optimiser, phase_lr_factor(optimiser))})")
             lam_align_eff = 1.0        if current_phase in (1, 3) else 0.0
             lam_dyn_eff   = lambda_dyn if current_phase in (2, 3) else 0.0
         else:
             lam_align_eff = 1.0
-            lam_dyn_eff = (lambda_dyn * min(1.0, (epoch - 1) / dyn_warmup_epochs)
+            # λ_dyn^eff = λ_dyn · min(1, t / dyn_warmup_epochs), t the 1-based epoch,
+            # so the kinetics term is at λ_dyn/W on the first epoch and reaches full
+            # strength at epoch W rather than W+1.
+            lam_dyn_eff = (lambda_dyn * min(1.0, epoch / dyn_warmup_epochs)
                            if dyn_warmup_epochs > 0 else lambda_dyn)
-        effective_lambda_dyn = lam_dyn_eff   # keep diagnostic prints/logging compatible
         if not use_phases and g_freeze_epochs > 0:
             g_train = epoch > g_freeze_epochs
             for p in model.g.parameters():
@@ -1725,67 +2170,18 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         optimiser.zero_grad(set_to_none=True)
 
         # --- Sinkhorn alignment step (differentiable through phi) ---
-        # Full-batch when small (exact); a fresh random minibatch each epoch when
-        # sinkhorn_max_points caps it, so large real datasets (e.g. bmmc_cite at
-        # ~90k cells) stay within GPU memory instead of building an n×n matrix.
-        # Backward immediately so the φ/Sinkhorn graph is freed before the kinetics loop.
         align_val = 0.0
-        align_was_computed = False
         if lam_align_eff > 0.0:
-            if sinkhorn_max_points is not None and n > sinkhorn_max_points:
-                # Sample RNA and protein cells INDEPENDENTLY — the data is unpaired, so the
-                # protein batch must not be the same cells as the RNA batch (that would put
-                # each cell's true partner in the batch and leak the alignment).
-                rna_idx     = torch.randperm(n, device=device)[:sinkhorn_max_points]
-                protein_idx = torch.randperm(n, device=device)[:sinkhorn_max_points]
-                phi_align = model.phi(R_t[rna_idx])          # (b, D_p), φ predicts full panel
-                P_align = P_t[protein_idx]
-            else:
-                phi_align = model.phi(R_t)                   # (n, D_p)
-                P_align = P_t
-            if align_cols is not None:                       # compare only use_for_alignment proteins
-                phi_align = phi_align[:, align_cols]
-                P_align = P_align[:, align_cols]
-            loss_align = sinkhorn_divergence(phi_align, P_align, blur=blur, backend=sinkhorn_backend)
-            (lam_align_eff * loss_align).backward()
-            align_val = loss_align.item()
-            align_was_computed = True
+            align_val = alignment_step(
+                model, R_t, P_t, n, device, sinkhorn_max_points, align_cols,
+                blur, sinkhorn_backend, lam_align_eff,
+            )
 
-        # --- Kinetics step (per-batch, gradients accumulated) ---
-        # Shuffle once on-GPU and split; each batch's JVP graph is freed by its own
-        # backward() rather than all graphs living until the end of the epoch. Cell-weighted
-        # (len_b/n) so the accumulated gradient equals one backward() on the full-data mean.
-        # κ from each batch is reused for the κ prior instead of a second κ(R_t) pass.
-        dyn_val = 0.0
-        kappa_prior_val = 0.0
-        dyn_was_computed = False
-        if lam_dyn_eff > 0.0:
-            dyn_was_computed = True
-            for idx in torch.randperm(n, device=device).split(batch_size):
-                weight = idx.numel() / n
-                loss_dyn_b, kappa_b = kinetics_loss(
-                    model.phi, model.kappa, model.g,
-                    R_t[idx], V_eff_t[idx], SR_t[idx], model.beta, conf_t[idx],
-                    mask=mask_t, scale=protein_scale,
-                )
-                batch_obj = (lam_dyn_eff * weight) * loss_dyn_b
-                dyn_val += weight * loss_dyn_b.item()
-                if lambda_kappa_prior > 0.0 and kappa_target_t is not None:
-                    kp_b = lambda_kappa_prior * torch.log(kappa_b / kappa_target_t).pow(2).mean()
-                    batch_obj = batch_obj + weight * kp_b
-                    kappa_prior_val += weight * kp_b.item()
-                batch_obj.backward()
-        elif (
-            lambda_kappa_prior > 0.0
-            and kappa_target_t is not None
-            and any(param.requires_grad for param in model.kappa.parameters())
-        ):
-            for idx in torch.randperm(n, device=device).split(batch_size):
-                weight = idx.numel() / n
-                kappa_b = model.kappa(R_t[idx])
-                kp_b = lambda_kappa_prior * torch.log(kappa_b / kappa_target_t).pow(2).mean()
-                (weight * kp_b).backward()
-                kappa_prior_val += weight * kp_b.item()
+        # --- Kinetics step + kappa prior (per-batch, gradients accumulated) ---
+        dyn_val, kappa_prior_val = kinetics_step(
+            model, R_t, V_eff_t, SR_t, conf_t, n, batch_size, device,
+            mask_t, protein_scale, lam_dyn_eff, kappa_target_t, lambda_kappa_prior,
+        )
 
         # --- β anchor prior (on β directly; only when β is trainable and weighted) ---
         anchor_val = 0.0
@@ -1807,7 +2203,14 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         total_val = (lam_align_eff * align_val + lam_dyn_eff * dyn_val
                      + anchor_val + kappa_prior_val + reg_val)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # One norm over every head. Per-head budgets were measured on 2026-08-24 and
+        # made no difference to beta recovery (0.168 vs 0.157), so the extra config
+        # surface is gone. The return value is the PRE-clip norm, logged because it is
+        # what showed the clip binds on every step rather than catching spikes.
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0))
+        # Read BEFORE the scheduler advances: this is the factor the step above used,
+        # and logging the post-step value would report the next epoch's rate instead.
+        lr_factor = phase_lr_factor(optimiser)
         optimiser.step()
         if scheduler is not None:
             scheduler.step()
@@ -1867,6 +2270,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         loss_history["reg"].append(reg_val)
         loss_history["total"].append(total_val)
         loss_history["lambda_dyn_eff"].append(float(lam_dyn_eff))
+        loss_history["lr_factor"].append(float(lr_factor))
+        loss_history["grad_norm"].append(grad_norm)
         for key in history_beta_keys:
             loss_history[key].append(beta_stats[key])
         for key in history_diag_keys:
@@ -1878,7 +2283,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             print(f"[kot] epoch {epoch:4d}  align={align_val:.6f}  "
                   f"dyn={dyn_val:.6f}  anchor={anchor_val:.6f}  "
                   f"kprior={kappa_prior_val:.6f}  "
-                  f"λ_dyn={effective_lambda_dyn:.3f}  lr={optimiser.param_groups[0]['lr']:.2e}  "
+                  f"λ_dyn={lam_dyn_eff:.3f}  {format_group_lrs(optimiser, lr_factor)}  "
                   f"β={beta_mean_val:.3f}±{beta_std_val:.3f}  "
                   f"κ={diag['kappa_mean']:.3f}±{diag['kappa_std']:.3f} "
                   f"[{diag['kappa_min']:.3f},{diag['kappa_max']:.3f}]  "
@@ -1916,27 +2321,27 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             "total":  current_total,
         }
 
-        if dyn_was_computed and current_dyn < best_dyn:
+        if lam_dyn_eff > 0.0 and current_dyn < best_dyn:
             best_dyn = current_dyn
             best_dyn_epoch = epoch
-            best_dyn_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_dyn_state = clone_state(model)
             best_dyn_losses = dict(current_losses)
 
         if current_total < best_total:
             best_total = current_total
             best_total_epoch = epoch
-            best_total_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_total_state = clone_state(model)
             best_total_losses = dict(current_losses)
 
         # Early stopping: only monitor epochs with a real alignment loss. In phased
         # runs, the dynamics-only phase sets lam_align_eff=0 and must not become
         # "best_align" simply because align_val is 0.
-        monitor_align = align_was_computed and (use_phases or epoch > dyn_warmup_epochs)
+        monitor_align = lam_align_eff > 0.0 and (use_phases or epoch > dyn_warmup_epochs)
         if monitor_align:
             if current_align < best_align:
                 best_align = current_align
                 best_align_epoch = epoch
-                best_align_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                best_align_state = clone_state(model)
                 best_align_losses = dict(current_losses)
                 epochs_since_improvement = 0
             elif not use_phases or current_phase == 3:
@@ -1948,7 +2353,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                     break
 
     # Snapshot the literal final state before any restoration.
-    final_state  = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    final_state  = clone_state(model)
     final_losses = dict(current_losses)
 
     # Uniform checkpoint table: (name, state, epoch, losses) for all four.
@@ -1991,17 +2396,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         )
 
     # End-of-training diagnostics: time, branch confusion, variance, JVP/RHS.
-    diagnostics = compute_full_diagnostics(
-        model,
-        R_t,
-        V_eff_t,
-        P_t,
-        S_t,
-        rna_adata.obs,
-        subset=1024,
-        mask=mask_t,
-        align_cols=align_cols,
-    )
+    diagnostics = compute_full_diagnostics(model, diag_inputs)
     # Snapshot the raw best_align full-diagnostics (before the anchor augmentation below) so
     # the per-checkpoint loop reuses them for best_align — the model is on the same restored
     # best_align state, so recomputing the JVP + NN match there is pure waste.
@@ -2012,52 +2407,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics.update(velocity_diag)
     best_align_full.update(velocity_diag)
     diagnostics["anchor_loss_final"] = float(loss_anchor_final.item())
-    diagnostics["beta_anchor_prior"] = beta_anchor_prior if use_anchor else None
-    diagnostics["beta_anchor_aggregate"] = beta_anchor_aggregate if use_anchor else None
-    diagnostics["beta_anchor_n"] = int(len(anchor_indices)) if use_anchor else 0
-    diagnostics["beta_anchor_scale"] = float(anchor_scale) if anchor_scale is not None else None
-    # Anchors intersected with the actual runtime kinetic mask: an anchored protein
-    # only constrains the dynamics if it is in the kinetic term. Report which, by name.
-    if use_anchor and anchor_indices:
-        protein_names = list(second_adata.var_names)
-        anchor_in_mask = [bool(kin_mask[j]) for j in anchor_indices]
-        diagnostics["beta_anchor_in_kinetic_mask"] = anchor_in_mask
-        diagnostics["beta_anchor_names_in_kinetic"] = [
-            protein_names[j] for j, ok in zip(anchor_indices, anchor_in_mask) if ok
-        ]
-        diagnostics["beta_anchor_n_in_kinetic"] = int(sum(anchor_in_mask))
-        print(f"[kot] anchors in runtime kinetic mask: "
-              f"{diagnostics['beta_anchor_n_in_kinetic']}/{len(anchor_indices)}")
-    else:
-        diagnostics["beta_anchor_in_kinetic_mask"] = []
-        diagnostics["beta_anchor_names_in_kinetic"] = []
-        diagnostics["beta_anchor_n_in_kinetic"] = 0
-    # Per-anchor recovery: judge the anchor on the proteins it constrains, not the
-    # global beta_mean (which averages the ~130 unanchored proteins and hides whether
-    # anchored β actually moved toward its target).
-    if use_anchor:
-        final_beta_np = model.beta.detach().cpu().numpy()
-        anchor_targets_np = anchor_target.cpu().numpy()
-        anchor_final_np = final_beta_np[anchor_indices]
-        protein_names = list(second_adata.var_names)
-        anchor_abs_err = [
-            abs(float(f) - float(t)) for f, t in zip(anchor_final_np, anchor_targets_np)
-        ]
-        diagnostics["beta_anchor_indices"] = [int(j) for j in anchor_indices]
-        diagnostics["beta_anchor_names"] = [protein_names[j] for j in anchor_indices]
-        diagnostics["beta_anchor_targets"] = [float(t) for t in anchor_targets_np]
-        diagnostics["beta_anchor_final"] = [float(f) for f in anchor_final_np]
-        diagnostics["beta_anchor_abs_err"] = anchor_abs_err
-        diagnostics["beta_anchor_mean_abs_err"] = float(sum(anchor_abs_err) / len(anchor_abs_err))
-        diagnostics["beta_anchor_final_mean"] = float(anchor_final_np.mean())
-    else:
-        diagnostics["beta_anchor_indices"] = []
-        diagnostics["beta_anchor_names"] = []
-        diagnostics["beta_anchor_targets"] = []
-        diagnostics["beta_anchor_final"] = []
-        diagnostics["beta_anchor_abs_err"] = []
-        diagnostics["beta_anchor_mean_abs_err"] = None
-        diagnostics["beta_anchor_final_mean"] = None
+    diagnostics.update(anchor_diagnostics(
+        model.beta, use_anchor, anchor_indices, anchor_target, kin_mask,
+        list(second_adata.var_names), beta_anchor_prior, beta_anchor_aggregate, anchor_scale,
+    ))
     diagnostics["stop_epoch"]        = int(stop_epoch)
     diagnostics["best_align_epoch"]  = int(best_align_epoch) if best_align_state is not None else None
     diagnostics["best_align"]        = float(best_align) if best_align_state is not None else None
@@ -2080,201 +2433,29 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["lambda_kappa_prior"] = float(lambda_kappa_prior)
     diagnostics["kappa_prior_target"] = kappa_prior_target
     diagnostics["g_freeze_epochs"]   = int(g_freeze_epochs)
+    diagnostics["dyn_warmup_epochs"] = int(dyn_warmup_epochs)
+    diagnostics["lr_phi"]            = lr_phi
+    diagnostics["lr_alpha_kappa"]    = lr_alpha_kappa
+    diagnostics["lr_beta"]           = lr_beta
+    diagnostics["lr_warmup_epochs"]  = int(lr_warmup_epochs)
+    diagnostics["lr_warmup_start_factor"] = float(lr_warmup_start_factor)
+    diagnostics["lr_min_factor"]     = float(lr_min_factor)
+    # Median pre-clip gradient norm. It runs ~100-6000x above the 1.0 budget, so the
+    # clip binds every step and acts as a renormaliser -- worth knowing, not tunable.
+    diagnostics["grad_norm_median"] = float(np.median(loss_history["grad_norm"]))
     diagnostics["data_debug"]        = data_debug
 
-    print("[kot] end-of-training diagnostics:")
-    print(f"[kot]   time MAE / Spearman: {diagnostics['time_mae']:.4f} / {diagnostics['time_spearman']:.4f}")
-    print(f"[kot]   φ variance ratio:    {diagnostics['phi_variance_ratio']:.4f}")
-    print(f"[kot]   JVP·RHS cos:         {diagnostics['jvp_rhs_cos']:.4f}")
-    print(f"[kot]   |JVP| / |RHS|:       {diagnostics['jvp_norm']:.4f} / {diagnostics['rhs_norm']:.4f}")
+    print_end_of_training(
+        diagnostics, model.beta, use_anchor, anchor_target,
+        float(loss_anchor_final.item()), stop_epoch, n_epochs,
+    )
 
-    print("[kot]   per-cell distributions (across cells):")
-    print_distribution(diagnostics, "JVP·RHS cos", "jvp_rhs_cos")
-    print_distribution(diagnostics, "|JVP|", "jvp_norm", ".4g")
-    print_distribution(diagnostics, "|RHS|", "rhs_norm", ".4g")
-    print_distribution(diagnostics, "|JVP|/|RHS|", "norm_ratio", ".4g")
-    print_distribution(diagnostics, "log |JVP|/|RHS|", "log_norm_ratio")
-    print_distribution(diagnostics, "rel. residual", "rel_residual", ".4f")
-    print_distribution(diagnostics, "|v_eff|", "v_eff_norm", ".4g")
-    print(f"[kot]   v_eff nonzero cells:  "
-          f"{diagnostics['v_eff_nonzero_frac'] * 100:.1f}% of {diagnostics['v_eff_n_cells']}")
-    if diagnostics.get("velocity_backend_status") == "ok":
-        print_distribution(diagnostics, "cos(v, other backend)", "velocity_backend_cos")
-    print("[kot]   parameter distributions:")
-    print_distribution(diagnostics, "κ", "kappa", ".4g")
-    print_distribution(diagnostics, "α", "alpha", ".4g")
-    print_distribution(diagnostics, "β", "beta", ".4g")
-    print(f"[kot]   κ mean/std [min,max]: {diagnostics['kappa_mean']:.4f} / {diagnostics['kappa_std']:.4f}  "
-          f"[{diagnostics['kappa_min']:.4f}, {diagnostics['kappa_max']:.4f}]")
-    print(f"[kot]   α mean/std [min,max]: {diagnostics['alpha_mean']:.4f} / {diagnostics['alpha_std']:.4f}  "
-          f"[{diagnostics['alpha_min']:.4f}, {diagnostics['alpha_max']:.4f}]")
-    print(f"[kot]   β mean/std:          {diagnostics['beta_mean']:.4f} / {diagnostics['beta_std']:.4f}")
-    print(f"[kot]   anchor loss:         {loss_anchor_final.item():.6f}")
-    print(f"[kot]   branch labels:       {diagnostics['branch_confusion_labels']}")
-    print("[kot]   branch confusion:")
-    for row, label in zip(diagnostics["branch_confusion_matrix"], diagnostics["branch_confusion_labels"]):
-        print(f"[kot]     {label:>12s}: {row}")
-    print(f"[kot]   final β: {model.beta.detach().cpu().numpy()}")
-    if use_anchor:
-        print(
-            f"[kot]   anchor recovery: mean|β−β*|={diagnostics['beta_anchor_mean_abs_err']:.4f}  "
-            f"anchored β mean={diagnostics['beta_anchor_final_mean']:.4f}  "
-            f"(target mean={float(anchor_target.cpu().numpy().mean()):.4f})"
-        )
-        for name, tgt, fin, err in zip(
-            diagnostics["beta_anchor_names"],
-            diagnostics["beta_anchor_targets"],
-            diagnostics["beta_anchor_final"],
-            diagnostics["beta_anchor_abs_err"],
-        ):
-            print(f"[kot]     {name:<18} β*={tgt:.4f}  β={fin:.4f}  |Δ|={err:.4f}")
-    print(f"[kot] stopped at epoch {stop_epoch} / {n_epochs}")
 
     if output_dir is not None:
-        out = Path(output_dir)
-
-        # 1. Save best_align diagnostics (downstream FOSCTTM eval uses this).
-        diag_path = out / "diagnostics.json"
-        with open(diag_path, "w") as f:
-            json.dump(diagnostics, f, indent=2)
-        print(f"[kot] Saved diagnostics: {diag_path}")
-
-        # 2. Save the 4 checkpoint state dicts to disk.
-        for name, state, ep, lo in checkpoints:
-            if state is None:
-                continue
-            ckpt_path = out / f"checkpoint_{name}.pt"
-            torch.save(
-                {
-                    "state_dict": state,
-                    "epoch":      ep,
-                    "losses":     lo,
-                    "model_name": model_name,
-                    "seed":       seed,
-                },
-                ckpt_path,
-            )
-            print(f"[kot] Saved checkpoint: {ckpt_path} (epoch {ep})")
-
-        # 3. Evaluate FOSCTTM + diagnostics at EACH checkpoint (not just best_align).
-        # best_align reuses the full-diagnostics already computed above and caches its
-        # per-cell result for the scatter panel below — computed once, not three times.
-        per_ckpt_rows = []
-        best_align_per_cell = None
-        for name, state, ep, lo in checkpoints:
-            if state is None:
-                continue
-            model.load_state_dict(state)
-            if name == "best_align":
-                d = dict(best_align_full)
-            else:
-                d = compute_full_diagnostics(
-                    model,
-                    R_t,
-                    V_eff_t,
-                    P_t,
-                    S_t,
-                    rna_adata.obs,
-                    mask=mask_t,
-                    align_cols=align_cols,
-                )
-            pc = compute_per_cell_diagnostics(
-                model,
-                R_t,
-                V_eff_t,
-                P_t,
-                S_t,
-                rna_adata.obs,
-                mask=mask_t,
-                align_cols=align_cols,
-            )
-            if name == "best_align":
-                best_align_per_cell = pc
-            d.update(velocity_diag)
-            mean_f = float(np.mean(pc["foscttm"]))
-            d["mean_foscttm"]      = mean_f
-            d["checkpoint"]        = name
-            d["checkpoint_epoch"]  = ep
-            d["checkpoint_losses"] = lo
-            with open(out / f"diagnostics_{name}.json", "w") as f:
-                json.dump(d, f, indent=2)
-            pd.DataFrame({"foscttm": pc["foscttm"]}).to_csv(
-                out / f"foscttm_{name}.csv", index=False,
-            )
-            row = {
-                "checkpoint":         name,
-                "epoch":              ep,
-                "mean_foscttm":       mean_f,
-                "time_mae":           d["time_mae"],
-                "time_spearman":      d["time_spearman"],
-                "traj_dtw_temporal":  d["traj_dtw_temporal"],
-                "traj_dtw_recon":     d["traj_dtw_recon"],
-                "phi_variance_ratio": d["phi_variance_ratio"],
-                "jvp_rhs_cos":        d["jvp_rhs_cos"],
-                "jvp_norm":           d["jvp_norm"],
-                "rhs_norm":           d["rhs_norm"],
-            }
-            # Every per-cell / per-protein distribution, flattened into the summary CSV so a
-            # box plot across checkpoints, seeds or datasets needs nothing but this file.
-            for prefix in JVP_DIAG_PREFIXES + PARAM_DIAG_PREFIXES + ("beta", "v_eff_norm"):
-                for stat in STAT_SUFFIXES:
-                    row[f"{prefix}_{stat}"] = d[f"{prefix}_{stat}"]
-            row["v_eff_nonzero_frac"] = d["v_eff_nonzero_frac"]
-            row["velocity_backend_cos_mean"]   = d["velocity_backend_cos_mean"]
-            row["velocity_backend_cos_median"] = d["velocity_backend_cos_median"]
-            row["velocity_backend_cos_q25"]    = d["velocity_backend_cos_q25"]
-            row["velocity_backend_cos_q75"]    = d["velocity_backend_cos_q75"]
-            per_ckpt_rows.append(row)
-            print(f"[kot] Eval {name}: FOSCTTM={mean_f:.4f}  "
-                  f"cos={d['jvp_rhs_cos']:+.3f} (med {d['jvp_rhs_cos_median']:+.3f})  "
-                  f"ratio med={d['norm_ratio_median']:.3f}  "
-                  f"relres med={d['rel_residual_median']:.3f}  "
-                  f"κ={d['kappa_mean']:.3f} (med {d['kappa_median']:.3f}) "
-                  f"[{d['kappa_min']:.3f},{d['kappa_max']:.3f}]  "
-                  f"α={d['alpha_mean']:.3f} (med {d['alpha_median']:.3f}) "
-                  f"[{d['alpha_min']:.3f},{d['alpha_max']:.3f}]  "
-                  f"β={d['beta_mean']:.3f} (med {d['beta_median']:.3f})")
-        if per_ckpt_rows:
-            pd.DataFrame(per_ckpt_rows).to_csv(
-                out / "checkpoint_eval_summary.csv", index=False,
-            )
-
-        # 4. Restore best_align state so downstream artifacts (foscttm.csv, plots)
-        # reflect the same checkpoint as the returned `aligned`.
-        if best_align_state is not None:
-            model.load_state_dict(best_align_state)
-
-        # 5. Per-cell arrays + the FOSCTTM-vs-diagnostics scatter panel for best_align.
-        # Reuse the per-cell result already computed for best_align in the loop above (same
-        # restored state); only recompute in the edge case where best_align was never a
-        # checkpoint (best_align_per_cell stays None).
-        if best_align_per_cell is not None:
-            per_cell = best_align_per_cell
-        else:
-            per_cell = compute_per_cell_diagnostics(
-                model,
-                R_t,
-                V_eff_t,
-                P_t,
-                S_t,
-                rna_adata.obs,
-                mask=mask_t,
-                align_cols=align_cols,
-            )
-        per_cell_path = out / "per_cell_diagnostics.npz"
-        np.savez(per_cell_path, **per_cell)
-        plot_path = out / "foscttm_diagnostics.png"
-        plot_foscttm_diagnostics(per_cell, plot_path)
-        print(f"[kot] Saved per-cell arrays: {per_cell_path}")
-        print(f"[kot] Saved FOSCTTM diagnostics plot: {plot_path}")
-
-        # Per-batch alignment-vs-kinetics gradient interaction (epoch × probe batch).
-        if grad_interaction_rows:
-            gi_path = out / "grad_interaction.csv"
-            pd.DataFrame(grad_interaction_rows).to_csv(gi_path, index=False)
-            gi_plot = out / "grad_interaction.png"
-            plot_grad_interaction(grad_interaction_rows, gi_plot)
-            print(f"[kot] Saved grad-interaction diagnostics: {gi_path} + {gi_plot}")
+        write_run_artifacts(
+            output_dir, diagnostics, best_align_full, velocity_diag, checkpoints,
+            best_align_state, model, diag_inputs, model_name, seed, grad_interaction_rows,
+        )
 
     # Benchmark FOSCTTM is computed on `aligned`. Restrict it to the alignment panel
     # (use_for_alignment proteins) so the benchmark is consistent with training and

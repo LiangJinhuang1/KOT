@@ -5,7 +5,7 @@ Reads a CSV with (at least) protein_name and either half_life_hours or
 beta_per_hour (optionally cell_type, quality_score_or_R2, anchor_weight), and
 resolves it against the protein panel.
 
-Aggregation across cell-type rows (supervisor):
+Aggregation across cell-type rows:
   - median (default) or mean of β_per_hour
   - optional stability filter: keep only proteins whose CV across cell types
     is ≤ stable_cv_max
@@ -137,7 +137,7 @@ def resolve_beta_anchors(
         center = aggregate_values(betas_h, aggregate)
         if center <= 0:
             continue
-        cv = sample_std(betas_h) / center if center > 0 else 0.0
+        cv = sample_std(betas_h) / center
         # Stability filter: drop proteins whose half-life varies too much across cell types.
         if stable_cv_max is not None and len(betas_h) >= 2 and cv > stable_cv_max:
             continue

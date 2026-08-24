@@ -10,11 +10,14 @@ analysis/
 results/
 .ncbi/
 
-# 文档与脚本（本地 / HPC）
+# 文档与本地草稿
 assistant.py
 *.md
+!README.md
 !config/README.md
 *.sh
+!slurm/
+!slurm/*.sh
 *.qmd
 *.ipynb
 

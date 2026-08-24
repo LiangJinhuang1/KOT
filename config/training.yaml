@@ -150,6 +150,22 @@ defaults:
   # this value (small datasets n<8192 run full-batch). Override per-run with --set.
   batch_size: 8192
   lr: 1.0e-3
+  # Per-head learning rates; null falls back to `lr`. phi is the alignment map, and
+  # alpha/kappa share one group because they are the two heads of the same kinetics
+  # term (kappa absorbs the pseudotime scale alpha is measured on). beta is a single
+  # (D_p,) vector with a travel-cap of ~0.14 from init at a shared rate, which is the
+  # reason to give it its own.
+  lr_phi: null
+  lr_alpha_kappa: null
+  lr_beta: null
+  # One multiplicative factor on ALL groups, so the ratios between the three rates hold
+  # for the whole run: lr_warmup_start_factor·lr -> lr -> lr_min_factor·lr.
+  # Linear over the first lr_warmup_epochs, cosine over the remaining n_epochs - warmup.
+  # The defaults below (0 / 1.0 / 0.0) are exactly the previous
+  # CosineAnnealingLR(T_max=n_epochs), so runs stay comparable until you opt in.
+  lr_warmup_epochs: 0
+  lr_warmup_start_factor: 1.0
+  lr_min_factor: 0.0
   seed: 42
   phi_dims: [1024, 512, 256]
   kappa_dims: [64, 32]
