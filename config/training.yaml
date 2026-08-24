@@ -292,7 +292,7 @@ datasets:
     kot_alpha_max: 3.0             # keep α bounded (null / unbounded hurt PBMC: 0.50±0.18 vs 0.27)
     sinkhorn_max_points: 8192      # ~90k cells: minibatch the align Sinkhorn (full n×n OOMs)
     align_batch_key: batch         # OT baselines (scot/moscot/linear_ode) run per biological batch
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
   pbmc:
     modality_pair: rna_protein
@@ -309,7 +309,7 @@ datasets:
     kot_kinetics_require_velocity_gene: true
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0             # same bound as successful PBMC run_20260715_190847
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
   # #3 variants: same config, but read the ADT-gene-retained velocity file so S
   # coverage jumps (PBMC 17→29, BMMC 51→115). Same mapping CSV — present-in-RNA
@@ -351,7 +351,7 @@ datasets:
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
   # Velocity-provider ablation: identical KOT config to pbmc_retained, but the
   # dataset's rna_path (in datasets.yaml) points at the RegVelo velocity h5ad.
@@ -380,7 +380,7 @@ datasets:
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
   bmmc_cite_retained:
     modality_pair: rna_protein
@@ -416,7 +416,7 @@ datasets:
     kot_alpha_max: 3.0
     sinkhorn_max_points: 8192
     align_batch_key: batch
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
   # Velocity-provider ablation: identical KOT config to bmmc_cite_retained, but the
   # dataset's rna_path (in datasets.yaml) points at the RegVelo velocity h5ad.
@@ -447,7 +447,7 @@ datasets:
     kot_alpha_max: 3.0
     sinkhorn_max_points: 8192
     align_batch_key: batch
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
   # Papalexi ECCITE-seq (GSE153056). Only a 4-marker checkpoint ADT panel (CD86,
   # PD-L1, PD-L2, TIM3), so the alignment metric is inherently noisy — this is a
@@ -475,7 +475,7 @@ datasets:
     kot_alpha_max: 3.0
     kot_velocity_gauge_normalize: false
     sinkhorn_max_points: 8192            # ~20k cells: minibatch the align Sinkhorn
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
   # Velocity-provider ablation: identical KOT config to papalexi_retained, but the
   # dataset's rna_path (datasets.yaml) points at the RegVelo velocity h5ad.
@@ -501,4 +501,4 @@ datasets:
     kot_alpha_max: 3.0
     kot_velocity_gauge_normalize: false
     sinkhorn_max_points: 8192
-    seeds: [42, 123, 2026, 6, 9]
+    seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]

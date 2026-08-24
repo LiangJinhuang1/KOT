@@ -54,7 +54,7 @@ Parallel sweeps use one runner argument string per line:
 
 ```bash
 bash slurm/make_jobs.sh --out jobs.txt
-sbatch --export=ALL,JOBS_FILE=jobs.txt,MAX_PARALLEL=8 slurm/parallel_train.sh
+sbatch --export=ALL,JOBS_FILE=jobs.txt,MAX_PARALLEL=16 slurm/parallel_train.sh
 ```
 
 Submit from the repository root. The scripts use `SLURM_SUBMIT_DIR`, mount that

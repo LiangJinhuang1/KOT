@@ -157,6 +157,20 @@ def lr_schedule_factor(epoch_index: int, warmup_epochs: int, n_epochs: int,
     return min_factor + (1.0 - min_factor) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def phase_lr_factor(optimiser) -> float:
+    """The factor the groups' current lrs sit at, relative to their base_lr.
+
+    Both lr mechanisms are multiplicative and uniform across the heads -- the LambdaLR
+    factor in scheduler mode, phase3_lr_scale in phase mode -- so one group answers for
+    all of them, and reading the factor back out of the optimiser keeps the call sites
+    from having to know which of the two is live. In phase mode it is 1.0 until phase 3
+    and phase3_lr_scale after; with a scheduler it is lr_schedule_factor of the epoch
+    that has been stepped to.
+    """
+    group = optimiser.param_groups[0]
+    return float(group["lr"] / group["base_lr"])
+
+
 def format_group_lrs(optimiser, factor: float) -> str:
     """`lr=1.00e-03` when the heads share a rate, else one field per head.
 

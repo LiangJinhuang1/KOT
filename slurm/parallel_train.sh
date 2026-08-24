@@ -14,7 +14,7 @@
 #        --datasets pbmc_retained --models kot
 #        --datasets pbmc_retained --models scot
 #        --datasets bmmc_cite_retained --models kot --set lambda_dyn=1
-#   2) sbatch --export=ALL,JOBS_FILE=jobs.txt,MAX_PARALLEL=12 slurm/parallel_train.sh
+#   2) sbatch --export=ALL,JOBS_FILE=jobs.txt,MAX_PARALLEL=16 slurm/parallel_train.sh
 #      (optional: ,ENABLE_MPS=1 for true concurrent kernels via NVIDIA MPS)
 #
 # The preprocessing cache write is atomic (src/data/preprocessing.py), so several runs of the
@@ -23,9 +23,9 @@
 #
 #SBATCH --account=core-med1-telem
 #SBATCH --partition=jobs-gpu
-#SBATCH --gres=gpu:b200:2
+#SBATCH --gres=gpu:b200:4
 #SBATCH --cpus-per-gpu=32
-#SBATCH --mem=256GB
+#SBATCH --mem=512GB
 #SBATCH --time=07:00:00
 #SBATCH --job-name=kot_parallel
 #SBATCH --requeue
@@ -37,7 +37,7 @@ cd "${SLURM_SUBMIT_DIR}"
 mkdir -p logs
 
 : "${JOBS_FILE:?set JOBS_FILE=path/to/jobs.txt (one runner arg-string per line)}"
-MAX_PARALLEL="${MAX_PARALLEL:-12}"
+MAX_PARALLEL="${MAX_PARALLEL:-16}"
 ENABLE_MPS="${ENABLE_MPS:-0}"
 AUTO_GPU_THROTTLE="${AUTO_GPU_THROTTLE:-1}"
 MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-18000}"
@@ -58,8 +58,8 @@ CONTAINER="${CONTAINER:-/data/common/images/codedev_v1.0.5.sif}"
 export CONTAINER JOBS_FILE MAX_PARALLEL ENABLE_MPS RUN_STAMP
 export AUTO_GPU_THROTTLE MIN_FREE_GPU_MB GPU_POLL_SEC
 # --cpus-per-gpu does not set SLURM_CPUS_PER_TASK, so that alone would silently
-# fall back to 8 and leave most of the allocation idle — more so now that two GPUs
-# means twice the cores. CPUS_ON_NODE reflects what was actually granted.
+# fall back to 8 and leave most of the allocation idle — more so now that four GPUs
+# means four times the cores. CPUS_ON_NODE reflects what was actually granted.
 export PREPROCESS_THREADS="${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-8}}"
 echo "CPU budget: ${PREPROCESS_THREADS} (cpus_per_task=${SLURM_CPUS_PER_TASK:-unset}, cpus_on_node=${SLURM_CPUS_ON_NODE:-unset})"
 
