@@ -157,6 +157,22 @@ def lr_schedule_factor(epoch_index: int, warmup_epochs: int, n_epochs: int,
     return min_factor + (1.0 - min_factor) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def dyn_weight_factor(epoch: int, dyn_warmup_epochs: int) -> float:
+    """Multiplier on lambda_dyn for a 1-based `epoch`: a linear ramp to 1 over W epochs.
+
+    The kinetics weight has exactly ONE free parameter -- when it arrives. Its ceiling
+    is lambda_dyn and its floor is 0, so W is the whole schedule: the term is at
+    lambda_dyn/W on the first epoch and at full strength on epoch W, not W+1. W=0 is
+    joint training from epoch 1.
+
+    Top-level and single-purpose so the curriculum can be tested without standing up a
+    training run, the same reason lr_schedule_factor is.
+    """
+    if dyn_warmup_epochs <= 0:
+        return 1.0
+    return min(1.0, epoch / dyn_warmup_epochs)
+
+
 def phase_lr_factor(optimiser) -> float:
     """The factor the groups' current lrs sit at, relative to their base_lr.
 
@@ -1724,6 +1740,17 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         print(f"[kot] Phases: P1={phase1_epochs} (Sinkhorn) "
               f"P2={phase2_epochs} (Dynamics) "
               f"P3={phase3_epochs} (Joint @ lr×{phase3_lr_scale})")
+    elif dyn_warmup_epochs >= n_epochs:
+        # Checkpointing and early stopping only start once the ramp is done (see
+        # monitor_align below), so a ramp that outlasts the run leaves best_align
+        # unrecorded: no early stopping, no model selection, and the run silently
+        # returns its final state instead. Nothing downstream errors on that, so it has
+        # to be caught here.
+        raise ValueError(
+            f"dyn_warmup_epochs ({dyn_warmup_epochs}) must be shorter than n_epochs "
+            f"({n_epochs}), or the ramp never finishes and no best_align checkpoint is "
+            f"ever recorded. Shorten the ramp or raise n_epochs."
+        )
 
     use_feature_space = bool(cfg.get("kot_use_feature_space", False))
     rna_layer = cfg.get("kot_rna_layer")
@@ -2168,11 +2195,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             lam_dyn_eff   = lambda_dyn if current_phase in (2, 3) else 0.0
         else:
             lam_align_eff = 1.0
-            # λ_dyn^eff = λ_dyn · min(1, t / dyn_warmup_epochs), t the 1-based epoch,
-            # so the kinetics term is at λ_dyn/W on the first epoch and reaches full
-            # strength at epoch W rather than W+1.
-            lam_dyn_eff = (lambda_dyn * min(1.0, epoch / dyn_warmup_epochs)
-                           if dyn_warmup_epochs > 0 else lambda_dyn)
+            lam_dyn_eff = lambda_dyn * dyn_weight_factor(epoch, dyn_warmup_epochs)
         if not use_phases and g_freeze_epochs > 0:
             g_train = epoch > g_freeze_epochs
             for p in model.g.parameters():
@@ -2347,9 +2370,13 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             best_total_state = clone_state(model)
             best_total_losses = dict(current_losses)
 
-        # Early stopping: only monitor epochs with a real alignment loss. In phased
-        # runs, the dynamics-only phase sets lam_align_eff=0 and must not become
-        # "best_align" simply because align_val is 0.
+        # Early stopping: only monitor epochs where BOTH terms are at full strength.
+        # In phased runs, the dynamics-only phase sets lam_align_eff=0 and must not
+        # become "best_align" simply because align_val is 0. In joint runs the mirror
+        # trap: while the kinetics weight is still ramping, the align loss is the lowest
+        # it will ever be precisely because nothing is pulling against it, so an
+        # unguarded monitor would checkpoint inside the ramp and hand back a model with
+        # far less dynamics than it trained with -- one that ranks WELL on FOSCTTM.
         monitor_align = lam_align_eff > 0.0 and (use_phases or epoch > dyn_warmup_epochs)
         if monitor_align:
             if current_align < best_align:

@@ -203,6 +203,11 @@ defaults:
   kot_alpha_min: 0.1e-4
   kot_alpha_max: 3.0
   g_freeze_epochs: 0
+  # Linear ramp of the kinetics weight to lambda_dyn over this many epochs; 0 is joint
+  # training from epoch 1. Checkpointing and early stopping only start once the ramp is
+  # done: while it is running the align loss is trivially at its minimum, so an earlier
+  # best_align would select a model with far less dynamics than it trained with. Must be
+  # shorter than n_epochs (run_kot raises otherwise).
   dyn_warmup_epochs: 0
   early_stopping_patience: 100
   phase1_epochs: 0
