@@ -267,6 +267,137 @@ def aggregate_rows(rows: list[dict], checkpoint: str, key_columns: list[str],
     return records
 
 
+# Metrics the paired table differences, and whether lower is better. FOSCTTM is the
+# decision metric; the other two are the tie-breaks that say whether a FOSCTTM win was
+# bought by letting the dynamics term go slack.
+PAIRED_METRICS = [("mean_foscttm", True), ("jvp_rhs_cos_median", False),
+                  ("time_spearman", False)]
+
+
+def cell_key(row: dict, columns: list[str]) -> tuple:
+    """A config cell's identity, as formatted strings so 0 and "0" are the same cell."""
+    return tuple(format_cell(row.get(col)) for col in columns)
+
+
+def parse_baseline(spec: str) -> dict[str, str]:
+    """`lambda_dyn=100,n_epochs=500` -> {key: value} as strings."""
+    baseline = {}
+    for item in spec.split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise ValueError(f"--paired-vs expects key=value, got: {item!r}")
+        key, value = item.split("=", 1)
+        baseline[key.strip()] = value.strip()
+    return baseline
+
+
+def paired_deltas(rows: list[dict], checkpoint: str, group_by: list[str],
+                  baseline: dict[str, str]) -> list[dict]:
+    """One record per (dataset, config cell): its per-seed change against the baseline.
+
+    Paired, not pooled. Seeds are the dominant variance component in these sweeps --
+    on real CITE-seq the seed sd is the same size as the gaps between configs -- so
+    ranking cells by mean±sd throws away the fact that every cell ran the SAME four
+    seeds. Differencing within a seed removes that shared component, which is most of
+    what lets a 4-seed sweep resolve anything at all. `win` counts the seeds that moved
+    the right way: 4/4 with a small mean beats 3/4 with a large one, because the second
+    is usually one seed carrying the whole effect.
+
+    Datasets stay SEPARATE rows rather than being pooled into one delta. Pooling would
+    average a config that helps PBMC and hurts BMMC into a flat zero, and disagreement
+    between the two is a result -- it is the reason the sweep runs both.
+    """
+    # The baseline must pin EVERY group-by key. An unpinned key would leave the
+    # baseline cell under-determined -- there is no single row to difference against --
+    # and the lookup below would just fail with a less useful message.
+    unknown = [key for key in baseline if key not in group_by]
+    if unknown:
+        raise ValueError(f"--paired-vs keys not in --group-by: {unknown}")
+    unpinned = [key for key in group_by if key not in baseline]
+    if unpinned:
+        raise ValueError(
+            f"--paired-vs must pin every --group-by key; missing: {unpinned}. "
+            f"A baseline is one cell, not a slice."
+        )
+
+    values: dict[tuple, dict] = {}
+    datasets = set()
+    for row in rows:
+        if row.get("checkpoint") != checkpoint or row.get("status") != "ok":
+            continue
+        context = (row.get("model"), row.get("dataset"), row.get("seed"))
+        datasets.add((row.get("model"), row.get("dataset")))
+        values.setdefault((context, cell_key(row, group_by)), row)
+
+    cells = sorted({key for _, key in values})
+    base_key = tuple(baseline.get(col) or "" for col in group_by)
+    if base_key not in cells:
+        raise ValueError(f"--paired-vs cell {base_key} not found among {cells}")
+
+    records = []
+    for model, dataset in sorted(datasets):
+        for cell in cells:
+            record = {"model": model, "dataset": dataset}
+            record.update(dict(zip(group_by, cell)))
+            record["is_baseline"] = cell == base_key
+            for metric, lower_is_better in PAIRED_METRICS:
+                deltas = []
+                for seed_row_key, row in values.items():
+                    (row_model, row_dataset, _), key = seed_row_key
+                    if key != cell or row_model != model or row_dataset != dataset:
+                        continue
+                    base_row = values.get((seed_row_key[0], base_key))
+                    if base_row is None:
+                        continue
+                    here, there = row.get(metric), base_row.get(metric)
+                    if isinstance(here, (int, float)) and isinstance(there, (int, float)):
+                        deltas.append(float(here) - float(there))
+                mean, sd = mean_sd(deltas) if deltas else (None, None)
+                record[f"{metric}_delta_mean"] = mean
+                record[f"{metric}_delta_sd"] = sd
+                record[f"{metric}_delta_n"] = len(deltas)
+                record[f"{metric}_delta_win"] = sum(
+                    1 for d in deltas if (d < 0 if lower_is_better else d > 0)
+                )
+            records.append(record)
+
+    records.sort(key=lambda r: (r["dataset"], 0 if r["is_baseline"] else 1,
+                                float("inf") if r["mean_foscttm_delta_mean"] is None
+                                else r["mean_foscttm_delta_mean"]))
+    return records
+
+
+def print_paired(records: list[dict], group_by: list[str]) -> None:
+    """One block per dataset, ranked by mean paired FOSCTTM delta (negative = better)."""
+    columns = ["dataset"] + group_by
+    widths = {
+        col: max(len(col), max(len(format_cell(r.get(col))) for r in records)) + 2
+        for col in columns
+    }
+    header = ("".join(f"{col:{widths[col]}}" for col in columns)
+              + f"{'dFOSCTTM':>20}{'win':>7}{'dcos':>9}{'dtSpear':>9}")
+    current = None
+    for position, record in enumerate(records):
+        if record["dataset"] != current:
+            current = record["dataset"]
+            print(("\n" if position else "") + header)
+        cells = "".join(f"{format_cell(record.get(col)):{widths[col]}}" for col in columns)
+        if record["is_baseline"]:
+            print(cells + f"{'(baseline)':>20}")
+            continue
+        mean, sd = record["mean_foscttm_delta_mean"], record["mean_foscttm_delta_sd"]
+        delta = f"{mean:+.4f} ± {sd:.4f}" if mean is not None else "-"
+        win = f"{record['mean_foscttm_delta_win']}/{record['mean_foscttm_delta_n']}"
+        print(cells + f"{delta:>20}{win:>7}"
+              + f"{format_delta(record['jvp_rhs_cos_median_delta_mean']):>9}"
+              + f"{format_delta(record['time_spearman_delta_mean']):>9}")
+    print("\ndFOSCTTM is the per-seed change vs the baseline cell, negative = better; "
+          "`win` counts seeds that improved.\nA cell that wins on dFOSCTTM while dcos "
+          "goes sharply negative bought alignment by dropping the dynamics. A cell that "
+          "wins on\none dataset and loses on the other has not won.")
+
+
 def format_cell(value) -> str:
     """Compact, so 0.6931471805599453 does not set the column width on its own."""
     if value is None:
@@ -278,6 +409,11 @@ def format_cell(value) -> str:
 
 def format_metric(value) -> str:
     return "-" if value is None else f"{value:.3f}"
+
+
+def format_delta(value) -> str:
+    """Signed, so a paired table never leaves the direction of a change to be guessed."""
+    return "-" if value is None else f"{value:+.3f}"
 
 
 def print_aggregate(records: list[dict], key_columns: list[str]) -> None:
@@ -331,6 +467,13 @@ def main() -> int:
                              "instead of the run-dir name, e.g. "
                              "lambda_dyn,lambda_kappa_prior. model and dataset stay in "
                              "the key. Implies --aggregate and writes <out>_by_config.csv.")
+    parser.add_argument("--paired-vs", default=None,
+                        help="Baseline cell for a per-seed paired comparison, as "
+                             "key=value pairs over the --group-by keys, e.g. "
+                             "'lambda_dyn=100,n_epochs=500'. Prints "
+                             "dFOSCTTM vs that cell within each dataset instead of "
+                             "ranking cells by mean±sd, and writes <out>_paired.csv. "
+                             "Requires --group-by.")
     parser.add_argument("--dyn-cos-min", type=float, default=DYN_COS_MIN,
                         help=f"Flag a cell dyn-dead below this JVP·RHS cosine "
                              f"(default {DYN_COS_MIN}).")
@@ -392,6 +535,24 @@ def main() -> int:
         if flagged:
             print(f"\n{len(flagged)} of {len(records)} cells flagged — see cell_flag(). "
                   f"A dyn-dead cell can still rank well on FOSCTTM; it is not a result.")
+
+    if args.paired_vs:
+        if not group_by:
+            print("--paired-vs requires --group-by", file=sys.stderr)
+            return 1
+        checkpoint = args.checkpoint if not args.all_checkpoints else "training"
+        paired = paired_deltas(rows, checkpoint, group_by, parse_baseline(args.paired_vs))
+        paired_out = args.out.with_name(f"{args.out.stem}_paired{args.out.suffix}")
+        columns = (["model", "dataset"] + group_by + ["is_baseline"]
+                   + [f"{m}_delta_{stat}" for m, _ in PAIRED_METRICS
+                      for stat in ("mean", "sd", "n", "win")])
+        with open(paired_out, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(paired)
+        print(f"\nWrote {paired_out}: {len(paired)} config cells")
+        print()
+        print_paired(paired, group_by)
     return 0
 
 
