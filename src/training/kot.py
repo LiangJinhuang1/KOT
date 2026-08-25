@@ -2484,6 +2484,21 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # Median pre-clip gradient norm. It runs ~100-6000x above the 1.0 budget, so the
     # clip binds every step and acts as a renormaliser -- worth knowing, not tunable.
     diagnostics["grad_norm_median"] = float(np.median(loss_history["grad_norm"]))
+    # Gradient balance, summarised out of grad_interaction.csv so a sweep can rank on it.
+    # grad_mag_ratio = ||lambda_dyn*grad_dyn|| / ||grad_align||: because the clip binds on
+    # every step, lambda_dyn is a MIXING coefficient, not a scale -- it decides how a
+    # fixed-norm step is split between the two terms, and this ratio is that split
+    # measured directly. Near 1 means balanced; <<1 means the kinetics term is along for
+    # the ride. grad_cos is the angle between the two: strongly negative means they are
+    # fighting, so a FOSCTTM win at high lambda_dyn was bought against alignment.
+    # Taken over the last third of the logged epochs -- the early ones are dominated by
+    # initialisation and by the lambda_dyn ramp still being partway up.
+    if grad_interaction_rows:
+        epochs = sorted({row["epoch"] for row in grad_interaction_rows})
+        tail = set(epochs[len(epochs) * 2 // 3:])
+        late = [row for row in grad_interaction_rows if row["epoch"] in tail]
+        diagnostics["grad_mag_ratio_late"] = float(np.median([r["grad_mag_ratio"] for r in late]))
+        diagnostics["grad_cos_late"] = float(np.median([r["grad_cos"] for r in late]))
     diagnostics["data_debug"]        = data_debug
 
     print_end_of_training(

@@ -68,6 +68,10 @@ DEFAULT_METRICS = [
     # Pre-clip gradient norm. It sits ~100-6000x above the fixed 1.0 budget, so the
     # clip binds on every step and acts as a renormalizer rather than a spike guard.
     "grad_norm_median",
+    # Gradient balance at the end of training (see run_kot). grad_mag_ratio_late is the
+    # align-vs-dynamics split of each clipped step; grad_cos_late is the angle between
+    # the two terms. Both are mechanism checks on a lambda_dyn result, not scores.
+    "grad_mag_ratio_late", "grad_cos_late",
 ]
 
 CHECKPOINTS = ["training", "final", "best_align", "best_dyn", "best_total"]
@@ -80,6 +84,7 @@ AGGREGATE_METRICS = [
     # learned beta lands from its anchor target. It moves independently of FOSCTTM,
     # so it has to be in the table rather than looked up per-run afterwards.
     "beta_anchor_mean_abs_err",
+    "grad_mag_ratio_late", "grad_cos_late",
     "grad_norm_median", "runtime_seconds",
 ]
 
@@ -271,7 +276,8 @@ def aggregate_rows(rows: list[dict], checkpoint: str, key_columns: list[str],
 # decision metric; the other two are the tie-breaks that say whether a FOSCTTM win was
 # bought by letting the dynamics term go slack.
 PAIRED_METRICS = [("mean_foscttm", True), ("jvp_rhs_cos_median", False),
-                  ("time_spearman", False)]
+                  ("time_spearman", False), ("phi_variance_ratio", False),
+                  ("grad_cos_late", False)]
 
 
 def cell_key(row: dict, columns: list[str]) -> tuple:
@@ -376,7 +382,7 @@ def print_paired(records: list[dict], group_by: list[str]) -> None:
         for col in columns
     }
     header = ("".join(f"{col:{widths[col]}}" for col in columns)
-              + f"{'dFOSCTTM':>20}{'win':>7}{'dcos':>9}{'dtSpear':>9}")
+              + f"{'dFOSCTTM':>20}{'win':>7}{'dcos':>9}{'dtSpear':>9}{'dφvar':>9}{'dgcos':>9}")
     current = None
     for position, record in enumerate(records):
         if record["dataset"] != current:
@@ -391,11 +397,16 @@ def print_paired(records: list[dict], group_by: list[str]) -> None:
         win = f"{record['mean_foscttm_delta_win']}/{record['mean_foscttm_delta_n']}"
         print(cells + f"{delta:>20}{win:>7}"
               + f"{format_delta(record['jvp_rhs_cos_median_delta_mean']):>9}"
-              + f"{format_delta(record['time_spearman_delta_mean']):>9}")
+              + f"{format_delta(record['time_spearman_delta_mean']):>9}"
+              + f"{format_delta(record['phi_variance_ratio_delta_mean']):>9}"
+              + f"{format_delta(record['grad_cos_late_delta_mean']):>9}")
     print("\ndFOSCTTM is the per-seed change vs the baseline cell, negative = better; "
-          "`win` counts seeds that improved.\nA cell that wins on dFOSCTTM while dcos "
-          "goes sharply negative bought alignment by dropping the dynamics. A cell that "
-          "wins on\none dataset and loses on the other has not won.")
+          "`win` counts seeds that improved.\nCheck the mechanism before believing a "
+          "win: dcos sharply negative = bought alignment by dropping the dynamics; "
+          "dφvar\nsharply negative = phi is shrinking rather than the ODE being "
+          "satisfied; dgcos negative = the two terms\nare fighting, so the gain came "
+          "at alignment's expense. A cell that wins on one dataset and loses on\nthe "
+          "other has not won.")
 
 
 def format_cell(value) -> str:
@@ -430,7 +441,7 @@ def print_aggregate(records: list[dict], key_columns: list[str]) -> None:
     }
     print("".join(f"{col:{widths[col]}}" for col in key_columns)
           + f"{'FOSCTTM':>18}{'n':>4}{'bad':>5}{'cos':>8}{'relres':>8}{'tSpear':>8}"
-            f"{'βerr':>8}  flag")
+            f"{'βerr':>8}{'φvar':>8}{'gratio':>8}{'gcos':>8}  flag")
     for record in records:
         mean, sd = record["mean_foscttm_mean"], record["mean_foscttm_sd"]
         score = f"{mean:.4f} ± {sd:.4f}" if mean is not None else "CRASHED"
@@ -440,6 +451,12 @@ def print_aggregate(records: list[dict], key_columns: list[str]) -> None:
               + f"{format_metric(record['rel_residual_median_mean']):>8}"
               + f"{format_metric(record['time_spearman_mean']):>8}"
               + f"{format_metric(record['beta_anchor_mean_abs_err_mean']):>8}"
+              # phi_variance_ratio decides the `collapsed` flag and grad_mag_ratio_late
+              # explains a lambda_dyn result, so both belong in the table that gets read,
+              # not only in the CSV that gets opened when something already looks wrong.
+              + f"{format_metric(record['phi_variance_ratio_mean']):>8}"
+              + f"{format_metric(record['grad_mag_ratio_late_mean']):>8}"
+              + f"{format_metric(record['grad_cos_late_mean']):>8}"
               + (f"  {record['flag']}" if record["flag"] else ""))
 
 
