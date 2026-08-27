@@ -40,6 +40,10 @@ python -m src.training.runner --datasets pbmc_retained --models kot_main
 Configuration files are project inputs rather than package data. Run commands
 from the repository root, or pass `--config` and `--datasets-config` explicitly.
 
+`config/training.yaml` is the single training config. Model groups, seeds,
+staged synthetic runs, and the validation-split knobs are documented in
+`config/README.md`.
+
 ## Cluster
 
 The SLURM scripts run inside the existing Singularity image and preserve the
