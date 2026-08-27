@@ -50,6 +50,7 @@ from src.data.preprocessing import load_and_preprocess_cached
 from src.data.synthetic_linked_ode import stage_output_paths
 from src.data.projection import projection_matrix_from_adatas
 from src.data.adt_gene_map import load_mapping_records
+from src.data.splits import resolve_split_seed, validation_mask
 from src.models.KOT import KOTModel
 from src.training.kot import (
     FixedAlpha,
@@ -62,7 +63,9 @@ from src.training.kot import (
     compute_per_cell_diagnostics,
     matrix_from_adata,
     set_fixed_beta,
+    to_index_tensor,
     to_tensor,
+    validation_metrics,
 )
 
 
@@ -70,7 +73,7 @@ DATASETS_CONFIG = Path("config/datasets.yaml")
 DEFAULT_RUN_DIR = Path("cache/training")
 DEFAULT_OUTPUT = Path("cache/results/checkpoint_eval_summary.csv")
 
-CHECKPOINT_NAMES = ["best_align", "best_dyn", "best_total", "final"]
+CHECKPOINT_NAMES = ["best_align", "best_val_align", "best_dyn", "best_total", "final"]
 
 # Mirror the KOT-specific runner.MODEL_OVERRIDES so checkpoint architecture
 # matches the saved state dict.
@@ -465,7 +468,38 @@ def build_model_and_tensors(
     if fixed_beta_value is not None:
         set_fixed_beta(model, fixed_beta_value, D_p, device)
 
-    return model, R_t, V_eff_t, P_t, S_t, rna_adata.obs, mask_t, align_cols, velocity_backend
+    # The same validation slice the run itself used, so a re-evaluation scores the
+    # cells the run held out and not a fresh sample. Every input to the draw has to be
+    # read back from the run's own config: with val_split_per_seed the split is keyed
+    # on the run's SEED, and with val_stratify_by it is drawn per stratum, so passing
+    # the bare val_split_seed here would silently rebuild a different set of cells.
+    # diagnostics.json records val_split_digest; that is what this can be checked against.
+    val_fraction = float(run_cfg.get("val_fraction", 0.0))
+    val_stratify_by = run_cfg.get("val_stratify_by") or None
+    val_strata = None
+    if val_stratify_by is not None and val_fraction > 0.0:
+        if val_stratify_by not in rna_adata.obs.columns:
+            raise ValueError(
+                f"val_stratify_by={val_stratify_by!r} is not an obs column of the RNA "
+                f"AnnData; cannot rebuild the run's validation split."
+            )
+        val_strata = rna_adata.obs[val_stratify_by].astype(str).to_numpy()
+    val_mask = validation_mask(
+        rna_adata.obs_names,
+        val_fraction,
+        resolve_split_seed(
+            int(run_cfg.get("val_split_seed", 20260825)),
+            run_cfg.get("seed"),
+            bool(run_cfg.get("val_split_per_seed", False)),
+        ),
+        strata=val_strata,
+    )
+    val_idx_t = (
+        to_index_tensor(np.nonzero(val_mask)[0], device) if val_mask.any() else None
+    )
+
+    return (model, R_t, V_eff_t, P_t, S_t, rna_adata.obs, mask_t, align_cols,
+            velocity_backend, val_idx_t)
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +517,7 @@ def evaluate_one_checkpoint(
     mask_t=None,
     align_cols=None,
     velocity_backend=None,
+    val_idx=None,
 ):
     """Load checkpoint into model, recompute diagnostics + per-cell arrays."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -492,13 +527,14 @@ def evaluate_one_checkpoint(
     state_dict = {k: v.to(target_device) for k, v in ckpt["state_dict"].items()}
     model.load_state_dict(state_dict)
 
-    diag_inputs = DiagInputs(R_t, V_eff_t, P_t, S_t, rna_obs, mask_t, align_cols)
+    diag_inputs = DiagInputs(R_t, V_eff_t, P_t, S_t, rna_obs, mask_t, align_cols, val_idx)
     diagnostics = compute_full_diagnostics(model, diag_inputs)
     per_cell = compute_per_cell_diagnostics(model, diag_inputs)
     mean_foscttm = float(np.mean(per_cell["foscttm"]))
 
     if velocity_backend:
         diagnostics.update(velocity_backend)
+    diagnostics.update(validation_metrics(per_cell))
     diagnostics["checkpoint_epoch"]  = int(ckpt["epoch"])
     diagnostics["checkpoint_losses"] = ckpt.get("losses", {})
     diagnostics["mean_foscttm"]      = mean_foscttm
@@ -527,7 +563,7 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
             rna_adata, protein_adata, run_cfg, _ = data_cache[dataset_name]
 
             (model, R_t, V_eff_t, P_t, S_t, rna_obs, mask_t, align_cols,
-             velocity_backend) = build_model_and_tensors(
+             velocity_backend, val_idx_t) = build_model_and_tensors(
                 run_cfg, rna_adata, protein_adata, model_name, device,
             )
 
@@ -553,6 +589,7 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
                         mask_t,
                         align_cols,
                         velocity_backend,
+                        val_idx_t,
                     )
 
                     # Per-checkpoint artifacts
@@ -573,6 +610,8 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
                         "checkpoint":         ckpt_name,
                         "checkpoint_epoch":   diagnostics["checkpoint_epoch"],
                         "mean_foscttm":       diagnostics["mean_foscttm"],
+                        "val_foscttm":        diagnostics["val_foscttm"],
+                        "val_foscttm_in_full_pool": diagnostics["val_foscttm_in_full_pool"],
                         "time_mae":           diagnostics["time_mae"],
                         "time_spearman":      diagnostics["time_spearman"],
                         "traj_dtw_temporal":  diagnostics["traj_dtw_temporal"],

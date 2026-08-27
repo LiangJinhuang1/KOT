@@ -210,6 +210,80 @@ defaults:
   # shorter than n_epochs (run_kot raises otherwise).
   dyn_warmup_epochs: 0
   early_stopping_patience: 100
+  # What early stopping (and the best_align checkpoint) watches.
+  #   train_align — the training alignment loss, the historical behaviour.
+  #   val_align   — the Sinkhorn divergence on the held-out validation cells.
+  # Measured over the 66 runs that carry a run_config.yaml, train_align fired ONCE:
+  # the training align loss is still falling at epoch 500 (best_align sits a median
+  # of 28 epochs before the end), so patience is inert and n_epochs is the real knob.
+  # val_align is the criterion that can actually fire, and it is unsupervised — a
+  # Sinkhorn divergence uses no pairing, only cells the loss never saw.
+  early_stopping_monitor: train_align
+
+  # ---- Validation split (development only) ----
+  # A fixed slice of cells held out of BOTH loss terms and scored with the pairing,
+  # used only to RANK hyperparameter configurations. The test metric (mean_foscttm
+  # over all cells) is untouched and stays the headline number.
+  #
+  # Membership is a hash of the cell barcode (src/data/splits.py), so there is no file
+  # to keep in sync. diagnostics.json records val_split_digest, val_split_seed_resolved
+  # and val_stratify_by, so which cells a run held out is recoverable after the fact.
+  #
+  # 0.0 disables it. Per-dataset values below: 0.2 on the small panels, 0.1 on BMMC
+  # (~90k cells, where 10% is already ~9k validation cells).
+  #
+  # THE FINAL PAPER RUNS TRAIN ON EVERY CELL, like the baselines do:
+  #     --set val_holdout_from_training=false
+  # which returns the val cells to training and marks the val columns in-sample
+  # (val_holdout=false in diagnostics), leaving mean_foscttm exactly as it is today.
+  val_fraction: 0.0
+  val_split_seed: 20260825
+  # ONE FIXED SPLIT FOR EVERY SEED AND EVERY CONFIG (changed 2026-08-26).
+  # With this false, the split is a pure hash of the barcode against val_split_seed
+  # above: "the validation set" is one well-defined set of cells that every run in
+  # every sweep holds out, and "the training set" is its complement. Seed-to-seed
+  # spread is then model-fit variation alone, not split variation, and a train-vs-val
+  # comparison is over the same cells in every run instead of a different slice each
+  # time. val_split_digest in diagnostics.json should be IDENTICAL across all runs of
+  # a dataset -- check it rather than assume it, because with val_stratify_by set a
+  # cell's side depends on which other cells share its stratum, so the split moves if
+  # preprocessing ever drops a different cell set upstream.
+  #
+  # The cost of turning this off, stated plainly: the seed mean is now four (or
+  # twelve) fits of ONE split rather than a mean over that many splits, so a config
+  # can in principle win by suiting this particular held-out set. Nothing detects
+  # that from inside the same dataset -- only a fresh panel does.
+  #
+  # true = mix the run's MODEL seed into the hash, so each seed draws its own split.
+  val_split_per_seed: false
+  # obs column to stratify the split on; null = plain barcode threshold, where each
+  # level's share is binomial and a rare one can round to zero held-out cells. Set
+  # per dataset below: BMMC has cell_type (45 levels, the rarest 18 cells), the PBMC
+  # panels carry no annotation but leiden.
+  val_stratify_by: null
+  val_holdout_from_training: true
+  # Which side of the split a run FITS.
+  #
+  #   true   fit the SMALL side (val_fraction of the cells) -- the tuning set. This is
+  #          what the hyperparameter sweep uses: the pairing is allowed to choose
+  #          hyperparameters here, and the sweep ranks on train_foscttm (FOSCTTM on the
+  #          cells the run actually fitted). The large side is held out and scored as
+  #          val_foscttm by the same run, at no extra cost -- see below.
+  #   false  the original behaviour: fit the LARGE side, hold out val_fraction. This is
+  #          the default and what every non-sweep run in this project uses.
+  #
+  # Training never uses the pairing either way: the Sinkhorn samples RNA and protein
+  # rows independently (kot.py, alignment_step), so the correspondence is only ever an
+  # evaluation signal. That is what lets the sweep rank on the cells it fitted.
+  #
+  # NOTE: a sweep run with true already reports BOTH numbers -- train_foscttm on the
+  # 1121 cells it fitted and val_foscttm on the 4406 it never touched. No separate
+  # deployment run is needed to get an honest held-out score; it falls out of the same
+  # run. Rank on train_foscttm, read val_foscttm as the untouched check.
+  fit_tuning_subset: false
+  # Epoch interval for the held-out Sinkhorn (val_align in training_loss.csv). Forced
+  # to 1 when early_stopping_monitor=val_align, so patience keeps counting in epochs.
+  val_every: 5
   phase1_epochs: 0
   phase2_epochs: 0
   phase3_epochs: 0
@@ -280,6 +354,8 @@ datasets:
   # Runner trains every dataset listed here, so select one with --datasets.
   bmmc_cite:
     modality_pair: rna_protein
+    val_fraction: 0.1          # dev-only holdout for tuning (~90k cells)
+    val_stratify_by: cell_type # 45 levels; the rarest (cDC1) is 18 cells
     kot_use_feature_space: true    # genes → ADT: where S and the ODE are meaningful
     kot_rna_layer: Ms              # RNA state in the SAME space as scVelo velocity
     velocity_layer: velocity       # dMs/dt → consistent with kot_rna_layer
@@ -301,6 +377,7 @@ datasets:
 
   pbmc:
     modality_pair: rna_protein
+    val_fraction: 0.2          # dev-only holdout for tuning (~5k cells)
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
@@ -321,6 +398,7 @@ datasets:
   # is re-checked live against the retained genes.
   pbmc_retained:
     modality_pair: rna_protein
+    val_fraction: 0.2          # dev-only holdout for tuning (~5k cells)
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
@@ -362,6 +440,7 @@ datasets:
   # dataset's rna_path (in datasets.yaml) points at the RegVelo velocity h5ad.
   pbmc_regvelo:
     modality_pair: rna_protein
+    val_fraction: 0.2          # dev-only holdout for tuning (~5k cells)
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
@@ -389,6 +468,8 @@ datasets:
 
   bmmc_cite_retained:
     modality_pair: rna_protein
+    val_fraction: 0.1          # dev-only holdout for tuning (~90k cells)
+    val_stratify_by: cell_type # 45 levels; the rarest (cDC1) is 18 cells
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
@@ -427,6 +508,8 @@ datasets:
   # dataset's rna_path (in datasets.yaml) points at the RegVelo velocity h5ad.
   bmmc_cite_regvelo:
     modality_pair: rna_protein
+    val_fraction: 0.1          # dev-only holdout for tuning (~90k cells)
+    val_stratify_by: cell_type # 45 levels; the rarest (cDC1) is 18 cells
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
@@ -460,6 +543,7 @@ datasets:
   # this panel, but the ADT-target genes are still kinetics-eligible when retained.
   papalexi_retained:
     modality_pair: rna_protein
+    val_fraction: 0.2          # dev-only holdout for tuning (~20k cells)
     preprocessing_cache_version: papalexi_gene_alias_v1
     kot_use_feature_space: true
     kot_rna_layer: Ms
@@ -486,6 +570,7 @@ datasets:
   # dataset's rna_path (datasets.yaml) points at the RegVelo velocity h5ad.
   papalexi_regvelo:
     modality_pair: rna_protein
+    val_fraction: 0.2          # dev-only holdout for tuning (~20k cells)
     preprocessing_cache_version: papalexi_gene_alias_v1
     kot_use_feature_space: true
     kot_rna_layer: Ms

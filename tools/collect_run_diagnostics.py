@@ -24,6 +24,11 @@ sortable column rather than a substring like `lam1000_lkp0p1_kt0p69`. It also po
 sweep that was interrupted and resumed under a second stamp, and writes a small
 <out>_by_config.csv -- one row per cell -- next to the per-seed CSV.
 
+Sweeps are ranked on val_foscttm -- the held-out cells (src/data/splits.py) -- whenever
+the runs have one, because mean_foscttm is measured on the cells the run trained on and
+choosing hyperparameters by it is choosing them on the test set. Both columns are always
+printed; --rank-by overrides which one sorts.
+
 Cells are flagged (degenerate / collapsed / dyn-dead) because none of those failures is
 visible in the FOSCTTM ranking and one of them sorts first. A flagged cell is not a
 result no matter where it ranks.
@@ -44,10 +49,18 @@ import yaml
 
 # Sweep axes worth carrying next to the metrics. --hparams adds more.
 DEFAULT_HPARAMS = [
+    # fit_tuning_subset, with train_on_val_side as its deprecated alias. Both are
+    # collected so a table spanning runs from before and after the rename does not
+    # split one config across two columns; normalise_fit_flag() folds them together.
+    "fit_tuning_subset", "train_on_val_side",
     "lambda_dyn", "lambda_prior", "lambda_kappa_prior", "lambda_reg",
     "kot_kappa_prior", "kot_kappa_min", "kot_kappa_max",
     "kot_alpha_min", "kot_alpha_max",
-    "n_epochs", "early_stopping_patience", "lr", "batch_size",
+    "n_epochs", "early_stopping_patience", "early_stopping_monitor",
+    "lr", "lr_phi", "lr_alpha_kappa", "lr_beta",
+    "lr_warmup_epochs", "lr_warmup_start_factor", "lr_min_factor", "batch_size",
+    "val_fraction", "val_holdout_from_training", "val_split_seed",
+    "val_split_per_seed", "val_stratify_by",
     "sinkhorn_reg", "sinkhorn_max_points", "sinkhorn_backend",
     "dyn_warmup_epochs", "g_freeze_epochs",
     "phase1_epochs", "phase2_epochs", "phase3_epochs", "phase3_lr_scale",
@@ -57,13 +70,22 @@ DEFAULT_HPARAMS = [
 
 # Curated metrics. --all-diagnostics emits every scalar in the json instead.
 DEFAULT_METRICS = [
-    "mean_foscttm", "runtime_seconds",
+    # val_foscttm is the SELECTION metric: mean_foscttm is scored on cells the run
+    # trained on, so ranking configs by it is ranking them on the test set. The two
+    # sit side by side so a config that wins on one and not the other is visible.
+    "mean_foscttm", "val_foscttm", "val_foscttm_in_full_pool", "val_n_cells",
+    # train_foscttm is the SELECTION metric under the two-dataset protocol: when a run
+    # fits the small tuning set (train_on_val_side), this is the score on exactly the
+    # cells it fitted, and the large deployment side must stay out of selection.
+    "train_foscttm", "train_n_cells",
+    "val_holdout", "val_split_digest", "runtime_seconds",
     "jvp_rhs_cos_median", "jvp_rhs_cos_mean", "rel_residual_median",
     "time_spearman", "time_mae", "traj_dtw_temporal",
     "kappa_median", "alpha_median", "beta_mean", "beta_anchor_mean_abs_err",
     "phi_variance_ratio", "norm_ratio_median", "v_eff_norm_median",
     "velocity_backend_cos_median",
-    "best_align", "best_align_epoch", "best_dyn", "best_dyn_epoch",
+    "best_align", "best_align_epoch", "best_val_align", "best_val_align_epoch",
+    "best_dyn", "best_dyn_epoch",
     "best_total", "best_total_epoch", "stop_epoch",
     # Pre-clip gradient norm. It sits ~100-6000x above the fixed 1.0 budget, so the
     # clip binds on every step and acts as a renormalizer rather than a spike guard.
@@ -74,11 +96,17 @@ DEFAULT_METRICS = [
     "grad_mag_ratio_late", "grad_cos_late",
 ]
 
-CHECKPOINTS = ["training", "final", "best_align", "best_dyn", "best_total"]
+CHECKPOINTS = ["training", "final", "best_align", "best_val_align", "best_dyn", "best_total"]
 
 # Metrics carried into the per-config table as mean ± sd over every seed in the cell.
 AGGREGATE_METRICS = [
-    "mean_foscttm", "jvp_rhs_cos_median", "rel_residual_median", "time_spearman",
+    "mean_foscttm", "val_foscttm", "val_foscttm_in_full_pool",
+    # The median, not the mean: the per-cell cosine is left-skewed by a tail of
+    # near-zero-velocity cells, which drags a mean down without saying anything about
+    # how well a typical cell fits.
+    "jvp_rhs_cos_median",
+    "rel_residual_median", "time_spearman",
+    "train_foscttm", "train_n_cells", "val_n_cells",
     "phi_variance_ratio", "kappa_median", "alpha_median", "beta_mean",
     # beta_anchor_mean_abs_err is the identifiability claim itself -- how far the
     # learned beta lands from its anchor target. It moves independently of FOSCTTM,
@@ -236,7 +264,7 @@ def cell_flag(record: dict, dyn_cos_min: float) -> str:
 
 
 def aggregate_rows(rows: list[dict], checkpoint: str, key_columns: list[str],
-                   dyn_cos_min: float) -> list[dict]:
+                   dyn_cos_min: float, rank_by: str) -> list[dict]:
     """One record per key_columns group: mean ± sd over every seed it contains.
 
     key_columns is (run, model, dataset) by default. Passing hyperparameter names
@@ -267,17 +295,48 @@ def aggregate_rows(rows: list[dict], checkpoint: str, key_columns: list[str],
         record["flag"] = cell_flag(record, dyn_cos_min)
         records.append(record)
 
-    records.sort(key=lambda r: (float("inf") if r["mean_foscttm_mean"] is None
-                                else r["mean_foscttm_mean"]))
+    records.sort(key=lambda r: (float("inf") if r[f"{rank_by}_mean"] is None
+                                else r[f"{rank_by}_mean"]))
     return records
 
 
 # Metrics the paired table differences, and whether lower is better. FOSCTTM is the
 # decision metric; the other two are the tie-breaks that say whether a FOSCTTM win was
 # bought by letting the dynamics term go slack.
-PAIRED_METRICS = [("mean_foscttm", True), ("jvp_rhs_cos_median", False),
+PAIRED_METRICS = [("val_foscttm", True), ("mean_foscttm", True),
+                  ("jvp_rhs_cos_median", False),
                   ("time_spearman", False), ("phi_variance_ratio", False),
                   ("grad_cos_late", False)]
+
+# The two metrics a sweep may be ranked on. During a search it is val_foscttm (held-out
+# cells, chosen for exactly this); mean_foscttm is the reported number and ranking on it
+# is what the validation split exists to avoid.
+# train_foscttm is FOSCTTM on the cells the run FITTED. Under the two-dataset protocol
+# (train_on_val_side) the sweep fits the small tuning set and must rank on exactly that,
+# because the large deployment set is what the frozen config is later judged on and must
+# stay untouched by selection.
+RANK_METRICS = ["val_foscttm", "mean_foscttm", "train_foscttm"]
+
+
+def is_true(value) -> bool:
+    """A config flag read back from YAML/CSV, where True may arrive as the string."""
+    return str(value).strip().lower() == "true"
+
+
+def normalise_fit_flag(row: dict) -> None:
+    """Fold the deprecated train_on_val_side into fit_tuning_subset, in place.
+
+    Runs launched before the 2026-08-26 rename recorded only the old key. Without this
+    a --group-by on fit_tuning_subset would read None for them and silently pool the
+    tuning-subset runs together with the full-side ones -- the exact collision that
+    makes a sweep table wrong rather than merely incomplete.
+    """
+    renamed = row.get("fit_tuning_subset")
+    deprecated = row.get("train_on_val_side")
+    if is_true(renamed) or is_true(deprecated):
+        row["fit_tuning_subset"] = "True"
+    elif renamed in (None, "") and deprecated not in (None, ""):
+        row["fit_tuning_subset"] = str(deprecated)
 
 
 def cell_key(row: dict, columns: list[str]) -> tuple:
@@ -299,7 +358,7 @@ def parse_baseline(spec: str) -> dict[str, str]:
 
 
 def paired_deltas(rows: list[dict], checkpoint: str, group_by: list[str],
-                  baseline: dict[str, str]) -> list[dict]:
+                  baseline: dict[str, str], rank_by: str) -> list[dict]:
     """One record per (dataset, config cell): its per-seed change against the baseline.
 
     Paired, not pooled. Seeds are the dominant variance component in these sweeps --
@@ -369,20 +428,52 @@ def paired_deltas(rows: list[dict], checkpoint: str, group_by: list[str],
             records.append(record)
 
     records.sort(key=lambda r: (r["dataset"], 0 if r["is_baseline"] else 1,
-                                float("inf") if r["mean_foscttm_delta_mean"] is None
-                                else r["mean_foscttm_delta_mean"]))
+                                float("inf") if r[f"{rank_by}_delta_mean"] is None
+                                else r[f"{rank_by}_delta_mean"]))
     return records
 
 
-def print_paired(records: list[dict], group_by: list[str]) -> None:
-    """One block per dataset, ranked by mean paired FOSCTTM delta (negative = better)."""
+# Column header per FOSCTTM, naming WHICH CELLS it averages over. Ranking on
+# train_foscttm used to print "TEST", which is both wrong and the exact confusion
+# these short names exist to prevent.
+RANK_LABELS = {
+    "val_foscttm":   "VAL",     # cells held out of this run's loss
+    "train_foscttm": "TRAIN",   # cells this run fitted
+    "mean_foscttm":  "TEST",    # every cell, most of them fitted -- a misnomer kept
+}                               # because it is what the tables have always said
+
+
+def rank_label(metric: str) -> str:
+    """Short header for a FOSCTTM column."""
+    return RANK_LABELS[metric]
+
+
+def other_rank_metric(rank_by: str) -> str:
+    """The FOSCTTM the table is NOT ranked on, shown next to the one it is.
+
+    Ranking on train_foscttm pairs it with val_foscttm rather than mean_foscttm: under
+    the two-dataset protocol those are the fitted and held-out sides of one split, which
+    is the comparison worth seeing.
+    """
+    return "mean_foscttm" if rank_by == "val_foscttm" else "val_foscttm"
+
+
+def rank_metric_label(metric: str) -> str:
+    return "d" + rank_label(metric)
+
+
+def print_paired(records: list[dict], group_by: list[str], rank_by: str) -> None:
+    """One block per dataset, ranked by the paired delta on `rank_by` (negative = better)."""
+    other = other_rank_metric(rank_by)
     columns = ["dataset"] + group_by
     widths = {
         col: max(len(col), max(len(format_cell(r.get(col))) for r in records)) + 2
         for col in columns
     }
     header = ("".join(f"{col:{widths[col]}}" for col in columns)
-              + f"{'dFOSCTTM':>20}{'win':>7}{'dcos':>9}{'dtSpear':>9}{'dφvar':>9}{'dgcos':>9}")
+              + f"{rank_metric_label(rank_by):>20}{'win':>7}"
+              + f"{rank_metric_label(other):>9}"
+              + f"{'dcos':>9}{'dtSpear':>9}{'dφvar':>9}{'dgcos':>9}")
     current = None
     for position, record in enumerate(records):
         if record["dataset"] != current:
@@ -392,16 +483,19 @@ def print_paired(records: list[dict], group_by: list[str]) -> None:
         if record["is_baseline"]:
             print(cells + f"{'(baseline)':>20}")
             continue
-        mean, sd = record["mean_foscttm_delta_mean"], record["mean_foscttm_delta_sd"]
+        mean, sd = record[f"{rank_by}_delta_mean"], record[f"{rank_by}_delta_sd"]
         delta = f"{mean:+.4f} ± {sd:.4f}" if mean is not None else "-"
-        win = f"{record['mean_foscttm_delta_win']}/{record['mean_foscttm_delta_n']}"
+        win = f"{record[f'{rank_by}_delta_win']}/{record[f'{rank_by}_delta_n']}"
         print(cells + f"{delta:>20}{win:>7}"
+              + f"{format_delta(record[f'{other}_delta_mean']):>9}"
               + f"{format_delta(record['jvp_rhs_cos_median_delta_mean']):>9}"
               + f"{format_delta(record['time_spearman_delta_mean']):>9}"
               + f"{format_delta(record['phi_variance_ratio_delta_mean']):>9}"
               + f"{format_delta(record['grad_cos_late_delta_mean']):>9}")
-    print("\ndFOSCTTM is the per-seed change vs the baseline cell, negative = better; "
-          "`win` counts seeds that improved.\nCheck the mechanism before believing a "
+    print(f"\n{rank_metric_label(rank_by)} is the per-seed change vs the baseline cell "
+          f"on {rank_by}, negative = better;\n`win` counts seeds that improved, and "
+          f"{rank_metric_label(other)} is the same delta on {other}, shown but not "
+          f"ranked on.\nCheck the mechanism before believing a "
           "win: dcos sharply negative = bought alignment by dropping the dynamics; "
           "dφvar\nsharply negative = phi is shrinking rather than the ODE being "
           "satisfied; dgcos negative = the two terms\nare fighting, so the gain came "
@@ -427,7 +521,7 @@ def format_delta(value) -> str:
     return "-" if value is None else f"{value:+.3f}"
 
 
-def print_aggregate(records: list[dict], key_columns: list[str]) -> None:
+def print_aggregate(records: list[dict], key_columns: list[str], rank_by: str) -> None:
     """Ranked table, one row per config cell. Column widths follow the content.
 
     Widths are computed rather than fixed: a sweep's run dirs share a long
@@ -439,14 +533,19 @@ def print_aggregate(records: list[dict], key_columns: list[str]) -> None:
         col: max(len(col), max(len(format_cell(r.get(col))) for r in records)) + 2
         for col in key_columns
     }
+    other = other_rank_metric(rank_by)
+    ranked_label = rank_label(rank_by)
     print("".join(f"{col:{widths[col]}}" for col in key_columns)
-          + f"{'FOSCTTM':>18}{'n':>4}{'bad':>5}{'cos':>8}{'relres':>8}{'tSpear':>8}"
+          + f"{ranked_label:>18}{'n':>4}{'bad':>5}"
+          + f"{rank_label(other):>8}"
+          + f"{'cos':>8}{'relres':>8}{'tSpear':>8}"
             f"{'βerr':>8}{'φvar':>8}{'gratio':>8}{'gcos':>8}  flag")
     for record in records:
-        mean, sd = record["mean_foscttm_mean"], record["mean_foscttm_sd"]
+        mean, sd = record[f"{rank_by}_mean"], record[f"{rank_by}_sd"]
         score = f"{mean:.4f} ± {sd:.4f}" if mean is not None else "CRASHED"
         print("".join(f"{format_cell(record.get(col)):{widths[col]}}" for col in key_columns)
               + f"{score:>18}{record['n']:>4}{record['bad']:>5}"
+              + f"{format_metric(record[f'{other}_mean']):>8}"
               + f"{format_metric(record['jvp_rhs_cos_median_mean']):>8}"
               + f"{format_metric(record['rel_residual_median_mean']):>8}"
               + f"{format_metric(record['time_spearman_mean']):>8}"
@@ -491,6 +590,13 @@ def main() -> int:
                              "dFOSCTTM vs that cell within each dataset instead of "
                              "ranking cells by mean±sd, and writes <out>_paired.csv. "
                              "Requires --group-by.")
+    parser.add_argument("--rank-by", default="auto", choices=["auto"] + RANK_METRICS,
+                        help="Which FOSCTTM ranks the tables. auto (default) picks "
+                             "val_foscttm when the runs have a validation split and "
+                             "mean_foscttm when they do not. Both are always printed; "
+                             "this only chooses the sort key and the paired baseline "
+                             "column. Rank a SEARCH on val_foscttm: mean_foscttm is "
+                             "measured on cells the runs trained on.")
     parser.add_argument("--dyn-cos-min", type=float, default=DYN_COS_MIN,
                         help=f"Flag a cell dyn-dead below this JVP·RHS cosine "
                              f"(default {DYN_COS_MIN}).")
@@ -510,6 +616,9 @@ def main() -> int:
     key_columns = ["model", "dataset"] + group_by if group_by else ["run", "model", "dataset"]
 
     rows, metric_keys = collect(run_globs, checkpoints, hparams, args.all_diagnostics)
+    # Fold the pre-rename flag before anything groups or ranks on it.
+    for row in rows:
+        normalise_fit_flag(row)
     if not rows:
         print(f"No runs matched: {run_globs}", file=sys.stderr)
         return 1
@@ -534,9 +643,25 @@ def main() -> int:
         if len(bad) > 20:
             print(f"  ... and {len(bad) - 20} more", file=sys.stderr)
 
+    rank_by = args.rank_by
+    if rank_by == "auto":
+        has_val = any(isinstance(r.get("val_foscttm"), (int, float)) for r in rows)
+        rank_by = "val_foscttm" if has_val else "mean_foscttm"
+    elif rank_by == "val_foscttm" and not any(
+        isinstance(r.get("val_foscttm"), (int, float)) for r in rows
+    ):
+        print("WARNING: --rank-by val_foscttm, but no run reported one — these runs "
+              "predate the validation split or ran with val_fraction=0.", file=sys.stderr)
+    in_sample = [r for r in rows if r.get("val_holdout") is False
+                 and isinstance(r.get("val_foscttm"), (int, float))]
+    if rank_by == "val_foscttm" and in_sample:
+        print(f"WARNING: {len(in_sample)} row(s) have val_holdout=false — their "
+              f"validation cells were trained on, so val_foscttm is in-sample there "
+              f"and not a selection metric.", file=sys.stderr)
+
     if args.aggregate or group_by:
         checkpoint = args.checkpoint if not args.all_checkpoints else "training"
-        records = aggregate_rows(rows, checkpoint, key_columns, args.dyn_cos_min)
+        records = aggregate_rows(rows, checkpoint, key_columns, args.dyn_cos_min, rank_by)
         if group_by:
             by_config = args.out.with_name(f"{args.out.stem}_by_config{args.out.suffix}")
             columns = (key_columns + ["n", "bad", "n_runs", "flag"]
@@ -547,7 +672,8 @@ def main() -> int:
                 writer.writerows(records)
             print(f"Wrote {by_config}: {len(records)} config cells")
         print()
-        print_aggregate(records, key_columns)
+        print(f"Ranked on {rank_by}.")
+        print_aggregate(records, key_columns, rank_by)
         flagged = [r for r in records if r["flag"]]
         if flagged:
             print(f"\n{len(flagged)} of {len(records)} cells flagged — see cell_flag(). "
@@ -558,7 +684,8 @@ def main() -> int:
             print("--paired-vs requires --group-by", file=sys.stderr)
             return 1
         checkpoint = args.checkpoint if not args.all_checkpoints else "training"
-        paired = paired_deltas(rows, checkpoint, group_by, parse_baseline(args.paired_vs))
+        paired = paired_deltas(rows, checkpoint, group_by,
+                               parse_baseline(args.paired_vs), rank_by)
         paired_out = args.out.with_name(f"{args.out.stem}_paired{args.out.suffix}")
         columns = (["model", "dataset"] + group_by + ["is_baseline"]
                    + [f"{m}_delta_{stat}" for m, _ in PAIRED_METRICS
@@ -569,7 +696,8 @@ def main() -> int:
             writer.writerows(paired)
         print(f"\nWrote {paired_out}: {len(paired)} config cells")
         print()
-        print_paired(paired, group_by)
+        print(f"Ranked on {rank_by}.")
+        print_paired(paired, group_by, rank_by)
     return 0
 
 

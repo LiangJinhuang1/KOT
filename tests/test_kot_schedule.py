@@ -1,6 +1,13 @@
 import unittest
 
-from src.training.kot import dyn_weight_factor, lr_schedule_factor
+import torch
+
+from src.training.kot import (
+    dyn_weight_factor,
+    lr_schedule_factor,
+    shuffled_batches,
+    subsample_rows,
+)
 
 
 class DynWeightFactorTests(unittest.TestCase):
@@ -42,6 +49,46 @@ class LrScheduleFactorTests(unittest.TestCase):
         self.assertAlmostEqual(lr_schedule_factor(5, 10, 500, 0.1, 0.01), 0.55)
         self.assertAlmostEqual(lr_schedule_factor(10, 10, 500, 0.1, 0.01), 1.0)
         self.assertAlmostEqual(lr_schedule_factor(500, 10, 500, 0.1, 0.01), 0.01)
+
+
+class TrainingRowTests(unittest.TestCase):
+    """Held-out cells must not reach either loss term.
+
+    Both losses draw their cells through these two helpers, so a validation cell
+    entering training would have to come through one of them -- which is what makes
+    these two tests the actual guarantee behind the split.
+    """
+
+    def setUp(self):
+        self.device = torch.device("cpu")
+        self.n = 1000
+        self.val_idx = torch.arange(0, self.n, 10)                    # every 10th cell
+        keep = torch.ones(self.n, dtype=torch.bool)
+        keep[self.val_idx] = False
+        self.train_idx = torch.nonzero(keep, as_tuple=False).flatten()
+
+    def test_batches_cover_every_training_cell_exactly_once(self):
+        batches = shuffled_batches(self.train_idx.numel(), 128, self.device, self.train_idx)
+        seen = torch.cat(batches)
+        self.assertEqual(seen.numel(), self.train_idx.numel())
+        torch.testing.assert_close(torch.sort(seen).values, self.train_idx)
+
+    def test_batches_and_subsamples_never_contain_a_held_out_cell(self):
+        val = set(self.val_idx.tolist())
+        for batch in shuffled_batches(self.train_idx.numel(), 128, self.device, self.train_idx):
+            self.assertFalse(val & set(batch.tolist()))
+        for _ in range(20):
+            picks = subsample_rows(self.train_idx.numel(), 64, self.device, self.train_idx)
+            self.assertEqual(picks.numel(), 64)
+            self.assertFalse(val & set(picks.tolist()))
+
+    def test_no_split_means_every_cell(self):
+        # train_idx=None is the no-holdout path, and it must be the identity on rows:
+        # the full-batch alignment step relies on it to skip gathering (n, D_r).
+        batches = shuffled_batches(self.n, 128, self.device, None)
+        torch.testing.assert_close(
+            torch.sort(torch.cat(batches)).values, torch.arange(self.n)
+        )
 
 
 if __name__ == "__main__":

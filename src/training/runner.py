@@ -16,6 +16,7 @@ from src.utils.io import load_yaml, save_yaml
 from src.utils.arrays import matrix_from_adata
 from src.data.preprocessing import load_and_preprocess_cached
 from src.data.synthetic_linked_ode import stage_output_paths
+from src.data.splits import fitted_row_indices
 from src.evaluation.foscttm import evaluate_and_save, calc_domainAveraged_FOSCTTM
 from src.visualization.alignment import (
     coembedding_plot_kwargs,
@@ -306,16 +307,24 @@ SUMMARY_CONFIG_KEYS = [
     "lambda_dyn", "lambda_prior", "lambda_kappa_prior", "kot_kappa_prior",
     "lr", "lr_phi", "lr_alpha_kappa", "lr_beta",
     "lr_warmup_epochs", "lr_warmup_start_factor", "lr_min_factor",
-    "n_epochs", "early_stopping_patience", "batch_size", "sinkhorn_reg",
+    "n_epochs", "early_stopping_patience", "early_stopping_monitor",
+    "batch_size", "sinkhorn_reg",
     "dyn_warmup_epochs", "g_freeze_epochs",
     "kot_velocity_gauge_normalize", "use_anchor",
+    "val_fraction", "val_holdout_from_training",
+    "val_split_per_seed", "val_stratify_by", "fit_tuning_subset",
 ]
 SUMMARY_METRIC_KEYS = [
-    "mean_foscttm", "runtime_seconds",
+    # val_foscttm is the held-out number a search is chosen on; mean_foscttm is the
+    # reported one, measured on cells the run trained on. Both, always, side by side.
+    "mean_foscttm", "val_foscttm", "val_foscttm_in_full_pool", "val_holdout",
+    "train_foscttm", "train_n_cells", "val_n_cells",
+    "runtime_seconds",
     "jvp_rhs_cos_median", "rel_residual_median", "time_spearman", "time_mae",
     "phi_variance_ratio", "kappa_median", "alpha_median", "beta_mean",
     "grad_norm_median",
-    "best_align", "best_align_epoch", "best_total", "stop_epoch",
+    "best_align", "best_align_epoch", "best_val_align", "best_val_align_epoch",
+    "best_total", "stop_epoch",
 ]
 
 
@@ -656,10 +665,26 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
         diagnostics["seed"] = int(run_seed)
 
     result_name = f"{name}_{run_label}" if run_label is not None else name
+
+    # The benchmark FOSCTTM is scored on the cells this run FITTED, matching what the
+    # KOT diagnostics report. Without this, diagnostics.json and comparison_*.csv carry
+    # two different mean_foscttm values for the same run -- one over the fitted subset,
+    # one over every cell -- and the second silently uses held-out proteins as
+    # distractors for fitted cells. Applied here rather than inside a model so every
+    # model, KOT and baselines alike, is scored on the same cells.
+    eval_rows = fitted_row_indices(rna_adata.obs, run_cfg, run_seed)
+    eval_obs_names = rna_adata.obs_names
+    if eval_rows is not None:
+        aligned = [np.asarray(part)[eval_rows] for part in aligned]
+        eval_obs_names = rna_adata.obs_names[eval_rows]
+        if batch_foscttm is not None:
+            batch_foscttm = np.asarray(batch_foscttm)[eval_rows]
+        print(f"[{result_name}] benchmark FOSCTTM on the {len(eval_rows)} fitted cells")
+
     mean_foscttm = evaluate_and_save(
         aligned, result_name, output_dir, second_label,
         model_name=model_name,
-        obs_names=rna_adata.obs_names,
+        obs_names=eval_obs_names,
         foscttm_scores=batch_foscttm,
         save_prediction=bool(run_cfg.get("save_prediction_h5ad", True)),
     )

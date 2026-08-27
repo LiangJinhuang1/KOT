@@ -19,6 +19,9 @@
 #SBATCH --time=07:00:00
 #SBATCH --job-name=scot_synthetic
 #SBATCH --requeue
+# Requeued attempts reopen these files; without append, each retry TRUNCATES the
+# log and the record of how many times CUDA failed, and when, is destroyed.
+#SBATCH --open-mode=append
 #SBATCH --output=logs/slurm%j.log
 #SBATCH --error=logs/slurm%j.err
 
@@ -38,6 +41,11 @@ echo "CPUs per task: ${SLURM_CPUS_PER_TASK:-1}"
 
 CUDA_PREFLIGHT_REQUEUE="${CUDA_PREFLIGHT_REQUEUE:-1}"
 CUDA_PREFLIGHT_MAX_REQUEUES="${CUDA_PREFLIGHT_MAX_REQUEUES:-12}"
+# Seconds to hold a requeued job before it may start again. Error 802 (fabric manager
+# down) does not clear in the seconds an immediate requeue takes, so an undelayed loop
+# spends all 12 attempts inside a few minutes and gives up while the fault is still
+# being fixed. Spacing them turns the same 12 into ~2 hours of coverage. 0 = immediate.
+CUDA_REQUEUE_DELAY_SEC="${CUDA_REQUEUE_DELAY_SEC:-600}"
 echo "CUDA preflight requeue: ${CUDA_PREFLIGHT_REQUEUE} (max ${CUDA_PREFLIGHT_MAX_REQUEUES}, current restart ${SLURM_RESTART_COUNT:-0})"
 
 # Preserve Slurm's GPU mask inside real allocations. Clearing it here can make
@@ -101,67 +109,9 @@ echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}" >&2
 nvidia-smi -L >&2 || true
 python -c "import os; print(\"python:\", os.sys.executable); print(\"cwd:\", os.getcwd())" >&2
 if [ "${SKIP_CUDA_PREFLIGHT:-0}" != "1" ]; then
-python - <<'"'"'PY'"'"' >&2
-import os
-import re
-import subprocess
-import sys
-import torch
-
-print("torch:", torch.__version__, "cuda build:", torch.version.cuda)
-print("cuda env:", os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"))
-try:
-    smi = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=name,compute_cap,memory.total,driver_version",
-            "--format=csv,noheader",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    gpu_info = smi.stdout.strip() or smi.stderr.strip()
-    print("nvidia-smi query:", gpu_info or "<empty>")
-except Exception as exc:
-    gpu_info = ""
-    print("nvidia-smi query failed:", repr(exc))
-
-def parse_cuda_version(version):
-    if not version:
-        return ()
-    match = re.match(r"^(\d+)\.(\d+)", str(version))
-    return tuple(map(int, match.groups())) if match else ()
-
-if "B200" in gpu_info and parse_cuda_version(torch.version.cuda) < (12, 8):
-    print(
-        "ERROR: B200/Blackwell requires a CUDA 12.8+ PyTorch runtime; "
-        f"this container has torch.version.cuda={torch.version.cuda!r}. "
-        "Use a newer CUDA 12.8+ / PyTorch container.",
-        file=sys.stderr,
-    )
-    sys.exit(42)
-
-try:
-    cuda_available = torch.cuda.is_available()
-    device_count = torch.cuda.device_count()
-    print("cuda available:", cuda_available)
-    print("cuda device_count:", device_count)
-    if not cuda_available or device_count < 1:
-        print(
-            "ERROR: GPU was requested but PyTorch cannot initialize CUDA. "
-            "Requeue for another B200 allocation, fix the B200 node, or set "
-            "SKIP_CUDA_PREFLIGHT=1 only for CPU-only jobs.",
-            file=sys.stderr,
-        )
-        sys.exit(44)
-    torch.empty(1, device="cuda")
-    print("cuda smoke allocation: ok")
-except Exception as exc:
-    print("CUDA preflight failed:", repr(exc))
-    print("ERROR: refusing to start RUN_CMD with broken CUDA.", file=sys.stderr)
-    sys.exit(45)
-PY
+  # Shared with slurm/parallel_train.sh: one definition of "is this allocation
+  # usable", one set of exit codes for the requeue branch below.
+  python slurm/cuda_preflight.py >&2 || exit $?
 else
 echo "Skipping CUDA preflight because SKIP_CUDA_PREFLIGHT=1" >&2
 fi
@@ -182,6 +132,10 @@ if [ "${run_status}" -ne 0 ]; then
       if [ "${restart_count}" -lt "${CUDA_PREFLIGHT_MAX_REQUEUES}" ]; then
         echo "CUDA preflight failed on $(hostname); requeueing job ${SLURM_JOB_ID} (${restart_count}/${CUDA_PREFLIGHT_MAX_REQUEUES})." >&2
         scontrol requeue "${SLURM_JOB_ID}"
+        if [ "${CUDA_REQUEUE_DELAY_SEC}" -gt 0 ]; then
+          scontrol update JobId="${SLURM_JOB_ID}" StartTime=now+"${CUDA_REQUEUE_DELAY_SEC}" || true
+          echo "Held until now+${CUDA_REQUEUE_DELAY_SEC}s so the node has time to recover." >&2
+        fi
         exit 0
       fi
       echo "CUDA preflight still failed after ${restart_count} restarts; giving up." >&2

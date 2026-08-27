@@ -394,43 +394,58 @@ def settling_epoch(epochs: np.ndarray, values: np.ndarray,
 
 
 def plot_training_loss(loss_csv, save_dir, model_name):
-    """Both objectives on one log-scaled panel, direct-labelled.
+    """The objectives on one log-scaled panel, direct-labelled.
 
     Log y because the losses fall by two orders of magnitude in the first ~40
     epochs and then flatten; on a linear axis most of the range and most of the
     epochs carry no visible information (§3.2).
+
+    The held-out Sinkhorn is drawn next to the training one whenever the run had a
+    validation split: the two are the same estimator on different cells, so the gap
+    between the curves is the thing to look at, and it only reads as a gap when both
+    are on the same axes. It is measured every val_every epochs, hence the gaps.
     """
     apply_style()
     save_dir = Path(save_dir)
     df = pd.read_csv(loss_csv)
 
+    # The held-out Sinkhorn shares the training one's colour and differs by dash: it is
+    # the same quantity on different cells, so hue would encode a difference that is not
+    # there, while the dash reads as "same measurement, held-out cells".
     series = [
-        ("Sinkhorn alignment", "align", MODALITY_COLORS["RNA"]),
-        ("Kinetics ODE", "dyn", MODALITY_COLORS["Protein"]),
+        ("Sinkhorn alignment", "align", MODALITY_COLORS["RNA"], "-"),
+        ("Sinkhorn (held-out)", "val_align", MODALITY_COLORS["RNA"], "--"),
+        ("Kinetics ODE", "dyn", MODALITY_COLORS["Protein"], "-"),
     ]
-    series = [(lbl, col, c) for lbl, col, c in series if col in df.columns]
+    # An all-NaN column is a run without that series (no validation split), not a
+    # series to draw an empty line for.
+    series = [(lbl, col, c, ls) for lbl, col, c, ls in series
+              if col in df.columns and np.isfinite(df[col].to_numpy(dtype=float)).any()]
 
     fig, ax = plt.subplots(figsize=figsize("half", 2.0))
-    x_max = float(df["epoch"].max())
     settle_epochs = []
-    for label, col, color in series:
+    for label, col, color, linestyle in series:
         vals = df[col].to_numpy(dtype=float)
         positive = vals[vals > 0]
         floor = float(positive.min()) * 0.5 if len(positive) else 1e-12
         safe = np.clip(vals, floor, None)
-        ax.plot(df["epoch"], safe, color=ink(color), lw=1.1)
-        # Direct end-of-line labels in preference to a legend box (§6.3).
-        ax.annotate(label, xy=(x_max, safe[-1]),
+        ax.plot(df["epoch"], safe, color=ink(color), lw=1.1, ls=linestyle)
+        # Direct end-of-line labels in preference to a legend box (§6.3). The label sits
+        # at the last MEASURED point: val_align is NaN on the epochs between checks, and
+        # the final epoch can be one of them when early stopping cuts the run short.
+        finite = np.flatnonzero(np.isfinite(safe))
+        last = finite[-1]
+        ax.annotate(label, xy=(float(df["epoch"].to_numpy()[last]), safe[last]),
                     xytext=(3, 0), textcoords="offset points",
                     fontsize=6, color=ink(color), va="center", ha="left")
-        settle_epochs.append(settling_epoch(df["epoch"].to_numpy(), safe))
+        settle_epochs.append(settling_epoch(df["epoch"].to_numpy()[finite], safe[finite]))
 
     ax.set_yscale("log")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     settled = [e for e in settle_epochs if e is not None]
     if settled:
-        ax.set_title(f"Both objectives settle by epoch {max(settled):g}")
+        ax.set_title(f"Objectives settle by epoch {max(settled):g}")
     else:
         ax.set_title("Training objectives")
     ax.set_xlim(left=0)

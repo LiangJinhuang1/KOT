@@ -23,6 +23,13 @@ set -euo pipefail
 STAMP="@STAMP@"   # resolved by parallel_train.sh at run time
 ROOT="cache/training"
 OUT="jobs.txt"
+# These are the REPORTED runs, so they train on every cell, exactly like the baselines
+# do. The validation slice (config/training.yaml val_fraction) exists to choose
+# hyperparameters -- slurm/make_sweep_jobs.sh holds it out -- and once they are chosen
+# there is nothing left to hold it out for. val_foscttm is still written for these runs
+# and is marked in-sample by val_holdout=false, so it can never be mistaken for a
+# held-out number.
+FULL_DATA="--set val_holdout_from_training=false"
 # `kot` is the model GROUP: kot + kot_noanchor + kot_nodyn.
 MODELS="kot"
 REAL_LAMBDAS=(1 2)
@@ -49,6 +56,10 @@ lam_tag() { printf "lam%03d" "$1"; }
   echo "# headline arm alone (3x faster, but the ablation panels stay blocked)."
   echo "#"
   echo "# @STAMP@ is replaced by parallel_train.sh with the sweep start time."
+  echo "#"
+  echo "# Real-data lines carry ${FULL_DATA}: these are the reported runs and"
+  echo "# train on every cell. The dev-only validation holdout belongs to the search"
+  echo "# (slurm/make_sweep_jobs.sh), not here."
   echo "# Inspect afterwards:  ls -d ${ROOT}/run_<stamp>_*   (stamp is printed in the slurm log)"
   echo
   echo "# ============================ real CITE-seq ============================"
@@ -56,8 +67,8 @@ lam_tag() { printf "lam%03d" "$1"; }
   for pair in "bmmc:bmmc_cite_retained:bmmc_cite_regvelo" "pbmc:pbmc_retained:pbmc_regvelo"; do
     IFS=: read -r tissue scvelo regvelo <<< "${pair}"
     for lam in "${REAL_LAMBDAS[@]}"; do
-      echo "--datasets ${scvelo} --models ${MODELS} --set lambda_dyn=${lam} --run-dir ${ROOT}/run_${STAMP}_${tissue}_scvelo_$(lam_tag "${lam}")"
-      echo "--datasets ${regvelo} --models ${MODELS} --set lambda_dyn=${lam} --run-dir ${ROOT}/run_${STAMP}_${tissue}_regvelo_$(lam_tag "${lam}")"
+      echo "--datasets ${scvelo} --models ${MODELS} ${FULL_DATA} --set lambda_dyn=${lam} --run-dir ${ROOT}/run_${STAMP}_${tissue}_scvelo_$(lam_tag "${lam}")"
+      echo "--datasets ${regvelo} --models ${MODELS} ${FULL_DATA} --set lambda_dyn=${lam} --run-dir ${ROOT}/run_${STAMP}_${tissue}_regvelo_$(lam_tag "${lam}")"
     done
   done
   echo

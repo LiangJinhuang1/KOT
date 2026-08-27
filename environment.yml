@@ -1,0 +1,31 @@
+name: kot
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - pyyaml
+  - anndata
+  - scanpy
+  - scvelo
+  - pytorch
+  - pytorch-cuda=12.8
+  - umap-learn
+  - networkx
+  - pip
+  - pip:
+      - geomloss
+      - pykeops
+      - moscot
+      - scglue
+      - scvi-tools
+      - decoupler
+      - regvelo
+      - pysam
