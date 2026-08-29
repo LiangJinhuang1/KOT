@@ -29,6 +29,11 @@ the runs have one, because mean_foscttm is measured on the cells the run trained
 choosing hyperparameters by it is choosing them on the test set. Both columns are always
 printed; --rank-by overrides which one sorts.
 
+Since 2026-08-28 no run has one: kot.py builds DiagInputs with val_idx=None, so
+diagnostics are scoped to the fitted cells and mean_foscttm carries the old
+train_foscttm meaning. --rank-by auto resolves there; an explicit val_foscttm or
+train_foscttm warns and falls back instead of printing blanks.
+
 Cells are flagged (degenerate / collapsed / dyn-dead) because none of those failures is
 visible in the FOSCTTM ranking and one of them sorts first. A flagged cell is not a
 result no matter where it ranks.
@@ -64,7 +69,8 @@ DEFAULT_HPARAMS = [
     "sinkhorn_reg", "sinkhorn_max_points", "sinkhorn_backend",
     "dyn_warmup_epochs", "g_freeze_epochs",
     "phase1_epochs", "phase2_epochs", "phase3_epochs", "phase3_lr_scale",
-    "kot_velocity_gauge_normalize", "kot_kinetics_require_velocity_gene",
+    "kot_velocity_gauge_normalize", "kot_velocity_shuffle",
+    "kot_kinetics_require_velocity_gene",
     "phi_spectral_norm", "use_anchor", "beta_anchor_csv",
 ]
 
@@ -393,7 +399,18 @@ def paired_deltas(rows: list[dict], checkpoint: str, group_by: list[str],
             continue
         context = (row.get("model"), row.get("dataset"), row.get("seed"))
         datasets.add((row.get("model"), row.get("dataset")))
-        values.setdefault((context, cell_key(row, group_by)), row)
+        key = (context, cell_key(row, group_by))
+        # Two runs at the same (model, dataset, seed, cell) means the --runs glob picked
+        # up a duplicate or two parallel jobs shared a --run-dir. Silently keeping the
+        # first would difference against whichever run happened to be globbed first, so
+        # say so instead.
+        if key in values:
+            raise ValueError(
+                f"Two runs share (model, dataset, seed)={context} and config cell "
+                f"{cell_key(row, group_by)}: {values[key].get('run')} and "
+                f"{row.get('run')}. Narrow --runs, or give each job its own --run-dir."
+            )
+        values[key] = row
 
     cells = sorted({key for _, key in values})
     base_key = tuple(baseline.get(col) or "" for col in group_by)
@@ -448,14 +465,25 @@ def rank_label(metric: str) -> str:
     return RANK_LABELS[metric]
 
 
-def other_rank_metric(rank_by: str) -> str:
+def other_rank_metric(rank_by: str, records: list[dict] | None = None) -> str:
     """The FOSCTTM the table is NOT ranked on, shown next to the one it is.
 
     Ranking on train_foscttm pairs it with val_foscttm rather than mean_foscttm: under
     the two-dataset protocol those are the fitted and held-out sides of one split, which
     is the comparison worth seeing.
+
+    `records` keeps the choice on a column that has data: val_foscttm is no longer
+    computed, so the preferred companion would render as a column of "-".
     """
-    return "mean_foscttm" if rank_by == "val_foscttm" else "val_foscttm"
+    preferred = "mean_foscttm" if rank_by == "val_foscttm" else "val_foscttm"
+    if records is None or any(r.get(f"{preferred}_mean") is not None for r in records):
+        return preferred
+    for candidate in RANK_METRICS:
+        if candidate != rank_by and any(
+            r.get(f"{candidate}_mean") is not None for r in records
+        ):
+            return candidate
+    return preferred
 
 
 def rank_metric_label(metric: str) -> str:
@@ -464,7 +492,7 @@ def rank_metric_label(metric: str) -> str:
 
 def print_paired(records: list[dict], group_by: list[str], rank_by: str) -> None:
     """One block per dataset, ranked by the paired delta on `rank_by` (negative = better)."""
-    other = other_rank_metric(rank_by)
+    other = other_rank_metric(rank_by, records)
     columns = ["dataset"] + group_by
     widths = {
         col: max(len(col), max(len(format_cell(r.get(col))) for r in records)) + 2
@@ -533,7 +561,7 @@ def print_aggregate(records: list[dict], key_columns: list[str], rank_by: str) -
         col: max(len(col), max(len(format_cell(r.get(col))) for r in records)) + 2
         for col in key_columns
     }
-    other = other_rank_metric(rank_by)
+    other = other_rank_metric(rank_by, records)
     ranked_label = rank_label(rank_by)
     print("".join(f"{col:{widths[col]}}" for col in key_columns)
           + f"{ranked_label:>18}{'n':>4}{'bad':>5}"
@@ -542,7 +570,14 @@ def print_aggregate(records: list[dict], key_columns: list[str], rank_by: str) -
             f"{'βerr':>8}{'φvar':>8}{'gratio':>8}{'gcos':>8}  flag")
     for record in records:
         mean, sd = record[f"{rank_by}_mean"], record[f"{rank_by}_sd"]
-        score = f"{mean:.4f} ± {sd:.4f}" if mean is not None else "CRASHED"
+        # n counts seeds that produced a mean_foscttm: n=0 is a dead arm, n>0 with no
+        # value for this metric is one that is simply no longer computed.
+        if mean is not None:
+            score = f"{mean:.4f} ± {sd:.4f}"
+        elif record["n"] == 0:
+            score = "CRASHED"
+        else:
+            score = "not computed"
         print("".join(f"{format_cell(record.get(col)):{widths[col]}}" for col in key_columns)
               + f"{score:>18}{record['n']:>4}{record['bad']:>5}"
               + f"{format_metric(record[f'{other}_mean']):>8}"
@@ -647,11 +682,15 @@ def main() -> int:
     if rank_by == "auto":
         has_val = any(isinstance(r.get("val_foscttm"), (int, float)) for r in rows)
         rank_by = "val_foscttm" if has_val else "mean_foscttm"
-    elif rank_by == "val_foscttm" and not any(
-        isinstance(r.get("val_foscttm"), (int, float)) for r in rows
-    ):
-        print("WARNING: --rank-by val_foscttm, but no run reported one — these runs "
-              "predate the validation split or ran with val_fraction=0.", file=sys.stderr)
+    elif not any(isinstance(r.get(rank_by), (int, float)) for r in rows):
+        # Any requested metric no run carries warns and names its fallback, instead of
+        # printing a table of blanks.
+        note = ("these runs predate the validation split, ran with val_fraction=0, or "
+                "postdate the 2026-08-28 kot.py change that stopped computing the "
+                "fitted/held-out FOSCTTM split (run_kot passes val_idx=None)")
+        print(f"WARNING: --rank-by {rank_by}, but no run reported one — {note}. "
+              f"Falling back to mean_foscttm.", file=sys.stderr)
+        rank_by = "mean_foscttm"
     in_sample = [r for r in rows if r.get("val_holdout") is False
                  and isinstance(r.get("val_foscttm"), (int, float))]
     if rank_by == "val_foscttm" and in_sample:

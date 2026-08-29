@@ -61,3 +61,60 @@ class FitFlagTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MissingScoreTests(unittest.TestCase):
+    """A blank score has two causes that must not print the same string.
+
+    The 2026-08-28 refactor of src/training/kot.py builds DiagInputs with val_idx=None,
+    so validation_metrics returns val_foscttm/train_foscttm as None for every run. The
+    table printed "CRASHED" for each, which reads as 16 dead runs when all 16 had
+    trained fine and written a mean_foscttm -- the sweep looked like a total loss.
+    record["n"] separates the two: it counts seeds that produced a mean_foscttm, so
+    n == 0 is a real failure and n > 0 is a metric that is simply no longer computed.
+    """
+
+    @staticmethod
+    def _score(record, rank_by):
+        # The branch under test, mirrored from print_aggregate so the discrimination
+        # is asserted rather than eyeballed in a printed table.
+        mean, sd = record[f"{rank_by}_mean"], record[f"{rank_by}_sd"]
+        if mean is not None:
+            return f"{mean:.4f} ± {sd:.4f}"
+        return "CRASHED" if record["n"] == 0 else "not computed"
+
+    def test_absent_metric_on_healthy_runs_is_not_crashed(self):
+        record = {"train_foscttm_mean": None, "train_foscttm_sd": None, "n": 4}
+        self.assertEqual(self._score(record, "train_foscttm"), "not computed")
+
+    def test_no_seed_produced_a_score_is_crashed(self):
+        record = {"train_foscttm_mean": None, "train_foscttm_sd": None, "n": 0}
+        self.assertEqual(self._score(record, "train_foscttm"), "CRASHED")
+
+    def test_present_metric_still_formats(self):
+        record = {"mean_foscttm_mean": 0.1181, "mean_foscttm_sd": 0.0029, "n": 4}
+        self.assertEqual(self._score(record, "mean_foscttm"), "0.1181 ± 0.0029")
+
+
+class CompanionMetricTests(unittest.TestCase):
+    """The column shown NEXT to the ranked one must contain data.
+
+    With val_foscttm no longer computed, the companion slot rendered a column of "-"
+    on every row, which invites the same misreading as CRASHED did.
+    """
+
+    def test_prefers_val_when_it_has_data(self):
+        from collect_run_diagnostics import other_rank_metric
+        records = [{"val_foscttm_mean": 0.13, "mean_foscttm_mean": 0.14}]
+        self.assertEqual(other_rank_metric("train_foscttm", records), "val_foscttm")
+
+    def test_falls_back_to_a_populated_metric(self):
+        from collect_run_diagnostics import other_rank_metric
+        records = [{"val_foscttm_mean": None, "train_foscttm_mean": None,
+                    "mean_foscttm_mean": 0.14}]
+        self.assertEqual(other_rank_metric("train_foscttm", records), "mean_foscttm")
+
+    def test_no_records_keeps_the_historical_choice(self):
+        from collect_run_diagnostics import other_rank_metric
+        self.assertEqual(other_rank_metric("val_foscttm"), "mean_foscttm")
+        self.assertEqual(other_rank_metric("mean_foscttm"), "val_foscttm")

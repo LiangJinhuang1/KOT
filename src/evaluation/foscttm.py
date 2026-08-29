@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import anndata as ad
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
@@ -32,7 +33,7 @@ def calc_frac_idx(x1_mat: np.ndarray, x2_mat: np.ndarray, batch_size: int = 1000
     try:
         import torch
     except ModuleNotFoundError:
-        return _calc_frac_idx_numpy(x1_array, x2_array, batch_size)
+        return calc_frac_idx_numpy(x1_array, x2_array, batch_size)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x1 = torch.as_tensor(x1_array, dtype=torch.float32, device=device)
@@ -51,7 +52,7 @@ def calc_frac_idx(x1_mat: np.ndarray, x2_mat: np.ndarray, batch_size: int = 1000
     return fracs.cpu().tolist()
 
 
-def _calc_frac_idx_numpy(
+def calc_frac_idx_numpy(
     x1: np.ndarray, x2: np.ndarray, batch_size: int
 ) -> list[float]:
     """CPU fallback used when PyTorch is not installed."""
@@ -96,8 +97,6 @@ def save_prediction_h5ad(
     second_label: str,
     obs_names,
 ) -> None:
-    import anndata as ad
-
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     adata = ad.AnnData(X=aligned[0])
     adata.obs_names = list(obs_names)

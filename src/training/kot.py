@@ -372,6 +372,26 @@ def set_fixed_beta(model, value: float | list[float], d_protein: int, device: to
     return target
 
 
+def velocity_row_permutation(n_cells: int, seed: int) -> np.ndarray:
+    """The row permutation behind the velocity control, seeded by the run seed.
+
+    Returns the permutation rather than a permuted matrix because everything that is a
+    property of a cell's own velocity has to move with it -- the velocity vector and
+    the confidence that weights its residual -- and one shared permutation is the only
+    way those stay together. Top-level so the control can be tested without a training
+    run, and seeded off the model seed so each seed draws its own permutation and the
+    control carries the same seed variance as the arm it is compared against.
+    """
+    return np.random.default_rng(seed).permutation(n_cells)
+
+
+def resolve_velocity_confidence(rna_adata, n_cells: int) -> np.ndarray:
+    """Per-cell scVelo velocity_confidence, or all-ones when the column is absent."""
+    if "velocity_confidence" in rna_adata.obs.columns:
+        return np.array(rna_adata.obs["velocity_confidence"].values, dtype=np.float32)
+    return np.ones(n_cells, dtype=np.float32)
+
+
 def resolve_velocity_matrix(rna_adata, velocity_layer: str | None, d_rna: int,
                             use_feature_space: bool) -> tuple[np.ndarray, str]:
     """The RNA velocity layer, projected into the KOT input's coordinate system.
@@ -1992,10 +2012,28 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     else:
         raise ValueError("KOT representation mode requires RNA PCA components in .varm['PCs'].")
 
-    # RNA velocity in the same coordinate system as the KOT RNA input.
+    # RNA velocity in the same coordinate system as the KOT RNA input, plus the per-cell
+    # scVelo confidence that weights its residual in the kinetics loss.
     V, selected_velocity_layer = resolve_velocity_matrix(
         rna_adata, velocity_layer, D_r, use_feature_space,
     )
+    conf = resolve_velocity_confidence(rna_adata, n)
+    # Control: give every cell another cell's real velocity. Permuting rows keeps the
+    # vectors, their per-cell norms (so the gauge below is unchanged) and the gene-gene
+    # structure, and destroys only the cell-to-velocity correspondence -- so a gap
+    # against the real run measures the information in that correspondence, not the
+    # scale or the mere presence of a kinetics term. The confidence rides the same
+    # permutation: it grades that cell's own velocity fit, so leaving it behind would
+    # decouple the weight from the vector it weights and make the two arms differ in
+    # two ways rather than one.
+    if bool(cfg.get("kot_velocity_shuffle", False)):
+        perm = velocity_row_permutation(n, int(cfg.get("seed", 42)))
+        V, conf = V[perm], conf[perm]
+        # One line per seed: the audit trail that the control actually fired, and the
+        # only honest one -- the JVP-RHS cosine cannot serve as that check, because the
+        # ODE right-hand side contains no v.
+        print(f"[kot] SHUFFLED velocity (control): rows permuted across {n} cells, "
+              f"{int((perm == np.arange(n)).sum())} left in place")
 
     # (Velocity gauge normalisation now happens on the EFFECTIVE velocity V_eff below,
     # after the RNA-side weight is applied — the gauge must be measured from the exact
@@ -2021,11 +2059,6 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         report_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(mapping_report).to_csv(report_path, index=False)
         print(f"[kot] wrote mapping report: {report_path}")
-
-    if "velocity_confidence" in rna_adata.obs.columns:
-        conf = np.array(rna_adata.obs["velocity_confidence"].values, dtype=np.float32)
-    else:
-        conf = np.ones(n, dtype=np.float32)
 
     R_t    = to_tensor(x,     device)   # (n, D_r)
     P_t    = to_tensor(y,     device)   # (n, D_p)

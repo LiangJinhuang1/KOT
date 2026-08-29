@@ -337,6 +337,7 @@ def cfg_with_model_overrides(run_cfg: dict, model_name: str) -> dict:
 
 def build_model_and_tensors(
     run_cfg: dict, rna_adata, protein_adata, model_name: str, device,
+    velocity_mode: str = "as-trained",
 ):
     """Reproduce KOTModel architecture + input tensors (R, V, P, S) for evaluation."""
     run_cfg = cfg_with_model_overrides(run_cfg, model_name)
@@ -422,6 +423,20 @@ def build_model_and_tensors(
     # normalisation). The diagnostics take this single vector — re-evaluating a checkpoint
     # on a raw or differently-scaled velocity would report physics numbers that do not match
     # the run that produced the checkpoint.
+    # Reproduce the run's own velocity by default: a shuffled run trained against a
+    # permuted field, so re-evaluating it on the real one would overwrite its physics
+    # numbers with a different quantity under the same name. velocity_mode="real"
+    # deliberately asks for that comparison and is written under its own checkpoint name.
+    if run_cfg.get("kot_velocity_shuffle", False) and velocity_mode == "as-trained":
+        # The permutation is drawn per model seed, but these tensors are built once per
+        # (run, model) outside the seed loop, so the run's own field cannot be rebuilt
+        # here. Refuse rather than evaluate against a different permutation and write the
+        # result under the run's own diagnostics name.
+        raise ValueError(
+            "This run trained with kot_velocity_shuffle=true; its velocity is per-seed "
+            "and cannot be reproduced here. Use --velocity real to score it against the "
+            "true velocity instead (written as diagnostics_<ckpt>_realvel.json)."
+        )
     velocity_weight_np = build_velocity_weight(rna_adata, S_np, run_cfg, use_feature_space)
     V_eff_t = to_tensor(build_effective_velocity(V, velocity_weight_np, run_cfg), device)
     # This tool overwrites each run's diagnostics_<ckpt>.json, so it has to reproduce the
@@ -545,7 +560,8 @@ def evaluate_one_checkpoint(
 # Walk and evaluate
 # ---------------------------------------------------------------------------
 
-def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
+def evaluate_run(run_folder: Path, device, save_percell: bool,
+                 velocity_mode: str = "as-trained") -> list[dict]:
     """Evaluate all checkpoints across all (model, seed) folders in one run."""
     print(f"\n=== {run_folder.name} ===")
 
@@ -564,7 +580,7 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
 
             (model, R_t, V_eff_t, P_t, S_t, rna_obs, mask_t, align_cols,
              velocity_backend, val_idx_t) = build_model_and_tensors(
-                run_cfg, rna_adata, protein_adata, model_name, device,
+                run_cfg, rna_adata, protein_adata, model_name, device, velocity_mode,
             )
 
             for seed_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")):
@@ -593,7 +609,8 @@ def evaluate_run(run_folder: Path, device, save_percell: bool) -> list[dict]:
                     )
 
                     # Per-checkpoint artifacts
-                    diag_out  = seed_dir / f"diagnostics_{ckpt_name}.json"
+                    suffix = "_realvel" if velocity_mode == "real" else ""
+                    diag_out  = seed_dir / f"diagnostics_{ckpt_name}{suffix}.json"
                     with open(diag_out, "w") as f:
                         json.dump(diagnostics, f, indent=2)
                     if save_percell:
@@ -683,6 +700,12 @@ def main():
         "--save-percell", action="store_true",
         help="Also write foscttm_<checkpoint>.csv per (model, seed). Off by default to save disk.",
     )
+    parser.add_argument(
+        "--velocity", choices=["as-trained", "real"], default="as-trained",
+        help="Which velocity to score against. 'real' ignores kot_velocity_shuffle and "
+             "asks whether a shuffled-trained model fits the TRUE field; results go to "
+             "diagnostics_<ckpt>_realvel.json so the run's own numbers are preserved.",
+    )
     args = parser.parse_args()
 
     run_folders = collect_run_folders(args)
@@ -696,7 +719,7 @@ def main():
 
     all_rows = []
     for run_folder in run_folders:
-        rows = evaluate_run(run_folder, device, args.save_percell)
+        rows = evaluate_run(run_folder, device, args.save_percell, args.velocity)
         all_rows.extend(rows)
 
     if not all_rows:

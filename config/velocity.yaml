@@ -11,7 +11,6 @@ defaults:
   # regvelo/scvi-tools stack in the container.
   velocity_backend: scvelo_dynamical
   dynamics_n_jobs: 8
-  random_state: 0
 
 datasets:
   bmmc_cite:

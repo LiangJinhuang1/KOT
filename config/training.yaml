@@ -134,7 +134,9 @@ defaults:
   velocity_layer: null
 
   # KOT
-  lambda_dyn: 1
+  # Operating point: candidate B of the tier-D/DH sweep. lambda_dyn=1 collapsed every
+  # cell it was tried in (FOSCTTM ~0.45-0.56); 1000 is what both candidates ran at.
+  lambda_dyn: 1000
   lambda_reg: 1.0e-4
   # geomloss Sinkhorn backend. Kept 'tensorized' (GPU-native PyTorch, O(N²) but fine
   # for the ≤8192-point align batch on a B200): KeOps in codedev_v1.0.5.sif cannot load
@@ -155,17 +157,17 @@ defaults:
   # term (kappa absorbs the pseudotime scale alpha is measured on). beta is a single
   # (D_p,) vector with a travel-cap of ~0.14 from init at a shared rate, which is the
   # reason to give it its own.
-  lr_phi: null
-  lr_alpha_kappa: null
-  lr_beta: null
+  lr_phi: 0.001
+  lr_alpha_kappa: 0.0001
+  lr_beta: 0.001                  # cfg C: 0.01
   # One multiplicative factor on ALL groups, so the ratios between the three rates hold
   # for the whole run: lr_warmup_start_factor·lr -> lr -> lr_min_factor·lr.
   # Linear over the first lr_warmup_epochs, cosine over the remaining n_epochs - warmup.
-  # The defaults below (0 / 1.0 / 0.0) are exactly the previous
-  # CosineAnnealingLR(T_max=n_epochs), so runs stay comparable until you opt in.
-  lr_warmup_epochs: 0
-  lr_warmup_start_factor: 1.0
-  lr_min_factor: 0.0
+  # Set to candidate B. The bare CosineAnnealingLR(T_max=n_epochs) these used to
+  # default to is lr_warmup_epochs=0, start_factor=1.0, min_factor=0.0.
+  lr_warmup_epochs: 300           # cfg C: 500
+  lr_warmup_start_factor: 0.1
+  lr_min_factor: 0.01
   seed: 42
   phi_dims: [1024, 512, 256]
   kappa_dims: [64, 32]
@@ -174,6 +176,9 @@ defaults:
   kot_fixed_beta: null
   kot_beta_warmstart_from_anchor: false   # init β at anchor targets, keep trainable + soft prior
   kot_beta_anchor_shuffle: false          # control: permute β* across proteins (assertion vs recovery test)
+  # Control: permute velocity rows across cells. Keeps the vectors, their norms and the
+  # gauge; destroys only which cell each velocity belongs to.
+  kot_velocity_shuffle: false
   kot_velocity_rna_reliability: false     # zero velocity of non-velocity_gene RNA coords before the JVP
   kot_velocity_s_linked_only: false       # JVP uses only S-linked (panel-coding) genes' velocity; fair scVelo-vs-RegVelo control
   kot_velocity_gauge_normalize: true      # rescale velocity to unit RMS per-cell norm (κ is bounded → compare direction not magnitude)
@@ -208,7 +213,9 @@ defaults:
   # done: while it is running the align loss is trivially at its minimum, so an earlier
   # best_align would select a model with far less dynamics than it trained with. Must be
   # shorter than n_epochs (run_kot raises otherwise).
-  dyn_warmup_epochs: 0
+  # 300, not 0: every ramp=0 cell in the tier-D/DH sweep collapsed (8/8 flagged
+  # collapsed+dyn-dead, FOSCTTM 0.33-0.42). 50/150/300 all train; 300 scored best.
+  dyn_warmup_epochs: 300
   early_stopping_patience: 100
   # What early stopping (and the best_align checkpoint) watches.
   #   train_align — the training alignment loss, the historical behaviour.
@@ -424,9 +431,8 @@ datasets:
     beta_anchor_sigma_floor: 0.25
     kot_anchor_indices: [0, 1, 2, 3, 4]
     kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
-    # Canonical run weights (baked in so no --set needed): strong dynamical term,
-    # soft β prior at 1.0. Switch with --set lambda_dyn=... / lambda_prior=...
-    lambda_dyn: 100
+    # Canonical run weight (baked in so no --set needed): soft β prior at 1.0.
+    # lambda_dyn now comes from defaults (candidate B); override with --set lambda_dyn=...
     lambda_prior: 1.0
     # Retained velocity already force-keeps ADT-target genes; default OFF so kinetic
     # active ≈ matched S. Override with --set kot_kinetics_require_velocity_gene=true
@@ -459,7 +465,6 @@ datasets:
     beta_anchor_sigma_floor: 0.25
     kot_anchor_indices: [0, 1, 2, 3, 4]
     kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
-    lambda_dyn: 100
     lambda_prior: 1.0
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
@@ -493,8 +498,7 @@ datasets:
     beta_anchor_sigma_floor: 0.25
     kot_anchor_indices: [0, 1, 2, 3, 4]
     kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
-    # Canonical run weights (baked in so no --set needed).
-    lambda_dyn: 100
+    # Canonical run weight (baked in so no --set needed); lambda_dyn from defaults.
     lambda_prior: 1.0
     # Same as pbmc_retained: filter OFF by default on retained velocity.
     kot_kinetics_require_velocity_gene: false
@@ -528,7 +532,6 @@ datasets:
     beta_anchor_sigma_floor: 0.25
     kot_anchor_indices: [0, 1, 2, 3, 4]
     kot_anchor_betas: [0.5, 0.5, 0.5, 0.5, 0.5]
-    lambda_dyn: 100
     lambda_prior: 1.0
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
@@ -557,7 +560,6 @@ datasets:
     use_anchor: false
     kot_anchor_indices: []
     kot_anchor_betas: []
-    lambda_dyn: 100
     lambda_prior: 0.0
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
@@ -584,7 +586,6 @@ datasets:
     use_anchor: false
     kot_anchor_indices: []
     kot_anchor_betas: []
-    lambda_dyn: 100
     lambda_prior: 0.0
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true

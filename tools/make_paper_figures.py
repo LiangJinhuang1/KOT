@@ -40,6 +40,7 @@ from src.visualization.runs import (
 )
 
 POINT_STYLE = dict(s=0.9, alpha=0.45, linewidths=0, rasterized=True)
+PREPROCESSED_DIR = Path("cache/preprocessed")
 
 
 def seed_dirs(dataset: str, model: str, require: tuple[str, ...]):
@@ -105,16 +106,31 @@ def load_aligned(run: Path) -> tuple[np.ndarray, np.ndarray]:
     return np.load(run / "aligned_rna.npy"), np.load(run / "aligned_protein.npy")
 
 
-def load_lineages(protein_h5ad: Path, n: int) -> pd.Series | None:
+def newest_protein_cache(dataset_stem: str) -> Path | None:
+    """The most recently written preprocessing cache for a dataset, or None.
+
+    The hash in a cache filename is a preprocessing-cache key, so naming one here
+    pins the figure to whatever the cache happened to be the day the line was
+    written: regenerating the velocity mints a new hash and the old file keeps
+    answering, silently labelling cells from superseded data. Resolving by mtime
+    instead means the figure follows the current cache with nothing to update.
+    `load_lineages` still checks the cell count, so a cache that does not match the
+    plotted run is refused rather than mislabelled.
+    """
+    caches = sorted(PREPROCESSED_DIR.glob(f"{dataset_stem}_*.protein.h5ad"),
+                    key=lambda f: f.stat().st_mtime)
+    return caches[-1] if caches else None
+
+
+def load_lineages(protein_h5ad: Path | None, n: int) -> pd.Series | None:
     """Coarse lineage per cell, or None with the reason printed.
 
-    The hash in the filename is a preprocessing-cache key, so re-running
-    preprocessing with different parameters renames this file. Silently returning
-    None then shipped a figure with two blank-but-lettered panels and no warning.
+    Silently returning None once shipped a figure with two blank-but-lettered
+    panels and no warning, so every refusal says why.
     """
-    if not protein_h5ad.exists():
-        print(f"[fig3] no lineage labels: {protein_h5ad} does not exist — the hash in "
-              f"the name is a preprocessing-cache key; check cache/preprocessed/")
+    if protein_h5ad is None:
+        print("[fig3] no lineage labels: no protein cache in cache/preprocessed/ for "
+              "this dataset — run preprocessing first")
         return None
     a = ad.read_h5ad(protein_h5ad, backed="r")
     if "cell_type" not in a.obs.columns:
@@ -182,9 +198,7 @@ def figure3(out: Path, max_cells: int = 12000, seed: int = 0):
 
     xr, xp = load_aligned(run)
     fos = pd.read_csv(run / "foscttm.csv")["foscttm"].to_numpy()
-    lin = load_lineages(
-        Path("cache/preprocessed/bmmc_cite_scvelo_results_retained_ee7f4fea5cb6.protein.h5ad"),
-        len(xr))
+    lin = load_lineages(newest_protein_cache("bmmc_cite_scvelo_results_retained"), len(xr))
 
     idx = rng.choice(len(xr), min(max_cells, len(xr)), replace=False)
     xy_r, xy_p = joint_embedding(xr, xp, idx, seed=seed)

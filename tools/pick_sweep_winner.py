@@ -34,10 +34,8 @@ def read_csv(path):
 
 
 def as_float(raw):
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
+    """A metric cell, or None where the writer left it blank (baseline rows, no diagnostics)."""
+    return float(raw) if raw else None
 
 
 def cell_of(row, keys):

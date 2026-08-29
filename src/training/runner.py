@@ -310,7 +310,7 @@ SUMMARY_CONFIG_KEYS = [
     "n_epochs", "early_stopping_patience", "early_stopping_monitor",
     "batch_size", "sinkhorn_reg",
     "dyn_warmup_epochs", "g_freeze_epochs",
-    "kot_velocity_gauge_normalize", "use_anchor",
+    "kot_velocity_gauge_normalize", "kot_velocity_shuffle", "use_anchor",
     "val_fraction", "val_holdout_from_training",
     "val_split_per_seed", "val_stratify_by", "fit_tuning_subset",
 ]
@@ -740,7 +740,7 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
     print(f"[runner] results saved to {output_dir}/")
 
 
-def _run_training(
+def train_all_datasets(
     config_path: Path = TRAINING_CONFIG,
     datasets_config_path: Path | None = None,
     stage: str | None = None,
@@ -921,7 +921,7 @@ def run_training(
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     try:
-        _run_training(
+        train_all_datasets(
             config_path=config_path,
             datasets_config_path=datasets_config_path,
             stage=stage,
