@@ -198,6 +198,14 @@ defaults:
   kot_allow_empty_anchor_after_kinetic_mask: false
   beta_anchor_fixed_scale: null           # freeze physical→model β scale (compute once on full set); null = geom-mean
   beta_anchor_min_r2: null                # drop anchors whose R²/quality is below this (e.g. 0.8); null = keep all (downweight only)
+  # Anchor-count ablation. beta_anchor_subset_n keeps a random subset of the anchors that
+  # are ACTIVE in the run (resolved from the CSV, then intersected with the kinetic mask);
+  # null = keep all, which is the untouched code path, and 0 turns the β prior off. The
+  # β unit is fixed upstream in resolve_beta_anchors and the prior is a weighted mean, so
+  # a rung changes the anchor COUNT and nothing else. The subset is drawn with the run
+  # seed, so each seed keeps a different one and the arm carries anchor-choice variance.
+  # Ladder: jobs_anchor_ablation.txt.
+  beta_anchor_subset_n: null
   g_dims: [256, 128]
   phi_init_gain: 0.5
   phi_spectral_norm: true

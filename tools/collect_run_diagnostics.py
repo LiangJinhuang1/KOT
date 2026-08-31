@@ -71,7 +71,7 @@ DEFAULT_HPARAMS = [
     "phase1_epochs", "phase2_epochs", "phase3_epochs", "phase3_lr_scale",
     "kot_velocity_gauge_normalize", "kot_velocity_shuffle",
     "kot_kinetics_require_velocity_gene",
-    "phi_spectral_norm", "use_anchor", "beta_anchor_csv",
+    "phi_spectral_norm", "use_anchor", "beta_anchor_csv", "beta_anchor_subset_n",
 ]
 
 # Curated metrics. --all-diagnostics emits every scalar in the json instead.
@@ -86,8 +86,14 @@ DEFAULT_METRICS = [
     "train_foscttm", "train_n_cells",
     "val_holdout", "val_split_digest", "runtime_seconds",
     "jvp_rhs_cos_median", "jvp_rhs_cos_mean", "rel_residual_median",
-    "time_spearman", "time_mae", "traj_dtw_temporal",
+    # traj_dtw_recon orders both trajectories by TRUE pseudotime; traj_dtw_temporal orders
+    # the prediction by its OWN pseudotime and so improves when that pseudotime collapses
+    # (nodyn scores 0.702 vs 0.841 with dynamics on, while time_spearman falls to -0.32).
+    # Carry both, and read recon.
+    "time_spearman", "time_mae", "traj_dtw_temporal", "traj_dtw_recon",
     "kappa_median", "alpha_median", "beta_mean", "beta_anchor_mean_abs_err",
+    "alpha_frac_at_midpoint", "alpha_frac_near_ceiling", "alpha_frac_near_floor",
+    "alpha_frac_constant_across_cells", "kappa_frac_near_ceiling", "kappa_frac_near_floor",
     "phi_variance_ratio", "norm_ratio_median", "v_eff_norm_median",
     "velocity_backend_cos_median",
     "best_align", "best_align_epoch", "best_val_align", "best_val_align_epoch",
@@ -112,6 +118,11 @@ AGGREGATE_METRICS = [
     # how well a typical cell fits.
     "jvp_rhs_cos_median",
     "rel_residual_median", "time_spearman",
+    # Trajectory shape. recon only: traj_dtw_temporal orders the prediction by its OWN
+    # pseudotime, so a run whose pseudotime collapses scores BETTER on it (nodyn 0.702 vs
+    # 0.841 with dynamics on, while time_spearman falls to -0.32). recon orders both sides
+    # by true pseudotime and cannot be gamed that way.
+    "traj_dtw_recon",
     "train_foscttm", "train_n_cells", "val_n_cells",
     "phi_variance_ratio", "kappa_median", "alpha_median", "beta_mean",
     # beta_anchor_mean_abs_err is the identifiability claim itself -- how far the

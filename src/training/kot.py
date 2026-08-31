@@ -487,6 +487,34 @@ def summarize_distribution(values, prefix: str) -> dict:
     return {f"{prefix}_{s}": stats[s] for s in STAT_SUFFIXES}
 
 
+def bounded_head_saturation(values: np.ndarray, min_value: float, max_value: float | None,
+                            prefix: str, edge_frac: float = 0.05) -> dict:
+    """How much of a BoundedPositiveMLP head sits at its limits instead of being learned.
+
+    The head is min + span·sigmoid(raw), so an output whose pre-activation never moved off
+    zero sits exactly at the midpoint, and the sigmoid gradient vanishes at both ends. Mass
+    at the midpoint means those entries are still at init; mass at an edge means the bound,
+    not the data, is setting them. Reported because `alpha_max` is one extreme of ~10^5
+    entries and says nothing about the bulk. Empty for an unbounded (softplus) head.
+    """
+    if max_value is None:
+        return {}
+    span = max_value - min_value
+    flat = np.asarray(values).reshape(-1)
+    return {
+        f"{prefix}_frac_at_midpoint":  float(np.isclose(flat, min_value + 0.5 * span,
+                                                        rtol=0, atol=1e-3 * span).mean()),
+        f"{prefix}_frac_near_ceiling": float((flat > max_value - edge_frac * span).mean()),
+        f"{prefix}_frac_near_floor":   float((flat < min_value + edge_frac * span).mean()),
+    }
+
+
+def constant_output_fraction(values: np.ndarray, tol: float = 1e-3) -> float:
+    """Fraction of per-protein outputs that do not vary across cells — a dead head that
+    returns the same number for every cell, so its protein carries no cell-state signal."""
+    return float(((values.max(axis=0) - values.min(axis=0)) < tol).mean())
+
+
 def jvp_rhs_per_cell(dphi_dv: torch.Tensor, rhs: torch.Tensor) -> dict:
     """Per-cell views of how well J_φ(r)·v matches the ODE right-hand side.
 
@@ -738,8 +766,15 @@ def compute_jvp_rhs_diagnostics(
         out.update(summarize_distribution(per_cell[name], name))
     # κ is one scalar per cell; α is per (cell, protein) and is summarised over every
     # entry, matching what the older alpha_mean/alpha_std reported.
-    out.update(summarize_distribution(kappa.detach().cpu().numpy(), "kappa"))
-    out.update(summarize_distribution(alpha.detach().cpu().numpy(), "alpha"))
+    kappa_np = kappa.detach().cpu().numpy()
+    alpha_np = alpha.detach().cpu().numpy()
+    out.update(summarize_distribution(kappa_np, "kappa"))
+    out.update(summarize_distribution(alpha_np, "alpha"))
+    # Where α and κ sit relative to their bounds, and the per-protein α the panel learned.
+    out.update(bounded_head_saturation(kappa_np, model.kappa.min_value, model.kappa.max_value, "kappa"))
+    out.update(bounded_head_saturation(alpha_np, model.g.min_value, model.g.max_value, "alpha"))
+    out["alpha_frac_constant_across_cells"] = constant_output_fraction(alpha_np)
+    out["alpha_per_protein_mean"] = alpha_np.mean(axis=0).tolist()
     # Back-compat aliases for the existing plots / CSVs / collect_run_diagnostics.py.
     out["jvp_rhs_cos"] = out["jvp_rhs_cos_mean"]
     out["jvp_norm"]    = out["jvp_norm_mean"]
@@ -881,7 +916,7 @@ def compute_grad_interaction(
 # materialises is (chunk x m), so the same chunk that is trivial on pbmc (m ~ 4k)
 # is a 1.4 GB spike on bmmc_cite (m ~ 90k). A sweep runs many jobs per GPU, so
 # that spike is what OOMs, long after training itself has fit.
-_CDIST_BLOCK_ELEMS = 32 * 1024 * 1024   # 128 MB at fp32
+CDIST_BLOCK_ELEMS = 32 * 1024 * 1024   # 128 MB at fp32
 
 
 def nearest_protein_match(
@@ -894,13 +929,13 @@ def nearest_protein_match(
     cells, where a dense n×n matrix is ~32 GB) do not OOM.
 
     `chunk` defaults to whatever keeps one (chunk x m) block near
-    `_CDIST_BLOCK_ELEMS`, and halves on CUDA OOM down to a single row before
+    `CDIST_BLOCK_ELEMS`, and halves on CUDA OOM down to a single row before
     giving up and finishing the block on CPU -- this runs after the checkpoints
     are written, so it must not be what throws away a finished run.
     """
     n, m = phi.shape[0], protein.shape[0]
     if chunk is None:
-        chunk = max(1, min(n, _CDIST_BLOCK_ELEMS // max(m, 1)))
+        chunk = max(1, min(n, CDIST_BLOCK_ELEMS // max(m, 1)))
     idx = torch.empty(n, dtype=torch.long, device=phi.device)
     vals = torch.empty(n, dtype=phi.dtype, device=phi.device)
     start = 0
@@ -1325,7 +1360,8 @@ def compute_full_diagnostics(model, inputs: DiagInputs, subset: int = 1024) -> d
 
 def anchor_diagnostics(beta: torch.Tensor, use_anchor: bool, anchor_indices: list,
                        anchor_target: torch.Tensor | None, kin_mask, protein_names: list,
-                       prior_kind: str, aggregate: str, anchor_scale) -> dict:
+                       prior_kind: str, aggregate: str, anchor_scale,
+                       subset_n: int | None) -> dict:
     """What the β-anchor asked for and what β actually did, per anchored protein.
 
     Judged on the anchored proteins alone: the global beta_mean averages the ~130
@@ -1341,6 +1377,10 @@ def anchor_diagnostics(beta: torch.Tensor, use_anchor: bool, anchor_indices: lis
         "beta_anchor_aggregate":        aggregate if use_anchor else None,
         "beta_anchor_n":                int(len(anchor_indices)) if use_anchor else 0,
         "beta_anchor_scale":            float(anchor_scale) if anchor_scale is not None else None,
+        # The ablation's axis: how many anchors were REQUESTED (null = every active one)
+        # and the seed the subset was drawn with. Recorded even on the count=0 rung,
+        # where the prior is off, so the ladder groups on one column.
+        "beta_anchor_subset_n":         subset_n,
         "beta_anchor_in_kinetic_mask":  [],
         "beta_anchor_names_in_kinetic": [],
         "beta_anchor_n_in_kinetic":     0,
@@ -1619,6 +1659,39 @@ def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
         print(f"[kot] Saved grad-interaction diagnostics: {gi_path} + {gi_plot}")
 
 
+def select_anchor_entries(keep: list[int], indices: list, betas: list,
+                          weights: list, sigmas: list) -> tuple[list, list, list, list]:
+    """Take positions `keep` out of the parallel anchor lists.
+
+    A list whose length does not match `indices` was not supplied per anchor by a
+    manual config, so it passes through untouched and `anchor_tensors` falls back to
+    its defaults for it. One helper because both anchor filters -- the kinetic-mask
+    intersection and the anchor-count ablation -- have to keep the four lists aligned.
+    """
+    picked = [[v[k] for k in keep] if len(v) == len(indices) else v
+              for v in (betas, weights, sigmas)]
+    return [indices[k] for k in keep], *picked
+
+
+def anchor_subset_indices(n_active: int, keep_n: int, seed: int) -> list[int]:
+    """Which active anchors survive an anchor-count ablation, seeded by the run seed.
+
+    Returns positions into the active anchor list, drawn as the head of ONE permutation
+    so the ladder is nested within a seed: the keep_n=3 set is a subset of the keep_n=5
+    set, and a step down the ladder removes anchors instead of re-drawing a different
+    set. Seeded off the run seed, so each
+    seed keeps a different subset -- the arm then carries the variance of WHICH anchors
+    were kept, not the luck of one pick, and is comparable to the full-anchor arm whose
+    spread is training noise alone.
+    """
+    if not 0 <= keep_n <= n_active:
+        raise ValueError(
+            f"beta_anchor_subset_n={keep_n} is outside 0..{n_active}, the number of "
+            f"anchors active in this run. Pick a rung the dataset actually has."
+        )
+    return sorted(int(k) for k in np.random.default_rng(seed).permutation(n_active)[:keep_n])
+
+
 def anchor_tensors(indices: list, betas: list, sigmas: list, weights: list,
                    default_beta: float, prior_sigma_floor: float, target_beta: float,
                    device: torch.device):
@@ -1853,6 +1926,11 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     min_anchor_quality = float(min_anchor_quality_cfg) if min_anchor_quality_cfg is not None else None
     prior_sigma_floor = float(cfg.get("beta_anchor_sigma_floor", 0.25))
     beta_warmstart = bool(cfg.get("kot_beta_warmstart_from_anchor", False))
+    # Anchor-count ablation: keep only this many of the anchors that actually act
+    # (null = keep all, which is the untouched code path). Applied after the kinetic-mask
+    # intersection below, so the number asked for is the number of priors in the loss.
+    anchor_subset_cfg = cfg.get("beta_anchor_subset_n")
+    anchor_subset_n = int(anchor_subset_cfg) if anchor_subset_cfg is not None else None
     anchor_scale = None
     if beta_anchor_csv and Path(beta_anchor_csv).exists():
         # beta_anchor_fixed_scale freezes the physical→model β unit (compute it once on
@@ -2291,6 +2369,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     anchor_target = None
     anchor_sigma_t = None
     anchor_weight_t = None
+    # An anchor-free arm (kot_noanchor) never enters the block below, so a subset_n set on
+    # its command line is inert. Recording the requested number anyway would put a k=N row
+    # in a --group-by table for a run that had no anchors to thin -- report only what ran.
+    anchor_subset_applied = False
     if use_anchor:
         if not anchor_indices:
             message = "use_anchor=true but no kot_anchor_indices are configured."
@@ -2305,13 +2387,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         if use_anchor and use_feature_space:
             n_from_csv = len(anchor_indices)
             keep = [k for k, j in enumerate(anchor_indices) if bool(kin_mask[j])]
-            anchor_indices = [anchor_indices[k] for k in keep]
-            if len(anchor_betas) == n_from_csv:
-                anchor_betas = [anchor_betas[k] for k in keep]
-            if len(anchor_weights_list) == n_from_csv:
-                anchor_weights_list = [anchor_weights_list[k] for k in keep]
-            if len(anchor_sigmas_list) == n_from_csv:
-                anchor_sigmas_list = [anchor_sigmas_list[k] for k in keep]
+            anchor_indices, anchor_betas, anchor_weights_list, anchor_sigmas_list = (
+                select_anchor_entries(keep, anchor_indices, anchor_betas,
+                                      anchor_weights_list, anchor_sigmas_list)
+            )
             print(f"[kot] anchors: {n_from_csv} from csv, {n_from_csv - len(anchor_indices)} "
                   f"excluded (not in kinetic mask), {len(anchor_indices)} active priors")
             if not anchor_indices:
@@ -2321,6 +2400,23 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                     use_anchor = False
                 else:
                     raise ValueError(message)
+        # Anchor-count ablation. After the kinetic-mask intersection so the count asked for
+        # is the count that reaches the loss, and after resolve_beta_anchors so every rung
+        # shares one β scale. Rationale: jobs_anchor_ablation.txt.
+        if use_anchor and anchor_subset_n is not None:
+            anchor_subset_applied = True
+            n_active = len(anchor_indices)
+            keep = anchor_subset_indices(n_active, anchor_subset_n, seed)
+            anchor_indices, anchor_betas, anchor_weights_list, anchor_sigmas_list = (
+                select_anchor_entries(keep, anchor_indices, anchor_betas,
+                                      anchor_weights_list, anchor_sigmas_list)
+            )
+            kept_names = [second_adata.var_names[j] for j in anchor_indices]
+            print(f"[kot] ANCHOR-COUNT ABLATION: kept {len(anchor_indices)}/{n_active} active "
+                  f"anchors (subset seed={seed}): {kept_names}")
+            if not anchor_indices:
+                print("[kot] beta_anchor_subset_n=0 — β prior disabled for this run.")
+                use_anchor = False
         if use_anchor:
             anchor_idx_t, anchor_target, anchor_sigma_t, anchor_weight_t = anchor_tensors(
                 anchor_indices, anchor_betas, anchor_sigmas_list, anchor_weights_list,
@@ -2808,6 +2904,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics.update(anchor_diagnostics(
         model.beta, use_anchor, anchor_indices, anchor_target, kin_mask,
         list(second_adata.var_names), beta_anchor_prior, beta_anchor_aggregate, anchor_scale,
+        anchor_subset_n if anchor_subset_applied else None,
     ))
     diagnostics["stop_epoch"]        = int(stop_epoch)
     diagnostics["best_align_epoch"]  = int(best_align_epoch) if best_align_state is not None else None
