@@ -1,20 +1,8 @@
-"""
-β degradation-rate anchor from measured protein half-lives.
+"""β anchors from measured half-lives.
 
-Reads a CSV with (at least) protein_name and either half_life_hours or
-beta_per_hour (optionally cell_type, quality_score_or_R2, anchor_weight), and
-resolves it against the protein panel.
-
-Aggregation across cell-type rows:
-  - median (default) or mean of β_per_hour
-  - optional stability filter: keep only proteins whose CV across cell types
-    is ≤ stable_cv_max
-  - per-protein σ from cross-cell-type dispersion (for soft Gaussian /
-    log-normal priors); single-measurement proteins get prior_sigma_floor
-
-Modelling note: KOT's ODE runs in pseudotime, so absolute per-hour rates are
-rescaled so mean(β) = target_mean_beta. Relative fast/slow structure is kept;
-learned κ absorbs the time-unit conversion.
+CSV: protein_name plus half_life_hours or beta_per_hour. Median/mean across
+cell types; optional CV filter; σ from cross-type dispersion. The ODE runs in
+pseudotime, so rates are rescaled to mean(β)=target; κ absorbs the time unit.
 """
 
 from __future__ import annotations

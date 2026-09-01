@@ -33,6 +33,7 @@ velocity = [
     "scvelo>=0.3",
 ]
 baselines = [
+    "maxfuse>=0.0.2",
     "moscot>=0.4",
     "scglue>=0.3",
     "scvi-tools>=1.1",

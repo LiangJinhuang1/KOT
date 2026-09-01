@@ -10,7 +10,6 @@ import h5py
 
 
 def is_valid_h5ad(path: str | Path) -> bool:
-    """Return whether *path* looks like a complete AnnData HDF5 file."""
     path = Path(path)
     if not path.exists() or path.stat().st_size == 0:
         return False
@@ -21,11 +20,7 @@ def is_valid_h5ad(path: str | Path) -> bool:
 
 
 def write_h5ad_atomic(adata, output_path: str | Path) -> None:
-    """Write an H5AD file atomically and validate it before publication.
-
-    A UUID avoids temporary-name collisions between threads in the same process,
-    while ``os.replace`` ensures cluster workers never observe a partial cache.
-    """
+    """UUID temp + os.replace so cluster workers never read a partial cache."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_name(

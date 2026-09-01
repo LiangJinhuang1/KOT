@@ -1,40 +1,5 @@
 #!/usr/bin/env python3
-"""
-KOT training instability analysis, grouped by experiment type.
-
-Output structure (under --output, default ./analysis/):
-  clean/           — oracle/clean/branch synthetic stages (one folder per stage)
-  oracle/
-  branch/
-  linked_ode/      — synthetic_linked_ode + mean-scale layers
-  meanscale/       — mean-scale coordinates (non-linked-ode)
-  log_velocity/    — log-velocity layer + PCA representation
-  phased/          — alternating-phase optimisation (phase1_epochs > 0)
-  all/             — every run combined
-
-  Per group:
-    foscttm_distribution.png
-    per_seed_reliability.png
-    model_comparison.png
-    loss_trajectories.png
-    time_vs_alignment.png
-    time_model_comparison.png
-    summary_per_run.csv
-    long_form_results.csv
-    stuck_signatures.csv
-    metrics_per_seed.csv          — every seed / single-run baseline (+ stage, JVP)
-    foscttm_aggregate_by_stage.csv
-    jvp_aggregate_by_stage.csv
-    foscttm_aggregate_wide.csv    — model × clean/oracle/branch (mean ± std)
-    jvp_aggregate_wide.csv
-
-Usage:
-    python analyze_instability.py
-    python analyze_instability.py --output analysis/
-    python analyze_instability.py --only linked_ode all
-    python analyze_instability.py --runs run_20260622_234003
-    python analyze_instability.py --runs run_20260622_234003 --per-run
-"""
+"""Group runs by experiment type so a stuck signature is not pooled with a healthy one."""
 
 from __future__ import annotations
 

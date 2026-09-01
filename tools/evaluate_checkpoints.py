@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""
-Re-evaluate every saved KOT checkpoint and write per-checkpoint diagnostics
-plus a single compact summary CSV across ALL runs (v1, v2, v3, anything in
-cache/training/run_*).
-
-For each (run, model, seed, checkpoint) it loads `checkpoint_<name>.pt`,
-restores the model, recomputes FOSCTTM + full diagnostics, and writes:
-
-  <run>/<model>/<dataset>/<seed>/diagnostics_<checkpoint>.json
-  <run>/<model>/<dataset>/<seed>/foscttm_<checkpoint>.csv   (optional)
-
-Plus one summary file with all rows:
-
-  cache/results/checkpoint_eval_summary.csv
-
-Usage:
-  python evaluate_checkpoints.py                       # all runs
-  python evaluate_checkpoints.py --runs cache/training/run_20260617_085640
-  python evaluate_checkpoints.py --runs "cache/training/run_20260617_*"
-  python evaluate_checkpoints.py --save-percell        # also dump per-cell CSVs
-  python evaluate_checkpoints.py --output my_summary.csv
-
-The summary CSV has one row per (run, model, seed, checkpoint) and includes:
-  mean_foscttm, time_mae, time_spearman, jvp_rhs_cos, kappa_mean, beta_mean,
-  phi_variance_ratio, checkpoint_epoch, training-time loss values, etc.
-"""
+"""Re-evaluate saved KOT checkpoints. Rank on val_foscttm; mean_foscttm is in-sample."""
 
 from __future__ import annotations
 
@@ -52,6 +27,7 @@ from src.data.projection import projection_matrix_from_adatas
 from src.data.adt_gene_map import load_mapping_records
 from src.data.splits import held_out_mask
 from src.models.KOT import KOTModel
+from src.training.registry import MODEL_OVERRIDES
 from src.training.kot import (
     FixedAlpha,
     FixedKappa,
@@ -71,112 +47,15 @@ from src.training.kot import (
 )
 
 
+# Shared across run folders: keyed by the full preprocess args, never by dataset
+# name (two runs can differ in rna_n_top_genes). Downstream only reads these objects.
+PREPROCESSED_CACHE: dict = {}
+
 DATASETS_CONFIG = Path("config/datasets.yaml")
 DEFAULT_RUN_DIR = Path("cache/training")
 DEFAULT_OUTPUT = Path("cache/results/checkpoint_eval_summary.csv")
 
 CHECKPOINT_NAMES = ["best_align", "best_val_align", "best_dyn", "best_total", "final"]
-
-# Mirror the KOT-specific runner.MODEL_OVERRIDES so checkpoint architecture
-# matches the saved state dict.
-MODEL_OVERRIDES = {
-    "kot_nodyn": {"lambda_dyn": 0.0},
-    "kot_fixedkappa": {
-        "kot_fixed_kappa": 0.6931471805599453,
-        "kot_fixed_alpha": None,
-        "kot_alpha_min": 1.0e-3,
-        "kot_alpha_max": 1.5,
-        "lambda_kappa_prior": 0.0,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_fixedalpha": {
-        "kot_fixed_alpha": 0.6931471805599453,
-        "kot_fixed_kappa": None,
-        "kot_kappa_min": 1.0e-3,
-        "kot_kappa_max": 1.5,
-        "kot_kappa_prior": 0.6931471805599453,
-        "lambda_kappa_prior": 0.01,
-        "kot_alpha_min": 1.0e-6,
-        "kot_alpha_max": None,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_oracle": {
-        "kot_fixed_alpha": 1.0,
-        "kot_fixed_kappa": 1.0,
-        "kot_fixed_beta": 0.5,
-        "kot_kappa_min": 1.0,
-        "kot_kappa_max": 1.0,
-        "use_anchor": False,
-        "kot_anchor_indices": [],
-        "kot_anchor_betas": [],
-        "lambda_prior": 0.0,
-        "lambda_kappa_prior": 0.0,
-        "kot_alpha_min": 1.0,
-        "kot_alpha_max": 1.0,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_oracle_learnalpha": {
-        "kot_fixed_alpha": None,
-        "kot_fixed_kappa": 1.0,
-        "kot_fixed_beta": 0.5,
-        "kot_kappa_min": 1.0,
-        "kot_kappa_max": 1.0,
-        "use_anchor": False,
-        "kot_anchor_indices": [],
-        "kot_anchor_betas": [],
-        "lambda_prior": 0.0,
-        "lambda_kappa_prior": 0.0,
-        "kot_alpha_min": 1.0e-3,
-        "kot_alpha_max": 1.5,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_oracle_learnalpha_kappa": {
-        "kot_fixed_alpha": None,
-        "kot_fixed_kappa": None,
-        "kot_fixed_beta": 0.5,
-        "kot_kappa_min": 1.0e-3,
-        "kot_kappa_max": 1.5,
-        "use_anchor": False,
-        "kot_anchor_indices": [],
-        "kot_anchor_betas": [],
-        "lambda_prior": 0.0,
-        "lambda_kappa_prior": 0.0,
-        "kot_alpha_min": 1.0e-3,
-        "kot_alpha_max": 1.5,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_unbounded": {
-        "kot_kappa_min": 1.0e-6,
-        "kot_kappa_max": None,
-        "kot_alpha_min": 1.0e-6,
-        "kot_alpha_max": None,
-        "lambda_kappa_prior": 0.0,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_unbounded_sn": {
-        "kot_kappa_min": 1.0e-6,
-        "kot_kappa_max": None,
-        "kot_alpha_min": 1.0e-6,
-        "kot_alpha_max": None,
-        "lambda_kappa_prior": 0.0,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": True,
-        "g_dims": [256, 128],
-    },
-    "kot_anchor": {"use_anchor": True},
-}
 
 STAGED_DATASET = "synthetic_linked_ode"
 SCALE_LAYERS = {
@@ -307,8 +186,13 @@ def load_dataset_for_run(run_folder: Path, dataset_name: str | None = None):
         dataset_name = next(iter(datasets_section.keys()))
 
     run_cfg, dataset_meta, name = dataset_config_for_run(run_folder, dataset_name)
+    rna_adata, protein_adata = load_preprocessed_cached(run_cfg, dataset_meta)
+    return rna_adata, protein_adata, run_cfg, name
 
-    rna_adata, protein_adata, _ = load_and_preprocess_cached(
+
+def load_preprocessed_cached(run_cfg: dict, dataset_meta: dict):
+    """The run's preprocessed RNA + protein AnnData, loaded once per distinct config."""
+    kwargs = dict(
         rna_path=dataset_meta["rna_path"],
         protein_path=dataset_meta.get("protein_path"),
         protein_label=dataset_meta.get("protein_label", "ADT"),
@@ -330,7 +214,11 @@ def load_dataset_for_run(run_folder: Path, dataset_name: str | None = None):
         atac_n_components=int(run_cfg.get("atac_n_components", 30)),
         atac_n_neighbors=int(run_cfg.get("atac_n_neighbors", 30)),
     )
-    return rna_adata, protein_adata, run_cfg, name
+    key = tuple(sorted((name, str(value)) for name, value in kwargs.items()))
+    if key not in PREPROCESSED_CACHE:
+        rna_adata, protein_adata, _ = load_and_preprocess_cached(**kwargs)
+        PREPROCESSED_CACHE[key] = (rna_adata, protein_adata)
+    return PREPROCESSED_CACHE[key]
 
 
 def cfg_with_model_overrides(run_cfg: dict, model_name: str) -> dict:
@@ -339,7 +227,8 @@ def cfg_with_model_overrides(run_cfg: dict, model_name: str) -> dict:
 
 def build_model_and_tensors(
     run_cfg: dict, rna_adata, protein_adata, model_name: str, device,
-    velocity_mode: str = "as-trained",
+    velocity_mode: str = "as-trained", mapping_mode: str = "as-trained",
+    with_velocity_backend: bool = True,
 ):
     """Reproduce KOTModel architecture + input tensors (R, V, P, S) for evaluation."""
     run_cfg = cfg_with_model_overrides(run_cfg, model_name)
@@ -377,16 +266,18 @@ def build_model_and_tensors(
         use_explicit_links=use_explicit_links,
         require_full_panel=require_full_panel,
     )
-    # The run's own mapping, including the permutation control (run_kot applies it in
-    # exactly this position, before the PC projection). velocity_mode="real" asks for the
-    # TRUE inputs, so it scores an S-permuted run against the real map as well.
-    if velocity_mode == "as-trained" and run_cfg.get("kot_s_permute", False):
+    # The RNA->protein map is its own control axis, independent of the velocity: run_kot
+    # applies the permutation in exactly this position, before the PC projection, and
+    # mapping_mode="real" asks for the TRUE map whatever the run trained on. Everything
+    # that follows from S -- S_model, the velocity-gene kinetic filter, the RNA-side
+    # velocity weight -- follows this one choice.
+    if mapping_mode == "as-trained" and run_cfg.get("kot_s_permute", False):
         # Seeded off the model seed, but these tensors are built once per (run, model)
         # outside the seed loop, so the run's own permutation cannot be rebuilt here.
         raise ValueError(
             "This run trained with kot_s_permute=true; its S is per-seed and cannot be "
-            "reproduced here. Use --velocity real to score it against the true mapping "
-            "instead (written as diagnostics_<ckpt>_realvel.json)."
+            "reproduced here. Use --mapping real to score it against the true mapping "
+            "instead (written as diagnostics_<ckpt>_realmap.json)."
         )
     if use_feature_space:
         S_model = S_np.copy()
@@ -459,8 +350,11 @@ def build_model_and_tensors(
     # This tool overwrites each run's diagnostics_<ckpt>.json, so it has to reproduce the
     # cross-backend velocity cosine too — otherwise re-evaluating a run silently strips it.
     # Checkpoint-independent (the velocity is fixed input), so it is computed once here.
-    velocity_backend = compute_velocity_backend_agreement(
-        rna_adata, V, run_cfg, velocity_weight_np)
+    # Reads the comparison h5ad once here; other tools discard it.
+    velocity_backend = (
+        compute_velocity_backend_agreement(rna_adata, V, run_cfg, velocity_weight_np)
+        if with_velocity_backend else {}
+    )
 
     phi_dims        = list(run_cfg.get("phi_dims", [1024, 512, 256]))
     kappa_dims      = list(run_cfg.get("kappa_dims", [64, 32]))
@@ -563,8 +457,20 @@ def evaluate_one_checkpoint(
 # Walk and evaluate
 # ---------------------------------------------------------------------------
 
+def artifact_suffix(velocity_mode: str, mapping_mode: str) -> str:
+    """Name the diagnostics file after the inputs it was scored against.
+
+    A run's own numbers live in diagnostics_<ckpt>.json; scoring a control arm against a
+    real input answers a different question, so it gets its own name rather than
+    overwriting them. The two axes are independent, hence two independent tags.
+    """
+    return (("_realvel" if velocity_mode == "real" else "")
+            + ("_realmap" if mapping_mode == "real" else ""))
+
+
 def evaluate_run(run_folder: Path, device, save_percell: bool,
-                 velocity_mode: str = "as-trained") -> list[dict]:
+                 velocity_mode: str = "as-trained",
+                 mapping_mode: str = "as-trained") -> list[dict]:
     """Evaluate all checkpoints across all (model, seed) folders in one run."""
     print(f"\n=== {run_folder.name} ===")
 
@@ -584,6 +490,7 @@ def evaluate_run(run_folder: Path, device, save_percell: bool,
             (model, R_t, V_eff_t, P_t, S_t, rna_obs, mask_t, align_cols,
              velocity_backend, val_idx_t) = build_model_and_tensors(
                 run_cfg, rna_adata, protein_adata, model_name, device, velocity_mode,
+                mapping_mode,
             )
 
             for seed_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")):
@@ -612,7 +519,7 @@ def evaluate_run(run_folder: Path, device, save_percell: bool,
                     )
 
                     # Per-checkpoint artifacts
-                    suffix = "_realvel" if velocity_mode == "real" else ""
+                    suffix = artifact_suffix(velocity_mode, mapping_mode)
                     diag_out  = seed_dir / f"diagnostics_{ckpt_name}{suffix}.json"
                     with open(diag_out, "w") as f:
                         json.dump(diagnostics, f, indent=2)
@@ -705,10 +612,17 @@ def main():
     )
     parser.add_argument(
         "--velocity", choices=["as-trained", "real"], default="as-trained",
-        help="Which inputs to score against. 'real' ignores kot_velocity_ablation and "
-             "kot_s_permute and asks whether a control-trained model fits the TRUE "
-             "velocity and mapping; results go to diagnostics_<ckpt>_realvel.json so the "
-             "run's own numbers are preserved.",
+        help="Which velocity field to score against. 'real' ignores "
+             "kot_velocity_ablation and asks whether a control-trained model fits the "
+             "TRUE velocity; results go to diagnostics_<ckpt>_realvel.json so the run's "
+             "own numbers are preserved.",
+    )
+    parser.add_argument(
+        "--mapping", choices=["as-trained", "real"], default="as-trained",
+        help="Which RNA->protein map S to score against. 'real' ignores kot_s_permute "
+             "and asks whether a permuted-map run fits the TRUE mapping -- the only way "
+             "to score that control, since its S is drawn per seed. Independent of "
+             "--velocity; results go to diagnostics_<ckpt>_realmap.json.",
     )
     args = parser.parse_args()
 
@@ -723,7 +637,8 @@ def main():
 
     all_rows = []
     for run_folder in run_folders:
-        rows = evaluate_run(run_folder, device, args.save_percell, args.velocity)
+        rows = evaluate_run(run_folder, device, args.save_percell, args.velocity,
+                            args.mapping)
         all_rows.extend(rows)
 
     if not all_rows:

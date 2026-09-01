@@ -86,16 +86,7 @@ def build_guidance_graph(
     *,
     uniform_fallback: bool = False,
 ) -> nx.Graph:
-    """
-    Build a bipartite guidance graph linking RNA genes to second-modality features.
-
-    - Self-loops on every vertex (GLUE requires them)
-    - Explicit links in .uns["rna_protein_feature_links"] or .uns["guidance_edges"]
-    - Name/synthetic-index matches when explicit links are unavailable
-    - Optional uniform fallback when no feature-level prior exists
-
-    Every var_name in both adatas must appear as a graph node; GLUE enforces this.
-    """
+    """Bipartite RNA–second graph. GLUE requires a self-loop on every var_name."""
     rna_features    = rna_adata.var_names.tolist()
     second_features = second_adata.var_names.tolist()
     rna_set         = set(rna_features)
@@ -149,18 +140,7 @@ def build_guidance_graph(
 
 
 def run_glue(context: dict, cfg: dict) -> tuple[list, np.ndarray | None]:
-    """
-    GLUE alignment: graph-guided VAE producing a shared latent space.
-
-    Both RNA and second-modality cells are embedded into the same latent_dim
-    space; aligned[0] and aligned[1] are those embeddings.
-    GLUE does not produce a coupling matrix, so coupling is None.
-
-    Returns
-    -------
-    aligned  : [rna_emb (n, latent_dim), second_emb (n, latent_dim)]
-    coupling : None
-    """
+    """GLUE shared latent. No coupling. Under a fit restriction, RNA stays full-n."""
     rna_adata    = context["rna_adata"]
     second_adata = context["second_adata"]
     second_label = context["second_label"]

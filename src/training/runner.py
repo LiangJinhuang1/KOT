@@ -22,6 +22,21 @@ from src.evaluation.foscttm import (
     evaluate_and_save,
     save_prediction_h5ad,
 )
+from src.evaluation.protocol import (
+    HOLDOUT_SECOND,
+    plan_fit_restriction,
+    protocol_stamp,
+    restrict_second_modality,
+    scatter_rows,
+)
+from src.training.registry import (
+    BATCH_SPLIT_MODELS,
+    COUNT_MODELS,
+    MODELS,
+    MODEL_OVERRIDES,
+    RETIRED_MODELS,
+    extra_for,
+)
 from src.visualization.alignment import (
     coembedding_plot_kwargs,
     plot_coembedding,
@@ -60,48 +75,14 @@ class Tee:
         for stream in self.close_streams:
             stream.close()
 
-# Registry: model name → alignment function
-# Each function accepts (context, cfg) and returns (aligned, coupling).
-# context keys:
-#   x            — RNA repr np.ndarray (n_cells × n_pcs)
-#   y            — second modality repr np.ndarray
-#   rna_adata    — full RNA AnnData (needed by GLUE, uniPort, totalVI)
-#   second_adata — full second modality AnnData
-#   second_label — "protein" or "atac"
-MODELS = {
-    "scot": ("src.training.scot", "run_scot"),
-    "moscot": ("src.training.moscot", "run_moscot"),
-    "glue": ("src.training.glue", "run_glue"),
-    "uniport": ("src.training.uniport", "run_uniport"),
-    "totalvi": ("src.training.totalvi", "run_totalvi"),
-    "linear_ode": ("src.training.linear_ode", "run_linear_ode"),
-    "kot": ("src.training.kot", "run_kot"),
-    "kot_nodyn": ("src.training.kot", "run_kot"),
-    "kot_fixedkappa": ("src.training.kot", "run_kot"),
-    "kot_fixedalpha": ("src.training.kot", "run_kot"),
-    "kot_oracle": ("src.training.kot", "run_kot"),
-    "kot_oracle_learnalpha": ("src.training.kot", "run_kot"),
-    "kot_oracle_learnalpha_kappa": ("src.training.kot", "run_kot"),
-    "kot_unbounded": ("src.training.kot", "run_kot"),
-    "kot_unbounded_sn": ("src.training.kot", "run_kot"),
-    "kot_noanchor": ("src.training.kot", "run_kot"),
-}
-
-MODEL_EXTRAS = {
-    "kot": "kot",
-    "moscot": "baselines",
-    "glue": "baselines",
-    "totalvi": "baselines",
-}
-
 
 def load_model_runner(model_name: str):
     """Import a selected model backend without importing every optional stack."""
-    module_name, function_name = MODELS[model_name]
+    spec = MODELS[model_name]
     try:
-        module = importlib.import_module(module_name)
+        module = importlib.import_module(spec["module"])
     except ModuleNotFoundError as exc:
-        extra = MODEL_EXTRAS.get("kot" if model_name.startswith("kot") else model_name)
+        extra = extra_for(model_name)
         install_hint = (
             f" Install the optional dependencies with `pip install -e '.[{extra}]'`."
             if extra
@@ -111,135 +92,11 @@ def load_model_runner(model_name: str):
             f"Cannot load model '{model_name}' because dependency "
             f"'{exc.name}' is missing.{install_hint}"
         ) from exc
-    return getattr(module, function_name)
-
-# Per-model config overrides injected automatically at runtime
-MODEL_OVERRIDES = {
-    "kot_nodyn":       {"lambda_dyn": 0.0},
-    "kot_fixedkappa": {
-        "kot_fixed_kappa": 0.6931471805599453,   # κ fixed (mirror of fixedalpha's fixed α)
-        "kot_fixed_alpha": None,                  # α learned
-        "kot_alpha_min": 1.0e-3,                  # learned-α box mirrors fixedalpha's learned-κ box [1e-3, 1.5]
-        "kot_alpha_max": 1.5,
-        "lambda_kappa_prior": 0.0,                # κ is fixed → no prior pull
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,               # match fixedalpha (φ-side confound control)
-        "g_dims": [256, 128],
-    },
-    "kot_fixedalpha": {
-        "kot_fixed_alpha": 0.6931471805599453,
-        "kot_fixed_kappa": None,
-        "kot_kappa_min": 1.0e-3,
-        "kot_kappa_max": 1.5,
-        "kot_kappa_prior": 0.6931471805599453,
-        "lambda_kappa_prior": 0.01,
-        "kot_alpha_min": 1.0e-6,
-        "kot_alpha_max": None,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_oracle": {
-        "kot_fixed_alpha": 1.0,
-        "kot_fixed_kappa": 1.0,
-        "kot_fixed_beta": 0.5,
-        "kot_kappa_min": 1.0,
-        "kot_kappa_max": 1.0,
-        "use_anchor": False,
-        "kot_anchor_indices": [],
-        "kot_anchor_betas": [],
-        "lambda_prior": 0.0,
-        "lambda_kappa_prior": 0.0,
-        "kot_alpha_min": 1.0,
-        "kot_alpha_max": 1.0,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_oracle_learnalpha": {
-        "kot_fixed_alpha": None,
-        "kot_fixed_kappa": 1.0,
-        "kot_fixed_beta": 0.5,
-        "kot_kappa_min": 1.0,
-        "kot_kappa_max": 1.0,
-        "use_anchor": False,
-        "kot_anchor_indices": [],
-        "kot_anchor_betas": [],
-        "lambda_prior": 0.0,
-        "lambda_kappa_prior": 0.0,
-        "kot_alpha_min": 1.0e-3,
-        "kot_alpha_max": 1.5,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_oracle_learnalpha_kappa": {
-        "kot_fixed_alpha": None,
-        "kot_fixed_kappa": None,
-        "kot_fixed_beta": 0.5,
-        "kot_kappa_min": 1.0e-3,
-        "kot_kappa_max": 1.5,
-        "use_anchor": False,
-        "kot_anchor_indices": [],
-        "kot_anchor_betas": [],
-        "lambda_prior": 0.0,
-        "lambda_kappa_prior": 0.0,
-        "kot_alpha_min": 1.0e-3,
-        "kot_alpha_max": 1.5,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_unbounded": {
-        "kot_kappa_min": 1.0e-6,
-        "kot_kappa_max": None,
-        "kot_alpha_min": 1.0e-6,
-        "kot_alpha_max": None,
-        "lambda_kappa_prior": 0.0,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": False,
-        "g_dims": [256, 128],
-    },
-    "kot_unbounded_sn": {
-        "kot_kappa_min": 1.0e-6,
-        "kot_kappa_max": None,
-        "kot_alpha_min": 1.0e-6,
-        "kot_alpha_max": None,
-        "lambda_kappa_prior": 0.0,
-        "g_freeze_epochs": 0,
-        "phi_spectral_norm": True,
-        "g_dims": [256, 128],
-    },
-    # `kot` already runs WITH beta-anchors (use_anchor: true in defaults and in
-    # every dataset block), so an arm that only sets use_anchor=True is a no-op and
-    # produces bit-identical results — verified across 210 paired runs. The real
-    # ablation is the arm that turns anchors OFF.
-    "kot_noanchor": {
-        "use_anchor": False,
-        "kot_anchor_indices": [],
-        "kot_anchor_betas": [],
-        "beta_anchor_csv": None,
-        "lambda_prior": 0.0,
-    },
-}
-
-# Arms that were removed because their overrides changed nothing. Kept here so a
-# stale --models list fails with an explanation instead of silently duplicating.
-RETIRED_MODELS = {
-    "kot_anchor": (
-        "kot_anchor applied {'use_anchor': True}, which is already the default, so "
-        "it produced results bit-identical to `kot` in 210/210 paired runs. Use "
-        "`kot` for the anchored arm and `kot_noanchor` for the anchor-free ablation."
-    ),
-}
+    return getattr(module, spec["function"])
 
 
 def assert_override_is_effective(model_name: str, resolved: dict, overrides: dict) -> None:
-    """Fail loudly when a model's overrides do not change the resolved config.
-
-    A no-op override silently yields a duplicate arm. Two identical rows in an
-    ablation table read as fabricated data even when they are not, so this is
-    caught at launch rather than at review time.
+    """A no-op override is a duplicate arm; catch it at launch.
     """
     if not overrides:
         return
@@ -251,18 +108,10 @@ def assert_override_is_effective(model_name: str, resolved: dict, overrides: dic
             f"base model. Either give it a real override or remove it from --models."
         )
 
-# Name of the staged synthetic dataset that --stage / --scale apply to.
 STAGED_DATASET = "synthetic_linked_ode"
 
-# KOT feature layers for the staged synthetic dataset.
-#
-# Only `mean` is supported: it is the native state the linked ODE is generated
-# in, so the kinetics term is correctly specified there. A log1p scale was
-# removed rather than left as an option — under log1p the ODE picks up a
-# 1/(1+p) factor the kinetics loss does not model, so its residual can never
-# reach zero by being correct and the only route downhill is shrinking phi.
-# Every log run collapsed (phi variance ratio ~0.20 against ~0.81 on mean) and
-# landed at chance.
+# Only `mean`: log1p adds a 1/(1+p) factor the kinetics loss does not model,
+# so the residual cannot reach zero by being correct and every log run collapsed.
 SCALE_LAYERS = {
     "mean": {
         "kot_rna_layer":     "spliced_mean",
@@ -270,10 +119,6 @@ SCALE_LAYERS = {
         "velocity_layer":    "true_velocity_mean",
     },
 }
-
-# Baselines whose likelihood needs integer counts; the noise-free oracle stage has none.
-COUNT_MODELS = {"glue", "totalvi"}
-
 
 def get_repr(adata, obsm_key: str, label: str) -> np.ndarray:
     if adata is None:
@@ -303,10 +148,7 @@ def json_ready_value(value):
     return value
 
 
-# The columns a sweep is actually read on: what was configured, what came out, and
-# whether the run is usable at all. Everything else stays in diagnostics.json — this is
-# the short list you can hold in your head, not a second copy of the diagnostics.
-# Baselines leave the KOT-only columns empty rather than being given a separate shape.
+# Sweep-readable columns. Everything else stays in diagnostics.json.
 SUMMARY_CONFIG_KEYS = [
     "lambda_dyn", "lambda_prior", "lambda_kappa_prior", "kot_kappa_prior",
     "lr", "lr_phi", "lr_alpha_kappa", "lr_beta",
@@ -321,8 +163,7 @@ SUMMARY_CONFIG_KEYS = [
     "fit_obs_key", "save_prediction_cells",
 ]
 SUMMARY_METRIC_KEYS = [
-    # val_foscttm is the held-out number a search is chosen on; mean_foscttm is the
-    # reported one, measured on cells the run trained on. Both, always, side by side.
+    # Rank on val_foscttm (held-out). mean_foscttm is in-sample — both always written.
     "mean_foscttm", "val_foscttm", "val_foscttm_in_full_pool", "val_holdout",
     "train_foscttm", "train_n_cells", "val_n_cells",
     "runtime_seconds",
@@ -332,18 +173,15 @@ SUMMARY_METRIC_KEYS = [
     "grad_norm_median",
     "best_align", "best_align_epoch", "best_val_align", "best_val_align_epoch",
     "best_total", "stop_epoch",
+    "n_train_cells", "n_held_out_cells", "n_reported_cells",
+    "protocol_oos_mode", "protocol_out_of_distribution", "protocol_paired_oracle",
+    "protocol_predictor", "protocol_n_fit_cells",
 ]
 
 
 def merged_diagnostics(output_dir: Path, diagnostics: dict) -> dict:
-    """The complete metric set for this arm, which only exists on disk.
-
-    run_kot writes its own diagnostics.json before returning and hands back a 3-tuple
-    with no diagnostics dict, so split_model_result yields {} and the in-memory dict
-    here holds ONLY what the runner added: dataset, model, seed, runtime, FOSCTTM.
-    save_diagnostics has already merged the two into the file, so reading it back is
-    what stops summary.txt, run_row.csv and the flag from being computed on a fifth of
-    the metrics -- a run whose cosine says dyn-dead was being labelled "ok".
+    """Read the file back: run_kot's dict never returns to the runner, so the
+    in-memory copy lacks cosine/flags and a dyn-dead run was labelled "ok".
     """
     on_disk = json.loads((output_dir / "diagnostics.json").read_text())
     return {**on_disk, **diagnostics}
@@ -351,19 +189,15 @@ def merged_diagnostics(output_dir: Path, diagnostics: dict) -> dict:
 
 def summary_record(name: str, model_name: str, run_seed, run_cfg: dict,
                    diagnostics: dict, output_dir: Path) -> dict:
-    """One flat record per finished arm: identity, config, metrics, verdict.
-
-    `flag` is the point of writing this at all. A dyn-dead or collapsed run still
-    produces a FOSCTTM that ranks perfectly respectably, so the verdict has to travel
-    WITH the run — by the time a sweep is being read as a table, nobody re-derives it.
+    """`flag` has to travel with the row: a dyn-dead run still produces a
+    respectable FOSCTTM, and a sweep table will not re-derive the verdict.
     """
     record = {
         "dataset": name,
         "model": model_name,
         "seed": "-" if run_seed is None else int(run_seed),
         "run_dir": str(output_dir),
-        # "ok" rather than "" so a healthy run says so out loud: an absent flag line
-        # would be indistinguishable from a summary written before flags existed.
+        # "ok" not "": an empty flag is indistinguishable from a pre-flag summary.
         "flag": run_flags(diagnostics) or "ok",
     }
     record.update({key: diagnostics.get(key) for key in SUMMARY_METRIC_KEYS})
@@ -372,19 +206,8 @@ def summary_record(name: str, model_name: str, run_seed, run_cfg: dict,
 
 
 def save_summary(output_dir: Path, record: dict, provenance: dict) -> None:
-    """summary.txt to read, run_row.csv to concatenate — the same run, two shapes.
-
-    run_row.csv carries `record` ONLY, so every arm writes the identical column set and
-    a directory of them concatenates without aligning headers:
-
-        head -1 <any>/run_row.csv; tail -qn +2 cache/training/*/*/*/*/run_row.csv
-
-    Provenance (which representation, which modality pair, baseline-specific fields)
-    varies per model, so it goes to summary.txt alone rather than making the CSV ragged.
-
-    summary.txt stays the resume marker — run_one skips any arm that has one — so it is
-    written LAST: a crash between the two leaves the arm looking unfinished and it gets
-    retried, rather than looking finished with half a row on disk.
+    """Write run_row.csv first, summary.txt last: the latter is the resume
+    marker, so a crash between them retries rather than looking finished.
     """
     with open(output_dir / "run_row.csv", "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(record))
@@ -397,7 +220,7 @@ def save_summary(output_dir: Path, record: dict, provenance: dict) -> None:
         for key, value in lines.items():
             if value is None or value == "":
                 continue
-            # %g, not a fixed 6 decimals: `lambda_dyn: 1000` reads, `1000.000000` does not.
+            # %g so `lambda_dyn: 1000` not `1000.000000`.
             text = f"{value:g}" if isinstance(value, float) else str(value)
             handle.write(f"{key + ':':{width}}{text}\n")
 
@@ -433,11 +256,6 @@ def split_model_result(result):
     return aligned, coupling, loss_df, diagnostics
 
 
-# O(n²) OT baselines that cannot solve the full 90k-cell problem. When
-# align_batch_key is set they are run within each biological batch instead.
-BATCH_SPLIT_MODELS = {"scot", "moscot", "linear_ode"}
-
-
 def aggregate_batch_diagnostics(batch_diags: list[dict]) -> dict:
     """Mean of the numeric diagnostics across per-batch runs."""
     out = {}
@@ -451,7 +269,8 @@ def aggregate_batch_diagnostics(batch_diags: list[dict]) -> dict:
 
 
 def run_alignment_per_batch(align_fn, x, y, rna_adata, second_adata,
-                            second_label, modality_pair, run_cfg, batch_labels, output_dir):
+                            second_label, modality_pair, run_cfg, batch_labels, output_dir,
+                            fit_rows=None):
     """
     Run an alignment adapter independently within each batch and reassemble.
 
@@ -459,36 +278,52 @@ def run_alignment_per_batch(align_fn, x, y, rna_adata, second_adata,
     batches would be meaningless) and returned as one per-cell array in the
     original cell order. Coupling / loss traces are not combined across batches
     (adapter trace files reflect the last batch).
+
+    `fit_rows` restricts the second modality WITHIN each batch, so the holdout survives
+    the split: a batch's knockout cells keep their RNA and lose their protein, exactly as
+    in the single-shot path. FOSCTTM is then only defined on a batch's fitted cells.
     """
     n = x.shape[0]
+    fit_mask = np.zeros(n, dtype=bool)
+    fit_mask[np.arange(n) if fit_rows is None else fit_rows] = True
     aligned_rna = None
     aligned_second = None
-    foscttm = np.empty(n, dtype=np.float64)
+    foscttm = np.full(n, np.nan, dtype=np.float64)
     batch_diags = []
 
     for b in np.unique(batch_labels):
         idx = np.where(batch_labels == b)[0]
+        fit_idx = idx[fit_mask[idx]]
+        if fit_idx.size == 0:
+            raise ValueError(
+                f"batch {b} has {len(idx)} cells and none of them are fitted; a batch with "
+                "no second-modality cells cannot be aligned. Drop the batch or widen "
+                "fit_obs_values."
+            )
         sub_context = build_context(
-            x[idx], y[idx], rna_adata[idx].copy(), second_adata[idx].copy(),
+            x[idx], y[fit_idx], rna_adata[idx].copy(), second_adata[fit_idx].copy(),
             second_label, modality_pair,
         )
         sub_context["output_dir"] = output_dir
+        # Positions of the fitted cells WITHIN this batch, which is what a model needs to
+        # pair x against y (the context's x is the batch, not the whole dataset).
+        sub_context["fit_rows"] = np.nonzero(fit_mask[idx])[0]
         aligned_b, _, _, diag_b = split_model_result(align_fn(sub_context, run_cfg))
         rb = np.asarray(aligned_b[0], dtype=np.float32)
         pb = np.asarray(aligned_b[1], dtype=np.float32)
         if aligned_rna is None:
             aligned_rna = np.zeros((n, rb.shape[1]), dtype=np.float32)
-            aligned_second = np.zeros((n, pb.shape[1]), dtype=np.float32)
+            aligned_second = np.full((n, pb.shape[1]), np.nan, dtype=np.float32)
         aligned_rna[idx] = rb
-        aligned_second[idx] = pb
-        if len(idx) < 2:
-            foscttm[idx] = np.nan
-            print(f"    [batch {b}] 1 cell | FOSCTTM undefined; recording NaN")
-        else:
-            foscttm[idx] = np.asarray(calc_domainAveraged_FOSCTTM(rb, pb))
+        aligned_second[fit_idx] = pb
         batch_diags.append(diag_b)
-        if len(idx) >= 2:
-            print(f"    [batch {b}] {len(idx)} cells | FOSCTTM={foscttm[idx].mean():.4f}")
+        if fit_idx.size < 2:
+            print(f"    [batch {b}] {fit_idx.size} fitted cell | FOSCTTM undefined; NaN")
+        else:
+            foscttm[fit_idx] = np.asarray(
+                calc_domainAveraged_FOSCTTM(rb[fit_mask[idx]], pb))
+            print(f"    [batch {b}] {len(idx)} cells ({fit_idx.size} fitted) | "
+                  f"FOSCTTM={np.nanmean(foscttm[fit_idx]):.4f}")
 
     return [aligned_rna, aligned_second], foscttm.tolist(), aggregate_batch_diagnostics(batch_diags)
 
@@ -641,6 +476,19 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
     context = build_context(x, y, rna_adata, second_adata, second_label, modality_pair)
     context["output_dir"] = output_dir
 
+    # Enforced here for every model. Restricting only KOT used to put OOD KOT next to
+    # in-distribution baselines in one table. Modes: src/evaluation/protocol.py.
+    requested_rows = fitted_row_indices(rna_adata.obs, run_cfg, run_seed)
+    fit_rows, oos_mode = plan_fit_restriction(run_cfg, model_name, requested_rows,
+                                              second_label)
+    if requested_rows is not None and fit_rows is None:
+        print(f"[{model_name}] PAIRED ORACLE: ignores the fit restriction and reads "
+              f"{second_label} for every cell. Stamped in-distribution.")
+    if fit_rows is not None and oos_mode == HOLDOUT_SECOND:
+        context = restrict_second_modality(context, fit_rows)
+        print(f"[{model_name}] {oos_mode}: {second_label} restricted to the "
+              f"{len(fit_rows)} fitted cells; RNA side keeps all {x.shape[0]}")
+
     align_fn = load_model_runner(model_name)
     batch_key = run_cfg.get("align_batch_key")
     per_batch = (
@@ -656,11 +504,16 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
         aligned, batch_foscttm, diagnostics = run_alignment_per_batch(
             align_fn, x, y, rna_adata, second_adata, second_label, modality_pair,
             run_cfg, batch_labels, output_dir,
+            fit_rows=fit_rows if oos_mode == HOLDOUT_SECOND else None,
         )
         coupling, loss_df = None, None
     else:
         aligned, coupling, loss_df, diagnostics = split_model_result(align_fn(context, run_cfg))
         batch_foscttm = None
+        # holdout_second returns fitted cells only; scatter back to full cell index.
+        if fit_rows is not None and oos_mode == HOLDOUT_SECOND:
+            aligned = [aligned[0], scatter_rows(np.asarray(aligned[1]), fit_rows,
+                                                x.shape[0])]
     runtime_seconds = time.perf_counter() - start_time
     diagnostics = {
         "dataset": name,
@@ -673,18 +526,10 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
 
     result_name = f"{name}_{run_label}" if run_label is not None else name
 
-    # The benchmark FOSCTTM is scored on the cells this run FITTED, matching what the
-    # KOT diagnostics report. Without this, diagnostics.json and comparison_*.csv carry
-    # two different mean_foscttm values for the same run -- one over the fitted subset,
-    # one over every cell -- and the second silently uses held-out proteins as
-    # distractors for fitted cells. Applied here rather than inside a model so every
-    # model, KOT and baselines alike, is scored on the same cells.
-    #
-    # CRISPR OOD (save_prediction_cells=all) is the exception for the prediction
-    # h5ad: φ must be stored on held-out knockout cells so the perturbation
-    # benchmark can score them. FOSCTTM stays on the fitted cells.
+    # FOSCTTM on fitted cells only, so held-out proteins cannot act as distractors.
+    # save_prediction_cells=all still writes φ on knockouts for the perturbation benchmark.
     aligned_full = [np.asarray(part) for part in aligned]
-    eval_rows = fitted_row_indices(rna_adata.obs, run_cfg, run_seed)
+    eval_rows = fit_rows  # same rows as the restriction; a paired oracle has fit_rows=None
     eval_obs_names = rna_adata.obs_names
     aligned_eval = aligned_full
     if eval_rows is not None:
@@ -694,6 +539,9 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
             batch_foscttm = np.asarray(batch_foscttm)[eval_rows]
         print(f"[{result_name}] benchmark FOSCTTM on the {len(eval_rows)} fitted cells")
 
+    stamp = protocol_stamp(run_cfg, model_name, aligned_full[0].shape[0], fit_rows)
+    diagnostics.update({f"protocol_{key}": value for key, value in stamp.items()
+                        if not isinstance(value, list)})
     save_prediction = bool(run_cfg.get("save_prediction_h5ad", True))
     save_all_cells = str(run_cfg.get("save_prediction_cells", "fitted")) == "all"
     mean_foscttm = evaluate_and_save(
@@ -702,6 +550,7 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
         obs_names=eval_obs_names,
         foscttm_scores=batch_foscttm,
         save_prediction=save_prediction and not save_all_cells,
+        protocol=stamp,
     )
     if save_prediction and save_all_cells:
         n_all = aligned_full[0].shape[0]
@@ -710,6 +559,7 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
             [float("nan")] * n_all,
             mean_foscttm,
             result_name, model_name, second_label, rna_adata.obs_names,
+            protocol=stamp,
         )
         print(f"[{result_name}] prediction h5ad keeps all {n_all} cells "
               f"({0 if eval_rows is None else n_all - len(eval_rows)} held out of the loss)")
@@ -805,35 +655,26 @@ def train_all_datasets(
             f"Check for typos; known keys include: {sorted(known_keys)}"
         )
 
-    # --datasets restricts the run to a comma-separated subset of the config's
-    # `datasets:` section (which otherwise trains every dataset listed there).
     selected_datasets = (
         set(name.strip() for name in datasets_filter.split(",")) if datasets_filter else None
     )
 
-    # Resolve which models to run: --models (group name or comma-list) if given,
-    # else the config's default_models group. Overrides any per-dataset model list.
     model_groups = train_cfg.get("model_groups", {})
     models_spec = models if models is not None else train_cfg.get("default_models")
     selected_models = (
         resolve_models(models_spec, model_groups) if models_spec is not None else None
     )
 
-    # Fresh run → new timestamped dir. Resume (--run-dir) → reuse the existing dir;
-    # run_one then skips any (model, seed) that already has a summary.txt.
+    # Resume reuses the dir; run_one skips arms that already have summary.txt.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_root = Path(defaults.get("output_root", "cache/training"))
     run_root = Path(run_dir) if run_dir is not None else base_root / f"run_{timestamp}"
     run_root.mkdir(parents=True, exist_ok=True)
     defaults["output_root"] = str(run_root)
 
-    # Snapshot config + log under names that don't clobber the original run when resuming.
     snapshot_name = f"training_resume_{timestamp}.yaml" if run_dir is not None else "training.yaml"
     log_name = f"run_resume_{timestamp}.log" if run_dir is not None else "run.log"
-    # Snapshot the ACTUAL config used, not the original file: train_cfg already carries
-    # the modified defaults (output_root), and cli_overrides record what --set changed.
-    # shutil.copy(config_path) would save the pre-override file — misleading for resumes
-    # and for reading back what a run actually used.
+    # Resolved config, not a copy of the file: shutil.copy would drop --set.
     config_snapshot = run_root / snapshot_name
     snapshot_cfg = dict(train_cfg)
     if cli_overrides:

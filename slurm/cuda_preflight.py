@@ -1,32 +1,6 @@
-"""
-Refuse to start work on an allocation whose CUDA is broken.
-
-The failure this exists for looks healthy from the outside: nvidia-smi lists every
-B200 with full free memory (NVML needs no CUDA context), while every process that
-tries to initialize CUDA fails. Job 4206192 lost all 16 arms to it, four on each of
-the four GPUs. A launcher that discovers this per-job discovers it 16 times and
-still burns the allocation, so the check belongs before the first job starts.
-
-Exit codes are the contract with the calling SLURM script:
-
-  0   usable
-  42  container/driver mismatch (B200 needs a CUDA 12.8+ torch) -- NOT requeueable,
-      another allocation has the same container and would fail identically
-  44  CUDA reports unavailable, or fewer devices than the allocation should have
-  45  CUDA raised while initializing or allocating
-
-44 and 45 are the requeueable ones: they describe this allocation, not this code.
-
-Every visible device is smoke-allocated, not just device 0: slurm/parallel_train.sh
-pins jobs round-robin across the GPUs, so a single wedged card would otherwise be
-found only by the jobs unlucky enough to land on it.
-
-A partly-broken allocation is USED, not thrown back. Only the devices that fail their
-smoke allocation are dropped, and --emit-usable writes the survivors for the launcher
-to round-robin over; the requeue verdict is reserved for an allocation with nothing
-usable at all. Error 802 is node-level and takes every GPU with it, but a card lost to
-ECC, an exclusive-mode holder, or a bus fall-off takes only itself, and giving back
-three good B200s over one bad one is not a trade worth making.
+"""Refuse to start on a broken CUDA allocation. nvidia-smi can look healthy
+while every CUDA init fails. Exit 42 is the container (do not requeue); 44/45
+are this node. Smoke-test every GPU; drop only the bad ones.
 """
 
 from __future__ import annotations

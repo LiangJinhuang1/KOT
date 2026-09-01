@@ -1,15 +1,4 @@
-#!/usr/bin/env python
-"""Emit the Figure 1a method schematic as an editable SVG.
-
-Written as SVG rather than plotted: box-and-arrow diagrams fight matplotlib, and
-the output needs to stay editable in Inkscape or Illustrator through revisions.
-Text is real text (not paths), so labels can be retyped downstream.
-
-Geometry, palette, and type sizes match the plotted panels so the schematic and
-the data figures read as one system.
-
-    PYTHONPATH=. python tools/make_schematic.py --out figures/fig1a_schematic.svg
-"""
+"""SVG, not matplotlib: box-and-arrow fights pyplot, and labels stay editable."""
 from __future__ import annotations
 
 import argparse

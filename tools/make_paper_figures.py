@@ -1,12 +1,5 @@
 #!/usr/bin/env python
-"""Assemble the main-text figures for the ICLR submission.
-
-Reusable panel code lives in src/visualization/; this script picks which runs
-feed which panel and lays them out. Run inside the project container:
-
-    singularity exec --pwd "$(pwd)" /data/common/images/codedev_v1.0.5.sif \
-      /bin/bash -lc 'PYTHONPATH=. MPLBACKEND=Agg python tools/make_paper_figures.py --out figures/'
-"""
+"""Pick which runs feed which panel. Panel code lives in src/visualization/."""
 from __future__ import annotations
 
 import argparse
@@ -422,10 +415,9 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
     """Controlled recovery on the synthetic linked-ODE system.
 
     Defaults to the `branch` stage: it carries the branching structure the
-    method is actually meant to handle, and it is the harder case
-    (median FOSCTTM 0.36 against 0.07 on the single-trajectory `clean`
-    stage). True kappa is constant by construction there, so panel d
-    shows the fitted spread against that constant rather than a scatter.
+    method is actually meant to handle, and it is the harder case. True kappa
+    is constant by construction there, so panel d shows the fitted spread
+    against that constant rather than a scatter.
     """
     apply_style()
     rng = np.random.default_rng(seed)

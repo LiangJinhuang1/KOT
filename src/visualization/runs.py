@@ -19,26 +19,21 @@ CACHE_DIR = Path("cache/training")
 PHI_COLLAPSE_THRESHOLD = 0.5
 
 
-# Below this JVP-RHS cosine the kinetics term is being carried but not fit. The
-# 20260824 tier-A sweep sets the value: healthy cells sat at 0.75-0.96 and dead ones at
-# 0.04-0.18 with nothing between, and BOTH scored the same FOSCTTM -- so a run can rank
-# first on alignment while its dynamics were never fitted at all.
+# Below this JVP-RHS cosine the kinetics term is carried but not fit.
+# Alignment can still look fine, so the flag has to travel with the run.
 DYN_COS_MIN = 0.5
 
 
 def read_diagnostics(path: str | Path) -> dict:
-    """The ``diagnostics.json`` a finished run wrote."""
     return json.loads(Path(path).read_text())
 
 
 def is_collapsed(diagnostics: dict) -> bool:
-    """Whether phi collapsed in this run — see :data:`PHI_COLLAPSE_THRESHOLD`."""
     ratio = diagnostics.get("phi_variance_ratio")
     return ratio is not None and ratio < PHI_COLLAPSE_THRESHOLD
 
 
 def is_dyn_dead(diagnostics: dict) -> bool:
-    """Whether the kinetics term was carried but never fitted — see :data:`DYN_COS_MIN`."""
     cos = diagnostics.get("jvp_rhs_cos_median")
     return cos is not None and cos < DYN_COS_MIN
 
@@ -74,16 +69,8 @@ def run_flags(diagnostics: dict) -> str:
 def curated_runs(cache_dir: str | Path = CACHE_DIR) -> dict[str, str]:
     """Run dirs the MANIFEST marks as kept, mapped to why each was kept.
 
-    ``cache/training`` was curated by hand on 2026-08-23: 35 runs renamed to
-    semantic names (``syn_branch_ablation``, ``bmmc_scvelo_kot``, ...) and 184
-    archived to ``cache/training_archive_20260823``. Those names record which run
-    belongs in which panel, so selection should follow the manifest rather than
-    infer intent from timestamps — picking by timestamp chose a lambda=1 sweep
-    where the branch ablation shows no effect (0.364 vs 0.374) over the curated
-    matched run where it separates 19-fold (0.020 vs 0.378).
-
-    Returns an empty mapping when no manifest exists, so callers fall back to
-    their own ordering.
+    Semantic names record which run belongs in which panel; timestamps do not.
+    Empty mapping when no manifest exists, so callers fall back to their own order.
     """
     manifest = Path(cache_dir) / "MANIFEST.json"
     if not manifest.exists():

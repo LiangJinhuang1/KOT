@@ -1,45 +1,7 @@
 #!/usr/bin/env python3
-"""
-Collect every training run into one tidy CSV: hyperparameters joined to metrics,
-one row per (run, model, dataset, seed, checkpoint).
-
-Referenced from src/training/kot.py; this is the sweep-reading counterpart to
-tools/evaluate_checkpoints.py (which re-runs evaluation). This one only reads what
-runs already wrote — diagnostics*.json plus the resolved run_config.yaml — so it is
-stdlib-only (json/yaml/csv) and runs on the login node without the container while a
-sweep is still going.
-
-Usage
------
-  python tools/collect_run_diagnostics.py                      # every run dir
-  python tools/collect_run_diagnostics.py --runs 'cache/training/run_20260824_*'
-  python tools/collect_run_diagnostics.py --aggregate          # mean±sd over seeds
-  python tools/collect_run_diagnostics.py --all-checkpoints    # + best_align/best_dyn/...
-  python tools/collect_run_diagnostics.py --hparams lambda_dyn,lr --all-diagnostics
-  python tools/collect_run_diagnostics.py --group-by lambda_dyn,lambda_kappa_prior
-
---group-by is the one to reach for on a sweep: it keys the table on the values a run was
-CONFIGURED with instead of the string its directory is named, so an axis becomes a
-sortable column rather than a substring like `lam1000_lkp0p1_kt0p69`. It also pools a
-sweep that was interrupted and resumed under a second stamp, and writes a small
-<out>_by_config.csv -- one row per cell -- next to the per-seed CSV.
-
-Sweeps are ranked on val_foscttm -- the held-out cells (src/data/splits.py) -- whenever
-the runs have one, because mean_foscttm is measured on the cells the run trained on and
-choosing hyperparameters by it is choosing them on the test set. Both columns are always
-printed; --rank-by overrides which one sorts.
-
-Since 2026-08-28 no run has one: kot.py builds DiagInputs with val_idx=None, so
-diagnostics are scoped to the fitted cells and mean_foscttm carries the old
-train_foscttm meaning. --rank-by auto resolves there; an explicit val_foscttm or
-train_foscttm warns and falls back instead of printing blanks.
-
-Cells are flagged (degenerate / collapsed / dyn-dead) because none of those failures is
-visible in the FOSCTTM ranking and one of them sorts first. A flagged cell is not a
-result no matter where it ranks.
-
-A run that crashed mid-arm still gets a row with status=missing_foscttm/no_diagnostics,
-so a silently lost sweep cell shows up instead of just being absent from the table.
+"""Read finished runs into one CSV (login node, no GPU). Rank on val_foscttm
+when it exists — mean_foscttm is in-sample. Flag dyn-dead/collapsed so they
+cannot win a FOSCTTM ranking. A crashed arm still gets a row.
 """
 from __future__ import annotations
 
@@ -93,9 +55,8 @@ DEFAULT_METRICS = [
     "branch_accuracy", "branch_accuracy_branched", "branch_n_branched",
     "loss_dyn", "loss_align", "loss_total",
     # traj_dtw_recon orders both trajectories by TRUE pseudotime; traj_dtw_temporal orders
-    # the prediction by its OWN pseudotime and so improves when that pseudotime collapses
-    # (nodyn scores 0.702 vs 0.841 with dynamics on, while time_spearman falls to -0.32).
-    # Carry both, and read recon.
+    # the prediction by its OWN pseudotime and so improves when that pseudotime
+    # collapses. Carry both, and read recon.
     "time_spearman", "time_mae", "traj_dtw_temporal", "traj_dtw_recon",
     "kappa_median", "alpha_median", "beta_mean", "beta_anchor_mean_abs_err",
     "alpha_frac_at_midpoint", "alpha_frac_near_ceiling", "alpha_frac_near_floor",
@@ -105,8 +66,8 @@ DEFAULT_METRICS = [
     "best_align", "best_align_epoch", "best_val_align", "best_val_align_epoch",
     "best_dyn", "best_dyn_epoch",
     "best_total", "best_total_epoch", "stop_epoch",
-    # Pre-clip gradient norm. It sits ~100-6000x above the fixed 1.0 budget, so the
-    # clip binds on every step and acts as a renormalizer rather than a spike guard.
+    # Pre-clip gradient norm. The clip binds every step and acts as a
+    # renormalizer rather than a spike guard.
     "grad_norm_median",
     # Gradient balance at the end of training (see run_kot). grad_mag_ratio_late is the
     # align-vs-dynamics split of each clipped step; grad_cos_late is the angle between
@@ -124,10 +85,9 @@ AGGREGATE_METRICS = [
     # how well a typical cell fits.
     "jvp_rhs_cos_median",
     "rel_residual_median", "time_spearman",
-    # Trajectory shape. recon only: traj_dtw_temporal orders the prediction by its OWN
-    # pseudotime, so a run whose pseudotime collapses scores BETTER on it (nodyn 0.702 vs
-    # 0.841 with dynamics on, while time_spearman falls to -0.32). recon orders both sides
-    # by true pseudotime and cannot be gamed that way.
+    # Trajectory shape. recon only: traj_dtw_temporal orders the prediction by its
+    # OWN pseudotime, so a collapsed pseudotime scores better on it. recon orders
+    # both sides by true time and cannot be gamed that way.
     "traj_dtw_recon",
     "train_foscttm", "train_n_cells", "val_n_cells",
     "phi_variance_ratio", "kappa_median", "alpha_median", "beta_mean",
@@ -145,9 +105,8 @@ AGGREGATE_METRICS = [
 # property that lets it run on the login node without the container. Change both.
 PHI_COLLAPSE_THRESHOLD = 0.5
 
-# Below this JVP·RHS cosine the kinetics term is being carried but not fit. Bimodality
-# in the 20260824 tier-A sweep sets the value: healthy cells sat at 0.75-0.96 and dead
-# ones at 0.04-0.18, with nothing in between, and BOTH scored the same FOSCTTM.
+# Below this JVP·RHS cosine the kinetics term is carried but not fit.
+# Alignment can still look fine, so the flag has to travel with the run.
 DYN_COS_MIN = 0.5
 
 # Any one of these marks a directory as a real training arm rather than a
@@ -168,9 +127,7 @@ def arm_dirs(run_dir: Path) -> list[tuple[Path, str, str, str]]:
 
     Stochastic models write run/model/dataset/seed_N; the deterministic baselines
     (scot, moscot, linear_ode) have no seed level and write straight into
-    run/model/dataset. Matching only seed_* dropped those arms from the table
-    entirely — 9 whole run dirs and 18 diagnostics.json files as of 2026-08-24 —
-    which is the opposite of what this tool is for.
+    run/model/dataset. Matching only seed_* dropped those arms from the table.
     """
     arms = []
     for dataset_dir in sorted(run_dir.glob("*/*")):
@@ -268,10 +225,8 @@ def cell_flag(record: dict, dyn_cos_min: float) -> str:
                  sorts FIRST, so a ranking alone presents it as the winner.
     collapsed -- phi shrank instead of the ODE being satisfied. The kinetics residual
                  is scale-degenerate, so this lowers the loss without fitting anything.
-    dyn-dead  -- the JVP-RHS cosine never rose: the kinetics term is carried but not
-                 fit. In the 20260824 tier-A sweep every lambda_dyn block contained one
-                 kappa-prior cell at cos < 0.2 scoring the SAME FOSCTTM as its cos > 0.9
-                 neighbour, so ranking on FOSCTTM alone picks these at random.
+    dyn-dead  -- the JVP-RHS cosine never rose: the kinetics term is carried but
+                 not fit. Ranking on FOSCTTM alone picks these at random.
     """
     flags = []
     score = record.get("mean_foscttm_mean")
@@ -384,17 +339,12 @@ def paired_deltas(rows: list[dict], checkpoint: str, group_by: list[str],
                   baseline: dict[str, str], rank_by: str) -> list[dict]:
     """One record per (dataset, config cell): its per-seed change against the baseline.
 
-    Paired, not pooled. Seeds are the dominant variance component in these sweeps --
-    on real CITE-seq the seed sd is the same size as the gaps between configs -- so
-    ranking cells by mean±sd throws away the fact that every cell ran the SAME four
-    seeds. Differencing within a seed removes that shared component, which is most of
-    what lets a 4-seed sweep resolve anything at all. `win` counts the seeds that moved
-    the right way: 4/4 with a small mean beats 3/4 with a large one, because the second
-    is usually one seed carrying the whole effect.
+    Paired, not pooled. Seed variance can be as large as the gaps between
+    configs, so ranking cells by mean±sd throws away that every cell ran the
+    SAME seeds. Differencing within a seed removes that shared component.
 
-    Datasets stay SEPARATE rows rather than being pooled into one delta. Pooling would
-    average a config that helps PBMC and hurts BMMC into a flat zero, and disagreement
-    between the two is a result -- it is the reason the sweep runs both.
+    Datasets stay SEPARATE rows rather than being pooled into one delta. Pooling
+    can cancel opposite effects on two datasets into a flat zero.
     """
     # The baseline must pin EVERY group-by key. An unpinned key would leave the
     # baseline cell under-determined -- there is no single row to difference against --
@@ -570,9 +520,8 @@ def print_aggregate(records: list[dict], key_columns: list[str], rank_by: str) -
     """Ranked table, one row per config cell. Column widths follow the content.
 
     Widths are computed rather than fixed: a sweep's run dirs share a long
-    run_<stamp>_sw<tier>_<dataset>_ prefix and differ only at the END, so the previous
-    fixed 44-char column truncated exactly the part being compared -- the 20260824
-    tier-A table printed 25 pbmc cells as five identical-looking names.
+    run_<stamp> prefix and differ only at the END, so a fixed-width column
+    truncates exactly the part being compared.
     """
     widths = {
         col: max(len(col), max(len(format_cell(r.get(col))) for r in records)) + 2

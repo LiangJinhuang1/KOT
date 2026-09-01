@@ -15,12 +15,7 @@ def linear_ode_device(cfg: dict) -> torch.device:
 
 def sinkhorn_coupling(x: np.ndarray, y: np.ndarray, reg: float = 0.1,
                       n_iter: int = 100, device: torch.device | None = None) -> np.ndarray:
-    """Entropic-OT coupling between x and y, on `device` (GPU when available).
-
-    The cost is ||x_i-y_j||² = ||x_i||²+||y_j||²-2 x_i·y_j, computed directly as an (n, m)
-    matrix without the (n, m, d) broadcast that would allocate terabytes for large n. On a
-    B200 the n×n Sinkhorn iterations are trivial even at ~90k cells.
-    """
+    """Cost as ||x||²+||y||²−2x·y, not an (n,m,d) broadcast (that is terabytes at large n)."""
     device = device if device is not None else torch.device("cpu")
     xt = torch.as_tensor(np.asarray(x), dtype=torch.float32, device=device)
     yt = torch.as_tensor(np.asarray(y), dtype=torch.float32, device=device)
@@ -94,20 +89,27 @@ def run_linear_ode(context: dict, cfg: dict) -> tuple[list, np.ndarray]:
     x_norm = normalize(x, norm="l2")
     y_norm = normalize(y, norm="l2")
 
-    # The Sinkhorn coupling is O(n²); estimate W on a capped SUBSAMPLE (sinkhorn_max_points,
-    # the same cap KOT uses), then apply the tiny (D_p×D_r) map W to ALL cells. Paired
-    # RNA/protein use the same indices so pairing is preserved. Datasets below the cap (e.g.
-    # pbmc) run in full; None = no cap.
-    max_points = cfg.get("sinkhorn_max_points")
+    # Row i of y is cell fit_rows[i] of x: under a fit restriction the protein side holds
+    # only the fitted cells while the RNA side keeps all of them (src/evaluation/protocol.py).
+    # W is estimated on those cells and then applied to every cell, which is what makes
+    # linear_ode able to predict a held-out cell at all.
+    fit_rows = context.get("fit_rows")
     n_full = x_norm.shape[0]
-    if max_points is not None and n_full > int(max_points):
+    paired_rows = np.arange(n_full) if fit_rows is None else np.asarray(fit_rows)
+
+    # The Sinkhorn coupling is O(n²); estimate W on a capped SUBSAMPLE (sinkhorn_max_points,
+    # the same cap KOT uses), then apply the tiny (D_p×D_r) map W to ALL cells. Datasets
+    # below the cap (e.g. pbmc) run in full; None = no cap.
+    max_points = cfg.get("sinkhorn_max_points")
+    if max_points is not None and len(paired_rows) > int(max_points):
         rng = np.random.default_rng(int(cfg.get("seed", 42)))
-        sub = rng.choice(n_full, size=int(max_points), replace=False)
-        print(f"[linear_ode] estimating W on {int(max_points)}/{n_full} sampled cells for the "
-              f"O(n²) OT (device={device})")
+        pick = rng.choice(len(paired_rows), size=int(max_points), replace=False)
+        print(f"[linear_ode] estimating W on {int(max_points)}/{len(paired_rows)} sampled "
+              f"paired cells for the O(n²) OT (device={device})")
     else:
-        sub = np.arange(n_full)
-    xs, ys, Vs = x_norm[sub], y_norm[sub], V[sub]
+        pick = np.arange(len(paired_rows))
+    xs, Vs = x_norm[paired_rows[pick]], V[paired_rows[pick]]
+    ys = y_norm[pick]
 
     # ALS on the subsample: alternate soft-matching (Sinkhorn OT) with the ODE least-squares.
     # Start from uniform coupling; after the first step W maps RNA → protein space and later

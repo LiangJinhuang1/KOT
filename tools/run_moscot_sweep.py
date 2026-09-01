@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""
-Run the MOSCOT epsilon/max_iterations grid on the staged synthetic experiment.
-
-Example:
-    python tools/run_moscot_sweep.py --stage clean --scale mean
-"""
+"""MOSCOT epsilon/max_iterations grid on one staged synthetic, not the full runner."""
 
 from __future__ import annotations
 

@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""
-Reorganize cache/training/run_* into analysis/<batch>/runs/<stage>/<run_name>/.
-
-Default layout:
-  analysis/jul2026/
-    runs/
-      clean/run_20260701_141322/   -> symlink to cache/training/...
-      oracle/...
-      branch/...
-
-Usage:
-    python tools/organize_training_runs.py
-    python tools/organize_training_runs.py --output analysis/jul2026/runs --copy
-"""
+"""Symlink finished run_* dirs into analysis batches. Default is links, not copies."""
 
 from __future__ import annotations
 

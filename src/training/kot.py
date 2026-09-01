@@ -31,7 +31,12 @@ from src.losses.jvp_physics import kinetics_loss
 from src.data.projection import projection_matrix_from_adatas
 from src.data.adt_gene_map import load_mapping_records
 from src.data.beta_anchor import resolve_beta_anchors
-from src.data.splits import held_out_mask, resolve_split_seed, split_digest
+from src.data.splits import (
+    held_out_mask,
+    reported_slice_mask,
+    resolve_split_seed,
+    split_digest,
+)
 from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
 from src.evaluation.trajectory_dtw import trajectory_dtw
 from src.visualization import FOSCTTM_CHANCE, METHOD_COLORS, MODALITY_COLORS
@@ -415,31 +420,14 @@ def resolve_velocity_ablation(cfg: dict) -> str:
 
 def apply_velocity_ablation(velocity: np.ndarray, confidence: np.ndarray | None,
                             cfg: dict) -> tuple[np.ndarray, np.ndarray | None]:
-    """The kinetics-term control: the real velocity field, or one piece of it broken.
+    """Break one piece of L_dyn; everything else in the run stays identical.
 
-    Each arm removes one kind of information from L_dyn and leaves everything else in
-    the run identical, so a gap against the real arm names what the kinetics term was
-    using rather than just showing that it matters:
+      shuffle  another cell's real v (confidence rides the shuffle so weight
+               and vector stay coupled)
+      reverse  v → −v (arrow of time only)
+      zero     v → 0, residual is the static half of the ODE
 
-      shuffle  every cell gets ANOTHER cell's real velocity. Keeps the vectors, their
-               per-cell norms (so the gauge below is unchanged) and the gene-gene
-               structure; destroys only which cell each velocity belongs to.
-      reverse  v -> -v. Keeps every norm, the gauge and the cell correspondence;
-               destroys only the arrow of time, so J_phi.v runs back down the
-               trajectory while its magnitude still matches the RHS.
-      zero     v -> 0, hence J_phi.v = 0 exactly. The residual keeps only the state
-               relation kappa(alpha*Sr - beta*phi), which is what isolates how much of
-               the alignment comes from the static half of the ODE.
-
-    The confidence rides the shuffle: it grades that cell's own velocity fit, so leaving
-    it behind would decouple the weight from the vector it weights and make the two arms
-    differ in two ways rather than one. reverse and zero move nothing between cells, so
-    it stays where it is. `confidence` is None for callers that only need to rebuild the
-    velocity -- checkpoint re-evaluation reports physics, which never weights by it.
-
-    The printed line is the audit trail that the control actually fired, and the only
-    honest one -- the JVP-RHS cosine cannot serve as that check, because the ODE
-    right-hand side contains no v.
+    Print is the audit trail: JVP-RHS cosine cannot be, the RHS contains no v.
     """
     ablation = resolve_velocity_ablation(cfg)
     corrupt = float(cfg.get("kot_velocity_corrupt", 0.0))
@@ -489,34 +477,11 @@ def median_norm_ratio(reference: np.ndarray, candidate: np.ndarray) -> float:
 
 def corrupt_velocity(velocity: np.ndarray, confidence: np.ndarray | None, fraction: float,
                      seed: int) -> tuple[np.ndarray, np.ndarray | None]:
-    """Mix a cell's own velocity with another cell's: (1-x)*v + x*v[perm].
-
-    The dose-response version of the shuffle. x=0 returns the real field and x=1 returns
-    exactly the shuffle arm -- same permutation, same seed -- so the endpoints ARE the two
-    arms already run and only the interior is new. That is what makes the curve readable
-    as one axis rather than five unrelated runs.
-
-    The confidence is interpolated on the same x. It grades the cell's own velocity fit,
-    so at x it is grading a vector that is x of the way to someone else's; blending it
-    keeps the weight matched to the vector it weights, and makes x=1 reproduce the shuffle
-    arm's confidence rather than jumping to it.
-
-    The raw mixture is NOT norm-preserving: v and v[perm] are near-independent, so its
-    length follows sqrt((1-x)^2 + x^2) -- 1.00 at x=0, ~0.71 at x=0.5, 1.00 at x=1. The
-    interior arms would then carry shorter velocity as well as more wrongly directed
-    velocity, and a FOSCTTM dip at x=0.5 could be either. So the mixture is rescaled by one
-    scalar per arm, restoring its median per-cell norm to the field it came from.
-
-    That scalar is exactly 1.0 at both endpoints and so cannot disturb them: at x=0 the
-    mixture IS v, and at x=1 it is v[perm], whose per-cell norms are a permutation of v's
-    and therefore share its median. The endpoint identities with the real and shuffle arms
-    survive bit-for-bit, and only the interior is corrected.
-
-    This is deliberately not the velocity gauge. The gauge is a global setting that also
-    rescales the real arm, and on the synthetic stage it amplifies a small true velocity
-    until dyn overpowers align (branch accuracy falls to chance while the JVP cosine rises
-    -- measured, see jobs_synth_gauge_pilot.txt). This scalar only ever touches a corrupted
-    arm, and leaves every other arm exactly as it was.
+    """x=0/1 are the real and shuffle arms (same perm, same seed). Rescale the
+    mixture's median norm: without it, x=0.5 is shorter by ~√2 as well as
+    wrongly directed, so a FOSCTTM dip is unreadable. Not the global velocity
+    gauge — that also rescales the real arm and on synthetic collapsed branch
+    accuracy (jobs/jobs_synth_gauge_pilot.txt).
     """
     perm = velocity_row_permutation(velocity.shape[0], seed)
     mixed = (1.0 - fraction) * velocity + fraction * velocity[perm]
@@ -713,8 +678,8 @@ def bounded_head_saturation(values: np.ndarray, min_value: float | None,
     The head is min + span·sigmoid(raw), so an output whose pre-activation never moved off
     zero sits exactly at the midpoint, and the sigmoid gradient vanishes at both ends. Mass
     at the midpoint means those entries are still at init; mass at an edge means the bound,
-    not the data, is setting them. Reported because `alpha_max` is one extreme of ~10^5
-    entries and says nothing about the bulk. Empty for an unbounded (softplus) head.
+    not the data, is setting them. Reported because a single scalar bound says
+    nothing about the bulk. Empty for an unbounded (softplus) head.
     """
     if max_value is None or min_value is None:
         return {}
@@ -802,13 +767,7 @@ def jvp_diag_keys() -> list[str]:
 
 
 def velocity_norm_diagnostics(v_eff) -> dict:
-    """‖v_eff‖ per cell, plus the fraction of cells that carry any velocity at all.
-
-    v_eff is the exact vector pushed through the Jacobian, after the RNA-side weight has
-    zeroed the genes without a usable fit. A cell whose every kept gene is zero contributes
-    a zero JVP and can only ever push the residual toward "the RHS should be zero too", so
-    the non-zero fraction says how much of the dataset the kinetic term can actually see.
-    """
+    """‖v_eff‖ after RNA-side zeros. A all-zero cell can only push the residual toward 0."""
     if isinstance(v_eff, torch.Tensor):
         norms = v_eff.norm(dim=1).detach().cpu().numpy()
     else:
@@ -886,27 +845,9 @@ def per_gene_cosine(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dict,
                                        velocity_weight: np.ndarray | None = None) -> dict:
-    """Per-cell cos(v_i from this run, v_i from a second velocity backend).
-
-    scVelo and RegVelo never meet inside one run — datasets.yaml swaps `rna_path` between
-    `*_scvelo_results_retained.h5ad` and `*_regvelo_results_retained.h5ad` — so a FOSCTTM
-    gap between the two ablations cannot be attributed without knowing how different the
-    two velocity fields were in the first place. Point `kot_velocity_compare_h5ad` at the
-    other backend's h5ad and this measures that difference directly, per cell, over the
-    cells and genes the two files share.
-
-    Reported twice. `velocity_backend_cos_*` is over every shared gene -- how different
-    the two fields are as published. `velocity_backend_cos_kot_*` applies the run's
-    RNA-side velocity weight first, so it is the agreement over exactly the coordinates
-    that reach J_phi.v: with kot_velocity_s_linked_only or kot_velocity_rna_reliability on,
-    most genes never enter the Jacobian, and two backends can disagree wildly on genes KOT
-    never looks at. Gauge normalisation is deliberately NOT applied -- it is one global
-    scalar per field, so it cancels in a per-cell cosine and would change nothing. With no
-    weight configured the two sets are equal by construction.
-
-    A configuration that cannot be compared (no path configured, missing file, missing
-    layer, no shared cells/genes, velocity not in gene space) is reported as NaN with a
-    reason rather than raising. A file that exists but cannot be read does raise.
+    """How different the two velocity files were, so a FOSCTTM gap between
+    scVelo and RegVelo ablations is not blamed on KOT. `*_kot_*` is after the
+    RNA-side weight (genes that never enter J_φ·v). Missing compare path → NaN.
     """
     compare_path = cfg.get("kot_velocity_compare_h5ad")
     layer = str(cfg.get("kot_velocity_compare_layer", "velocity"))
@@ -1111,7 +1052,6 @@ def compute_jvp_rhs_diagnostics(
 
 
 def clone_state(model) -> dict:
-    """Detached copy of the model's weights, safe to keep past further training."""
     return {k: v.detach().clone() for k, v in model.state_dict().items()}
 
 
@@ -1122,19 +1062,13 @@ def kappa_prior_loss(kappa: torch.Tensor, target: torch.Tensor,
 
 
 def phi_output(model, R_t: torch.Tensor) -> np.ndarray:
-    """φ over every cell as NumPy, on CPU. Leaves the model in eval mode."""
     model.eval()
     with torch.no_grad():
         return model.phi(R_t).cpu().numpy()
 
 
 def resolve_pseudotime(rna_obs: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
-    """Pseudotime coordinate for a run.
-
-    Prefers ground-truth 'time' (synthetic); falls back to scVelo
-    'velocity_pseudotime' / 'latent_time' on real datasets. Returns (values, key),
-    or (None, None) when no temporal coordinate is available.
-    """
+    """Prefer synthetic `time`; else scVelo. (None, None) if neither."""
     for key in ("time", "velocity_pseudotime", "latent_time"):
         if key in rna_obs.columns:
             return np.asarray(rna_obs[key].values, dtype=np.float64), key
@@ -1169,23 +1103,9 @@ def compute_grad_interaction(
     align_cols: torch.Tensor | None = None,
     lambda_dyn: float = 1.0,
 ) -> dict:
-    """Per-batch interaction between the alignment and kinetics objectives on the shared φ.
-
-    φ is the only parameter block both losses touch (alignment via the Sinkhorn on φ(r); the
-    kinetics residual via J_φ·v and β⊙φ). For each FIXED probe batch we take ∇L_align and
-    ∇L_dyn w.r.t. the φ parameters and report each gradient's L2 norm plus the cosine between
-    them: cos < 0 means the two objectives pull φ in opposing directions (gradient conflict),
-    cos > 0 means they cooperate; the norms show which objective dominates φ's update. Run in
-    eval() so the extra forwards do not perturb φ's spectral-norm estimate.
-
-    The losses are raw (un-λ-weighted), so `grad_dyn_norm` is the objective's *intrinsic*
-    gradient magnitude — comparable across runs with different λ_dyn. What actually reaches
-    the optimiser is λ_dyn times that, so `grad_dyn_norm_scaled` (= λ_dyn · ‖∇L_dyn‖, since
-    ∇(λL) = λ∇L) and `grad_mag_ratio` = ‖λ_dyn ∇L_dyn‖ / (‖∇L_align‖ + ε) are reported too:
-    the ratio is the one that says which objective is actually driving φ this epoch, with
-    1.0 the balance point. Pass the *effective* λ_dyn for the epoch (0 during a warmup or an
-    alignment-only phase), so the scaled view reflects the real update rather than the
-    configured weight. The cosine is scale-free and identical either way.
+    """cos(∇L_align, ∇L_dyn) on φ: <0 is conflict. Norms are unweighted so they
+    compare across λ_dyn; mag_ratio uses the epoch's effective λ (0 in warmup).
+    eval() so the extra forwards do not move spectral-norm stats.
     """
     was_training = model.training
     model.eval()
@@ -1237,10 +1157,8 @@ def compute_grad_interaction(
     }
 
 
-# Rows per cdist call are sized to this, not to a fixed count: the block cdist
-# materialises is (chunk x m), so the same chunk that is trivial on pbmc (m ~ 4k)
-# is a 1.4 GB spike on bmmc_cite (m ~ 90k). A sweep runs many jobs per GPU, so
-# that spike is what OOMs, long after training itself has fit.
+# Rows per cdist call are sized to this, not to a fixed count: the block is
+# (chunk × m), so a chunk that is cheap on a small panel OOMs a large one.
 CDIST_BLOCK_ELEMS = 32 * 1024 * 1024   # 128 MB at fp32
 
 
@@ -1250,8 +1168,7 @@ def nearest_protein_match(
     """Row-chunked nearest neighbour of each φ(r) in protein space.
 
     Returns (argmin index, min distance) per query row without ever materialising
-    the full (n, m) distance matrix, so large-n datasets (e.g. bmmc_cite at ~90k
-    cells, where a dense n×n matrix is ~32 GB) do not OOM.
+    the full (n, m) distance matrix, so a large panel does not OOM.
 
     `chunk` defaults to whatever keeps one (chunk x m) block near
     `CDIST_BLOCK_ELEMS`, and halves on CUDA OOM down to a single row before
@@ -1287,29 +1204,18 @@ def nearest_protein_match(
 
 
 def compute_per_cell_diagnostics(model, inputs: DiagInputs) -> dict:
-    """Per-cell arrays for FOSCTTM-correlated diagnostic plots.
-
-    FOSCTTM and the nearest-neighbour matching are computed on the alignment panel
-    (align_cols, e.g. use_for_alignment proteins) so features excluded from the
-    Sinkhorn (isotype controls) do not re-enter evaluation. φ still predicts the
-    full panel; only the metric is restricted.
-
-    Alongside FOSCTTM this returns the full per-cell physics arrays (`jvp_rhs_per_cell`),
-    κ, the per-cell mean α over the kinetic proteins, and ‖v_eff‖ — everything the summary
-    statistics in the diagnostics JSON are computed from, so a box plot or a scatter
-    against FOSCTTM can be drawn from the saved npz without rerunning the model.
+    """FOSCTTM on the alignment panel only — isotypes must not re-enter the metric.
+    Physics arrays are stored so a scatter against FOSCTTM does not rerun the model.
     """
     R_t, V_eff, P_t, S_t, rna_obs, mask, align_cols, val_idx = inputs
     model.eval()
 
-    # All-cell JVP and RHS (single forward-mode pass) on the exact training velocity.
     phi_r, dphi_dv, rhs, kappa, alpha = jvp_and_rhs(model, R_t, V_eff, S_t, mask)
 
     physics_per_cell = jvp_rhs_per_cell(dphi_dv, rhs)
     dyn_per_cell = (dphi_dv - rhs).pow(2).sum(dim=1).detach().cpu().numpy()
 
-    # κ is one scalar per cell; α is per (cell, protein), so average it over the proteins
-    # the kinetic term actually uses — an α mean over masked-out proteins is meaningless.
+    # α is per protein; mean over masked-out proteins is meaningless.
     kappa_per_cell = kappa.detach().reshape(-1).cpu().numpy()
     if mask is not None:
         mask_row = mask.reshape(1, -1)
@@ -1320,8 +1226,7 @@ def compute_per_cell_diagnostics(model, inputs: DiagInputs) -> dict:
         alpha_per_cell = alpha.mean(dim=1).detach().cpu().numpy()
     v_eff_norm_per_cell = V_eff.norm(dim=1).detach().cpu().numpy()
 
-    # Nearest-neighbor matching + FOSCTTM on the alignment panel (φ predicts all D_p,
-    # but excluded features must not re-enter the geometric metric).
+    # Alignment panel only: excluded features must not re-enter the metric.
     phi_a = phi_r if align_cols is None else phi_r[:, align_cols]
     P_a   = P_t   if align_cols is None else P_t[:, align_cols]
     nn_idx_t, min_dists = nearest_protein_match(phi_a, P_a)
@@ -1512,7 +1417,6 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
     pt = dict(s=1.2, alpha=0.30, linewidths=0, rasterized=True,
               color=METHOD_COLORS["kot"])
 
-    # a. FOSCTTM split by whether the cell was mapped into the right branch.
     ax = axes[0]
     if (branch_match >= 0).any():
         correct = foscttm[branch_match == 1]
@@ -1541,7 +1445,6 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
     chance_line(ax, FOSCTTM_CHANCE, axis="y", label="chance")
     panel_letter(ax, "a")
 
-    # b-e. Per-cell quantities against per-cell FOSCTTM, each with its correlation.
     panels = [
         ("Pseudotime error", time_err,  None,  "b", False),
         ("ODE consistency\ncos(J$_\\phi$v, f)", cos_pc, (-1.05, 1.05), "c", False),
@@ -1579,13 +1482,7 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
 
 
 def compute_full_diagnostics(model, inputs: DiagInputs, subset: int = 1024) -> dict:
-    """End-of-training diagnostics: time, branch confusion, variance, plus JVP stats.
-
-    The JVP/κ/α block comes back as full distributions across cells (see
-    `compute_jvp_rhs_diagnostics`); β and ‖v_eff‖ get the same treatment here, so every
-    quantity in the JSON carries a median and quantiles next to its mean.
-    """
-    # val_idx is deliberately dropped: everything below is an all-cell quantity.
+    """Time, branch, variance, JVP. val_idx is dropped: this is all-cell."""
     R_t, V_eff, P_t, S_t, rna_obs, mask, align_cols = inputs[:7]
     model.eval()
 
@@ -1595,12 +1492,9 @@ def compute_full_diagnostics(model, inputs: DiagInputs, subset: int = 1024) -> d
         phi_metric = phi_all if align_cols is None else phi_all[:, align_cols]
         P_metric = P_t if align_cols is None else P_t[:, align_cols]
 
-    # Nearest-neighbor in protein space → predicted state/time of cell i is taken from the
-    # observed cell whose protein is closest to φ(r_i). Row-chunked to bound memory.
-    nn_idx_t, _ = nearest_protein_match(phi_metric, P_metric)
+    nn_idx_t, _ = nearest_protein_match(phi_metric, P_metric)  # row-chunked
     nn_idx = nn_idx_t.cpu().numpy()
 
-    # Ground-truth 'time' (synthetic) or scVelo pseudotime (real); None if neither.
     pseudotime, _ = resolve_pseudotime(rna_obs)
     if pseudotime is not None:
         t_true = pseudotime
@@ -1617,7 +1511,7 @@ def compute_full_diagnostics(model, inputs: DiagInputs, subset: int = 1024) -> d
         time_mae = float("nan")
         time_spearman = float("nan")
 
-    # Branch confusion needs ground-truth branch labels (synthetic only).
+    # Branch labels exist only on the synthetic.
     if "state" in rna_obs.columns:
         state_true = np.asarray(rna_obs["state"].values)
         state_pred = state_true[nn_idx]
@@ -1639,11 +1533,7 @@ def compute_full_diagnostics(model, inputs: DiagInputs, subset: int = 1024) -> d
     var_p   = float(p_np.var(axis=0).mean())
     phi_var_ratio = var_phi / max(var_p, 1e-12)
 
-    # Trajectory DTW in protein space. `temporal` orders φ(r) by the model's
-    # predicted pseudotime (t_pred) against observed protein ordered by true
-    # pseudotime — it scores recovery of the temporal ordering. `recon` orders
-    # both by true pseudotime — a warp-tolerant reconstruction score. Uses the
-    # resolved pseudotime, so it runs on real data too; NaN only if no time exists.
+    # temporal = predicted order; recon = both on true time (warp-tolerant).
     if t_true is not None:
         traj_dtw_temporal = trajectory_dtw(phi_np, p_np, t_pred, t_true)
         traj_dtw_recon    = trajectory_dtw(phi_np, p_np, t_true, t_true)
@@ -1692,8 +1582,8 @@ def anchor_diagnostics(beta: torch.Tensor, use_anchor: bool, anchor_indices: lis
                        subset_n: int | None) -> dict:
     """What the β-anchor asked for and what β actually did, per anchored protein.
 
-    Judged on the anchored proteins alone: the global beta_mean averages the ~130
-    unanchored ones and hides whether anchored β moved toward its target at all.
+    Judged on the anchored proteins alone: the global beta_mean averages the
+    unanchored majority and hides whether anchored β moved toward its target.
     `beta_anchor_*_in_kinetic` intersects the anchor set with the runtime kinetic
     mask, because an anchored protein outside that mask constrains nothing.
 
@@ -1822,6 +1712,11 @@ def validation_metrics(per_cell: dict) -> dict:
     val_foscttm is the number a sweep ranks on; val_foscttm_in_full_pool is the same
     cells scored against all n, so the pair says how much of a difference is the
     smaller candidate pool rather than the model.
+
+    The counts describe what these FOSCTTM means were MEASURED over, so they are None
+    when nothing was -- end-of-training diagnostics run on the fitted cells alone and
+    drop val_idx, which used to make this report 0 fitted cells for a run that fitted
+    thousands. The split's own counts are n_train_cells / n_held_out_cells.
     """
     within = per_cell["foscttm_val"]
     in_pool = per_cell["foscttm_val_in_full_pool"]
@@ -1829,12 +1724,12 @@ def validation_metrics(per_cell: dict) -> dict:
     return {
         "val_foscttm": float(np.mean(within)) if within.size else None,
         "val_foscttm_in_full_pool": float(np.mean(in_pool)) if in_pool.size else None,
-        "val_n_cells": int(within.size),
+        "val_n_cells": int(within.size) if within.size else None,
         # FOSCTTM on the cells this run fitted, same pool as val_foscttm_in_full_pool
         # so the two are directly comparable. This is what a sweep ranks on when the
         # run trains on the tuning subset (fit_tuning_subset).
         "train_foscttm": float(np.mean(on_train)) if on_train.size else None,
-        "train_n_cells": int(on_train.size),
+        "train_n_cells": int(on_train.size) if on_train.size else None,
     }
 
 
@@ -1853,7 +1748,6 @@ def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
     """
     out = Path(output_dir)
 
-    # 1. Save the checkpoint state dicts to disk.
     for name, state, ep, lo in checkpoints:
         if state is None:
             continue
@@ -1870,9 +1764,8 @@ def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
         )
         print(f"[kot] Saved checkpoint: {ckpt_path} (epoch {ep})")
 
-    # 2. Evaluate FOSCTTM + diagnostics at EACH checkpoint (not just best_align).
-    # best_align reuses the full-diagnostics already computed above and caches its
-    # per-cell result for the scatter panel below — computed once, not three times.
+    # Every checkpoint, not just best_align. best_align reuses diagnostics already
+    # computed above and caches per-cell for the scatter — once, not three times.
     per_ckpt_rows = []
     best_align_per_cell = None
     for name, state, ep, lo in checkpoints:
@@ -1890,17 +1783,14 @@ def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
         mean_f = float(np.mean(pc["foscttm"]))
         val_metrics = validation_metrics(pc)
         d.update(val_metrics)
-        # The top-level diagnostics.json describes the best_align checkpoint, so its
-        # validation numbers belong there too — that file is what the runner merges into
-        # run_row.csv and what tools/collect_run_diagnostics.py reads when ranking.
+        # diagnostics.json is best_align — runner and collect_run_diagnostics read it.
         if name == "best_align":
             diagnostics.update(val_metrics)
         d["mean_foscttm"]      = mean_f
         d["checkpoint"]        = name
         d["checkpoint_epoch"]  = ep
         d["checkpoint_losses"] = lo
-        # Flat copies too: checkpoint_losses is a dict, and collect_run_diagnostics.py
-        # columns only scalars, so the dynamics loss is unreadable without these.
+        # collect_run_diagnostics columns only scalars; checkpoint_losses is a dict.
         d.update({f"loss_{key}": value for key, value in lo.items()})
         if name == "best_align":
             diagnostics.update({f"loss_{key}": value for key, value in lo.items()})
@@ -1924,8 +1814,7 @@ def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
             "jvp_norm":           d["jvp_norm"],
             "rhs_norm":           d["rhs_norm"],
         }
-        # Every per-cell / per-protein distribution, flattened into the summary CSV so a
-        # box plot across checkpoints, seeds or datasets needs nothing but this file.
+        # Distributions in the summary CSV so a box plot needs nothing else.
         for prefix in JVP_DIAG_PREFIXES + PARAM_DIAG_PREFIXES + ("beta", "v_eff_norm"):
             for stat in STAT_SUFFIXES:
                 row[f"{prefix}_{stat}"] = d[f"{prefix}_{stat}"]
@@ -1955,23 +1844,17 @@ def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
             out / "checkpoint_eval_summary.csv", index=False,
         )
 
-    # 3. Save best_align diagnostics. Written AFTER the checkpoint loop because that
-    # loop is where best_align's validation FOSCTTM is computed, and this file is the
-    # one every downstream reader (runner summary, collect_run_diagnostics) picks up.
+    # After the loop: that is where best_align's val FOSCTTM is written.
     diag_path = out / "diagnostics.json"
     with open(diag_path, "w") as f:
         json.dump(diagnostics, f, indent=2)
     print(f"[kot] Saved diagnostics: {diag_path}")
 
-    # 4. Restore best_align state so downstream artifacts (foscttm.csv, plots)
-    # reflect the same checkpoint as the returned `aligned`.
+    # Same checkpoint as the returned `aligned`.
     if best_align_state is not None:
         model.load_state_dict(best_align_state)
 
-    # 5. Per-cell arrays + the FOSCTTM-vs-diagnostics scatter panel for best_align.
-    # Reuse the per-cell result already computed for best_align in the loop above (same
-    # restored state); only recompute in the edge case where best_align was never a
-    # checkpoint (best_align_per_cell stays None).
+    # Recompute only if best_align was never a checkpoint.
     if best_align_per_cell is not None:
         per_cell = best_align_per_cell
     else:
@@ -2093,8 +1976,8 @@ def alignment_step(model, R_t: torch.Tensor, P_t: torch.Tensor, n_train: int, de
     """One Sinkhorn step on φ, backward already applied. Returns the raw loss.
 
     Full-batch when small (exact); a fresh random minibatch each epoch once
-    `max_points` caps it, so large real datasets (bmmc_cite at ~90k cells) stay
-    within GPU memory instead of building an n×n cost matrix. RNA and protein
+    `max_points` caps it, so a large panel stays within GPU memory instead of
+    building an n×n cost matrix. RNA and protein
     cells are sampled INDEPENDENTLY — the data is unpaired, and drawing the same
     rows would put each cell's true partner in the batch and leak the alignment.
 
@@ -2214,7 +2097,6 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     rna_adata    = context["rna_adata"]
     second_adata = context["second_adata"]   # protein AnnData
 
-    # Hyperparameters
     model_name   = str(cfg.get("model",       "kot"))
     n_epochs     = int(cfg.get("n_epochs",     500))
     batch_size   = int(cfg.get("batch_size",   256))
@@ -2222,14 +2104,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     lambda_dyn   = float(cfg.get("lambda_dyn", 1.0))
     lambda_reg   = float(cfg.get("lambda_reg", 1e-4))
     blur         = float(cfg.get("sinkhorn_reg", 0.1))
-    # geomloss backend for the alignment Sinkhorn: "auto" (default) uses the linear
-    # KeOps path once the batch is large, "tensorized" forces the O(N²) PyTorch path
-    # (no pykeops). See src/losses/sinkhorn.py.
+    # KeOps often cannot load CUDA; tensorized stays on GPU. See sinkhorn.py.
     sinkhorn_backend = str(cfg.get("sinkhorn_backend", "auto"))
     seed         = int(cfg.get("seed",         42))
-    # Cap the alignment Sinkhorn to a random minibatch of this many cells each
-    # epoch. None → full-batch (exact; keeps small/synthetic runs unchanged). Set
-    # it for large real datasets whose n×n distance matrix would not fit in GPU.
+    # None = full batch. Large n×n would not fit; small/synthetic stays exact.
     sinkhorn_max_points = cfg.get("sinkhorn_max_points")
     if sinkhorn_max_points is not None:
         sinkhorn_max_points = int(sinkhorn_max_points)
@@ -2392,7 +2270,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         if not Path(mapping_csv).exists():
             raise FileNotFoundError(
                 f"adt_mapping_csv '{mapping_csv}' not found. Build the mapping first:\n"
-                f"  PYTHONPATH=. python tools/build_adt_mapping.py --datasets <dataset>"
+                f"  PYTHONPATH=. python tools/build_inputs.py adt-mapping --datasets <dataset>"
             )
         mapping_records = load_mapping_records(Path(mapping_csv))   # validated, source of truth
         print(f"[kot] ADT→gene mapping from CSV (source of truth): {mapping_csv} "
@@ -2480,30 +2358,47 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     )
     val_stratify_by = cfg.get("val_stratify_by") or None
     fit_obs_key = cfg.get("fit_obs_key") or None
-    val_mask_np = held_out_mask(rna_adata.obs, cfg, seed)
+    # Two different questions, kept apart (src/data/splits.py). held_out_mask is what
+    # leaves the LOSS; reported_slice_mask is what val_foscttm is measured on, which with
+    # val_holdout_from_training=false is the same cells marked in-sample. Deciding the
+    # first from val_fraction and fit_obs_key here is what made fit_obs_key override the
+    # flag and pull the val slice out of training after the config had asked for it back.
+    held_out_np = held_out_mask(rna_adata.obs, cfg, seed)
+    val_mask_np = reported_slice_mask(rna_adata.obs, cfg, seed)
     n_val = int(val_mask_np.sum())
-    val_holdout = n_val > 0 and (
-        bool(cfg.get("val_holdout_from_training", True)) or fit_obs_key is not None
-    )
+    val_holdout = bool(held_out_np.any())
     val_idx_t = (
         to_index_tensor(np.nonzero(val_mask_np)[0], device) if n_val > 0 else None
     )
     # None means "every cell": it keeps the full-batch alignment path from gathering the
     # whole (n, D_r) matrix once an epoch just to re-index it in the original order.
     train_idx_t = (
-        to_index_tensor(np.nonzero(~val_mask_np)[0], device) if val_holdout else None
+        to_index_tensor(np.nonzero(~held_out_np)[0], device) if val_holdout else None
     )
-    n_train = n - n_val if val_holdout else n
+    n_held_out = int(held_out_np.sum())
+    n_train = n - n_held_out
+
+    # Kinetics never reads observed protein, so it can run on held-out RNA.
+    # Without that, φ on held-out cells is only a distribution match and
+    # predicted deltas collapse. Alignment stays on fitted cells: matching
+    # held-out RNA to control protein would train φ to erase the perturbation.
+    kinetics_on_held_out = bool(cfg.get("kot_kinetics_on_held_out", False))
+    dyn_idx_t = None if kinetics_on_held_out else train_idx_t
+    n_dyn = n if kinetics_on_held_out else n_train
+    if kinetics_on_held_out and val_holdout:
+        print(f"[kot] kinetics term on all {n} cells ({n_train} fitted + {n_held_out} "
+              f"held out); alignment stays on the {n_train} fitted cells")
     if n_val > 0:
-        held = "held out of training" if val_holdout else "IN training (val is in-sample)"
+        held = (f"{n_held_out} held out of training" if val_holdout
+                else "IN training (val is in-sample)")
         strat = f" | stratified by {val_stratify_by}" if val_stratify_by is not None else ""
         group = (f" | fit_obs {fit_obs_key} in {list(cfg.get('fit_obs_values', []))}"
                  if fit_obs_key is not None else "")
-        print(f"[kot] validation split: {n_val}/{n} cells ({100 * n_val / n:.1f}%) {held} "
-              f"| split_seed={val_split_seed}{strat}{group} "
+        print(f"[kot] validation split: {n_val}/{n} cells ({100 * n_val / n:.1f}%) reported, "
+              f"{held} | split_seed={val_split_seed}{strat}{group} "
               f"digest={split_digest(rna_adata.obs_names, val_mask_np)}")
     else:
-        print("[kot] validation split: off (val_fraction=0)")
+        print("[kot] validation split: off (val_fraction=0, no fit_obs restriction)")
     if monitor_is_val and not val_holdout:
         raise ValueError(
             "early_stopping_monitor=val_align needs held-out cells to measure: set "
@@ -2594,20 +2489,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     else:
         align_np = None
         align_cols = None
-    # One bundle of the fixed diagnostic inputs, built once and reused at every
-    # checkpoint evaluation below.
-    #
-    # RESTRICTED TO THE CELLS THIS RUN FITTED. With a split configured, an all-cell
-    # diagnostic pools fitted and held-out cells into one number that describes
-    # neither, and a FOSCTTM computed over the pool silently uses held-out proteins as
-    # distractors for fitted cells. Slicing the inputs once here makes every downstream
-    # diagnostic a property of one subset, with no per-metric special-casing: the
-    # subset is the dataset, as far as everything below is concerned.
-    #
-    # Only the cell-indexed tensors are sliced. S_t is the protein x gene link matrix
-    # (rhs uses S_t @ r.T), and mask_t / align_cols are per-protein, so all three are
-    # passed through whole. val_idx is dropped: a run reports on what it fitted, and
-    # the held-out side is a separate evaluation.
+    # Diagnostics on fitted cells only: an all-cell FOSCTTM uses held-out
+    # proteins as distractors. S / masks are per-protein, not sliced.
     if train_idx_t is None:
         diag_inputs = DiagInputs(R_t, V_eff_t, P_t, S_t, rna_adata.obs, mask_t,
                                  align_cols, None)
@@ -2621,8 +2504,13 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # Optional per-protein normalisation (off by default). The scale is floored at
     # the median std so it only DOWN-weights high-abundance proteins; without the
     # floor, near-constant proteins get a tiny std and their residual explodes.
+    #
+    # Measured on the FITTED cells. It is only D_p numbers, but they are a statistic of
+    # the protein matrix and they enter the loss, so taking them over every cell would
+    # let a held-out knockout's ADT reach training -- the one thing the protocol forbids
+    # (src/evaluation/protocol.py).
     if bool(cfg.get("kot_kinetics_normalize", False)):
-        std = P_t.std(dim=0)
+        std = (P_t if train_idx_t is None else P_t[train_idx_t]).std(dim=0)
         protein_scale = std.clamp(min=float(std.median()) + 1e-6)   # (D_p,)
     else:
         protein_scale = None
@@ -2697,9 +2585,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
                     use_anchor = False
                 else:
                     raise ValueError(message)
-        # Anchor-count ablation. After the kinetic-mask intersection so the count asked for
-        # is the count that reaches the loss, and after resolve_beta_anchors so every rung
-        # shares one β scale. Rationale: jobs_anchor_ablation.txt.
+        # Anchor-count ablation. After the kinetic-mask intersection so the count
+        # asked for is the count that reaches the loss, and after resolve_beta_anchors
+        # so every rung shares one β scale.
         if use_anchor and anchor_subset_n is not None:
             anchor_subset_applied = True
             n_active = len(anchor_indices)
@@ -2723,8 +2611,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
 
     # Warm-start β at the resolved anchor targets: β starts where the anchor wants
     # it (β = softplus(β_raw)+1e-6), stays trainable, and the soft prior holds it
-    # there. This sidesteps the bounded travel of β from its default ~0.72 init,
-    # which the diagnostics showed the prior alone cannot overcome.
+    # there. From the default init the prior alone cannot travel that far.
     if beta_warmstart and use_anchor and fixed_beta_value is None and anchor_indices and anchor_betas:
         with torch.no_grad():
             ws_idx = torch.tensor(anchor_indices, dtype=torch.long, device=device)
@@ -2782,7 +2669,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # runs so every history column has one entry per epoch.
     jvp_diag_nan = {key: float("nan") for key in jvp_diag_keys()}
 
-    print(f"[kot] Training {n_epochs} epochs | n={n} (train {n_train}, val {n_val}) | "
+    print(f"[kot] Training {n_epochs} epochs | n={n} (align {n_train}, dyn {n_dyn}, "
+          f"val {n_val}) | "
           f"D_r={D_r} | D_p={D_p} | device={device}")
 
     print(f"[kot] model: {model_name}")
@@ -2925,10 +2813,12 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
             )
 
         # --- Kinetics step + kappa prior (per-batch, gradients accumulated) ---
+        # dyn_idx_t, not train_idx_t: the ODE residual reads no observed protein, so it
+        # may govern φ on held-out cells too (see where dyn_idx_t is built).
         dyn_val, kappa_prior_val = kinetics_step(
-            model, R_t, V_eff_t, SR_t, conf_t, n_train, batch_size, device,
+            model, R_t, V_eff_t, SR_t, conf_t, n_dyn, batch_size, device,
             mask_t, protein_scale, lam_dyn_eff, kappa_target_t, lambda_kappa_prior,
-            train_idx_t,
+            dyn_idx_t,
         )
 
         # --- β anchor prior (on β directly; only when β is trainable and weighted) ---
@@ -2951,10 +2841,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         total_val = (lam_align_eff * align_val + lam_dyn_eff * dyn_val
                      + anchor_val + kappa_prior_val + reg_val)
 
-        # One norm over every head. Per-head budgets were measured on 2026-08-24 and
-        # made no difference to beta recovery (0.168 vs 0.157), so the extra config
-        # surface is gone. The return value is the PRE-clip norm, logged because it is
-        # what showed the clip binds on every step rather than catching spikes.
+        # One clip over every head. Per-head budgets added knobs without changing
+        # recovery. The return is the PRE-clip norm: it shows the clip binds
+        # every step rather than catching spikes.
         grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0))
         # Read BEFORE the scheduler advances: this is the factor the step above used,
         # and logging the post-step value would report the next epoch's rate instead.
@@ -3226,7 +3115,15 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["fit_obs_values"]    = (
         list(cfg.get("fit_obs_values", [])) if fit_obs_key is not None else None
     )
+    # The split's own counts, as opposed to validation_metrics' train_n_cells /
+    # val_n_cells, which count only what a FOSCTTM was measured over.
     diagnostics["n_train_cells"]     = int(n_train)
+    diagnostics["n_held_out_cells"]  = int(n_held_out)
+    diagnostics["n_reported_cells"]  = int(n_val)
+    # The alignment term saw n_train cells; the kinetics term saw n_dyn. They differ only
+    # under kot_kinetics_on_held_out, and a run cannot be interpreted without knowing it.
+    diagnostics["kot_kinetics_on_held_out"] = bool(kinetics_on_held_out)
+    diagnostics["n_kinetics_cells"]  = int(n_dyn)
     diagnostics["early_stopping_monitor"] = early_stopping_monitor
     diagnostics["best_dyn_epoch"]    = int(best_dyn_epoch) if best_dyn_state is not None else None
     diagnostics["best_dyn"]          = float(best_dyn) if best_dyn_state is not None else None
@@ -3254,8 +3151,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["lr_warmup_epochs"]  = int(lr_warmup_epochs)
     diagnostics["lr_warmup_start_factor"] = float(lr_warmup_start_factor)
     diagnostics["lr_min_factor"]     = float(lr_min_factor)
-    # Median pre-clip gradient norm. It runs ~100-6000x above the 1.0 budget, so the
-    # clip binds every step and acts as a renormaliser -- worth knowing, not tunable.
+    # Median pre-clip gradient norm. The clip binds every step and acts as a
+    # renormaliser — worth knowing, not tunable.
     diagnostics["grad_norm_median"] = float(np.median(loss_history["grad_norm"]))
     # Gradient balance, summarised out of grad_interaction.csv so a sweep can rank on it.
     # grad_mag_ratio = ||lambda_dyn*grad_dyn|| / ||grad_align||: because the clip binds on

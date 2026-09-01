@@ -1,17 +1,4 @@
-"""CRISPR perturbation-response scoring for unpaired RNA→protein maps.
-
-The paper question is not cell-level pairing (FOSCTTM). It is: given a map
-trained without the knockout transcriptomes, does predicted protein Δ(knockout,
-protein) recover the observed checkpoint-protein fold-changes?
-
-Two predictors, used on different methods:
-
-  direct        φ(r) itself, when the RNA-side embedding is already in ADT
-                coordinates (KOT with kot_use_feature_space).
-  knn_control   impute observed ADT from k nearest *control* cells in the
-                protein embedding. Knockout cells are not allowed as neighbours,
-                so the atlas cannot leak the perturbation protein state.
-"""
+"""Perturbation Δ, not pairing. Knockouts must not be kNN neighbours of each other."""
 from __future__ import annotations
 
 import numpy as np
@@ -58,8 +45,23 @@ def build_scoring_set(observed: pd.DataFrame, adt_gene_map: dict[str, str],
     return kept[["knockout", "adt", "delta", "cohens_d"]].rename(columns={"delta": "obs_delta"})
 
 
+def finite_pairs(*arrays: np.ndarray) -> np.ndarray:
+    """Mask of positions where every input is finite.
+
+    One definition for `score` and `bootstrap_spearman_gap` alike. They disagreed before:
+    score dropped non-finite pairs, the bootstrap kept them, so a resample containing one
+    produced a NaN gap that np.nanmean silently discarded -- leaving the CI averaged over
+    only those resamples that happened to miss the missing pair, which is a biased subset,
+    not a wider interval.
+    """
+    mask = np.ones(len(arrays[0]), dtype=bool)
+    for array in arrays:
+        mask &= np.isfinite(array)
+    return mask
+
+
 def score(pred: np.ndarray, obs: np.ndarray) -> dict:
-    finite = np.isfinite(pred) & np.isfinite(obs)
+    finite = finite_pairs(pred, obs)
     pred, obs = pred[finite], obs[finite]
     if len(pred) < 3 or np.std(pred) == 0:
         return {"spearman": np.nan, "pearson": np.nan, "sign_acc": np.nan, "n_pairs": len(pred)}
@@ -73,9 +75,18 @@ def score(pred: np.ndarray, obs: np.ndarray) -> dict:
 
 def bootstrap_spearman_gap(pred: np.ndarray, reference: np.ndarray, obs: np.ndarray,
                            n_boot: int, seed: int) -> tuple[float, float, float]:
-    """Paired bootstrap over scoring-set pairs for spearman(pred) - spearman(reference)."""
+    """Paired bootstrap over scoring-set pairs for spearman(pred) - spearman(reference).
+
+    Paired because both predictors are scored on the same resampled pairs, which is what
+    makes the difference interpretable with only ~20 points. Pairs that either predictor
+    cannot score are dropped ONCE, up front, so both arms see the identical pair set.
+    """
+    finite = finite_pairs(pred, reference, obs)
+    pred, reference, obs = pred[finite], reference[finite], obs[finite]
     rng = np.random.default_rng(seed)
     n = len(obs)
+    if n < 3:
+        return float("nan"), float("nan"), float("nan")
     gaps = np.full(n_boot, np.nan)
     for b in range(n_boot):
         idx = rng.integers(0, n, n)
@@ -91,11 +102,10 @@ def column_order_warning(aligned_protein: np.ndarray, observed: np.ndarray,
                          adt_names: list[str]) -> str | None:
     """A warning when the aligned protein columns do not line up with the observed ADTs.
 
-    DIAGNOSTIC ONLY. It must never decide which predictor runs, and the reason is
-    concrete: KOT's protein-side normalisation disagrees with the benchmark's rna_size
-    normalisation enough that PDL2's column correlates 0.10 with its own observed values
-    and 0.44 with CD86. Used as a dispatch, that made every KOT run fall back to kNN
-    without saying so. Column ORDER was never the problem.
+    DIAGNOSTIC ONLY. It must never decide which predictor runs: a normalisation
+    mismatch can make a column correlate more with a neighbour protein than with
+    itself, and using that as a dispatch silently swapped KOT to kNN. Column
+    ORDER was never the problem.
 
     Returns None when the check passes, or when it does not apply because the embedding
     is a latent space with no ADT columns to order.
@@ -103,6 +113,10 @@ def column_order_warning(aligned_protein: np.ndarray, observed: np.ndarray,
     n_adt = len(adt_names)
     if aligned_protein.shape[1] != n_adt:
         return None
+    # Held-out cells have no protein embedding under the holdout_second protocol; scoring
+    # their NaN rows would make every correlation NaN and turn this into a false alarm.
+    rows = np.isfinite(aligned_protein).all(axis=1)
+    aligned_protein, observed = aligned_protein[rows], observed[rows]
     corr = np.array([
         [abs(stats.spearmanr(aligned_protein[:, i], observed[:, j]).statistic)
          for j in range(n_adt)]
@@ -134,6 +148,10 @@ def knn_indices(source: np.ndarray, target: np.ndarray, k: int,
     src = torch.as_tensor(np.asarray(source), dtype=torch.float32, device=device)
     tgt = torch.as_tensor(np.asarray(target), dtype=torch.float32, device=device)
     allowed = torch.as_tensor(np.asarray(allowed_neighbors), dtype=torch.bool, device=device)
+    # Disallowed rows are masked to inf after cdist, but a NaN row (a held-out cell with
+    # no protein embedding) can poison cdist's matmul path for every column, so it is
+    # zeroed before the distance rather than after.
+    tgt = torch.where(allowed[:, None], tgt, torch.zeros_like(tgt))
     n = src.shape[0]
     out = torch.empty((n, k), dtype=torch.long, device=device)
     for start in range(0, n, batch):
@@ -151,12 +169,43 @@ def gather_mean(values: np.ndarray, idx: np.ndarray) -> np.ndarray:
     return values[idx].mean(axis=1)
 
 
+def affine_calibration(predicted: np.ndarray, observed: np.ndarray,
+                       rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-protein least-squares (a, b) mapping `predicted` onto `observed` over `rows`.
+
+    A column whose prediction is constant over `rows` has no identifiable scale, so it is
+    left alone (a=1, b=0) rather than collapsed to zero.
+    """
+    p, o = predicted[rows], observed[rows]
+    p_mean, o_mean = p.mean(axis=0), o.mean(axis=0)
+    p_centred, o_centred = p - p_mean, o - o_mean
+    variance = (p_centred * p_centred).sum(axis=0)
+    a = np.ones(predicted.shape[1], dtype=np.float64)
+    movable = variance > 0
+    a[movable] = (p_centred[:, movable] * o_centred[:, movable]).sum(axis=0) / variance[movable]
+    return a, o_mean - a * p_mean
+
+
+def calibrate_direct(predicted: np.ndarray, observed: np.ndarray,
+                     control_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-protein affine map from φ units (CLR) into the benchmark's units.
+
+    Without this, pooling pairs into one Spearman ranks a scale mismatch, not
+    the map. kNN baselines already sit in observed units. Fit on control cells
+    only; group_deltas subtracts the control mean so the intercept cannot
+    manufacture a knockout effect.
+    """
+    rows = np.nonzero(control_mask)[0]
+    a, b = affine_calibration(predicted.astype(np.float64), observed.astype(np.float64), rows)
+    return (predicted * a + b).astype(np.float32), a
+
+
 def predict_protein(emb_rna: np.ndarray, emb_protein: np.ndarray,
                     observed: np.ndarray, control_mask: np.ndarray,
                     k: int, device: torch.device, use_direct: bool) -> tuple[np.ndarray, str]:
     """Predicted protein per cell: phi(r) directly, or kNN imputation from control cells.
 
-    `use_direct` is decided by the CALLER from the run's configuration
+    `use_direct` is decided by the CALLER from the run's stamped protocol
     (kot_use_feature_space puts phi(r) in the protein panel), never inferred from the
     data. Inferring it meant a normalisation quirk in one of four proteins could silently
     swap the estimator, which is not a decision that should rest on a correlation.
@@ -165,7 +214,11 @@ def predict_protein(emb_rna: np.ndarray, emb_protein: np.ndarray,
     be scored against proteins it does not represent.
     """
     if not use_direct:
-        idx = knn_indices(emb_rna, emb_protein, k, control_mask, device)
+        # A run under the holdout_second protocol has no protein embedding for its
+        # held-out cells (NaN by construction, src/evaluation/protocol.scatter_rows), so
+        # those rows are not available as neighbours whatever the control mask says.
+        available = control_mask & np.isfinite(emb_protein).all(axis=1)
+        idx = knn_indices(emb_rna, emb_protein, k, available, device)
         return gather_mean(observed, idx).astype(np.float32), "knn_control"
     if emb_rna.shape[1] != observed.shape[1]:
         raise ValueError(

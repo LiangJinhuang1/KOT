@@ -5,13 +5,13 @@
 # Usage:
 #   bash slurm/make_jobs.sh                       # writes jobs.txt
 #   bash slurm/make_jobs.sh --models kot_main     # headline arm only (3x faster)
-#   bash slurm/make_jobs.sh --out jobs_quick.txt
+#   bash slurm/make_jobs.sh --out jobs/jobs_quick.txt
 #
 # Run dirs contain the literal token @STAMP@; parallel_train.sh replaces it with
 # a single timestamp taken when the sweep starts, so a jobs file can sit around
 # and still produce directories named for when it actually ran.
 #
-#   sbatch --export=ALL,JOBS_FILE=jobs.txt,MAX_PARALLEL=16 slurm/parallel_train.sh
+#   sbatch --export=ALL,JOBS_FILE=jobs/jobs_quick.txt,MAX_PARALLEL=16 slurm/parallel_train.sh
 #
 # Every line gets a UNIQUE --run-dir: parallel jobs sharing one silently
 # overwrite each other's results. The deliberate exception is that a single line

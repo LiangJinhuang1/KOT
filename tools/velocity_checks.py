@@ -1,46 +1,31 @@
 #!/usr/bin/env python3
-"""Per-cell cosine between two velocity backends' fields, under each KOT gene mask.
+"""Checks on the velocity field the runs consume, not on the model.
 
-WHY THIS IS NOT PART OF A TRAINING RUN. The agreement between scVelo and RegVelo is a
-property of the two velocity FILES and the gene mask -- no checkpoint, no seed and no loss
-enters it. It is therefore both cheaper and more honest to compute it once per dataset
-than to carry a per-seed column that is identical across every seed of a run.
-
-WHY SEVERAL MASKS. kot_velocity_rna_reliability and kot_velocity_s_linked_only decide
-which genes' velocity reaches J_phi.v. Two backends can agree closely on the genes KOT
-pushes through the Jacobian while disagreeing wildly on the ones it never looks at, or the
-reverse -- so a single unmasked cosine cannot say whether a FOSCTTM gap between the scVelo
-and RegVelo arms comes from the input. Each row is the same comparison under one mask, and
-`all_shared_genes` is the row that matches a run with neither flag set.
-
-The gene axis is already the run's own: the AnnData is the PREPROCESSED one, so the
-comparison is over the genes KOT actually sees, not the full transcriptome.
-
-Gauge normalisation is deliberately absent. It is one global scalar per field, so it
-cancels exactly in a per-cell cosine and would change nothing.
-
-Usage:
-  python tools/velocity_backend_cosine.py --pairs pbmc_retained:pbmc_regvelo
-  python tools/velocity_backend_cosine.py            # every default pair
+backend-cosine: two ablations may differ because the field differed.
+genes: transcriptional steady-state is not recoverable as a kinetic anchor.
+regeneration: a rebuilt h5ad that does not match the cache invalidates every number.
+shuffle-strength: cosine near 1 in PC space means the null barely moved.
 """
 from __future__ import annotations
 
-import argparse
-import sys
 from pathlib import Path
+import anndata as ad
+import argparse
+import csv
+import h5py
+import numpy as np
+import pandas as pd
+import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import numpy as np
-import pandas as pd
-
+from src.data.adt_gene_map import gene_alias_lookup, normalize_gene_symbol
+from src.training.kot import velocity_row_permutation
 from src.data.adt_gene_map import load_mapping_records
 from src.data.preprocessing import load_and_preprocess_cached
 from src.data.projection import projection_matrix_from_adatas
-import anndata as ad
-
 from src.training.kot import (
     align_velocity_fields,
     per_gene_cosine,
@@ -51,13 +36,23 @@ from src.training.kot import (
 )
 from src.utils.io import load_yaml
 
+
+# ============================================================================
+# backend_cosine
+# ============================================================================
+
 DATASETS_CONFIG = Path("config/datasets.yaml")
+
+
 TRAINING_CONFIG = Path("config/training.yaml")
+
+
 DEFAULT_OUTPUT = Path("cache/results/velocity_backend_cosine.csv")
+
+
 DEFAULT_PAIRS = ["pbmc_retained:pbmc_regvelo", "bmmc_cite_retained:bmmc_cite_regvelo"]
 
-# The BINARY KOT masks, as the config flags that switch each one on. "all_shared_genes" is
-# the no-flag case and so is what a run with neither flag set actually used.
+
 BINARY_MASKS = {
     "all_shared_genes":      {},
     "velocity_genes":        {"kot_velocity_rna_reliability": True},
@@ -65,15 +60,8 @@ BINARY_MASKS = {
     "velocity_and_s_linked": {"kot_velocity_rna_reliability": True,
                               "kot_velocity_s_linked_only": True},
 }
-# Continuous per-gene reliability, applied ON TOP of the S-linked mask: a gene that enters
-# the kinetic coordinates but whose velocity was fit badly should count less than one fit
-# well, which a 0/1 mask cannot express.
-#
-# ONLY scVelo PUBLISHES THESE. RegVelo's var carries just fit_scaling and velocity_genes
-# (and its velocity_genes is all-True), so there is no symmetric weight to use: RegVelo's
-# field is necessarily weighted by scVelo's opinion of each gene. That is a real asymmetry,
-# not a detail -- these rows answer "do the two agree on the genes scVelo fit well?", which
-# is a scVelo-centric question, and the row names say so.
+
+
 RELIABILITY_COLUMNS = {"scvelo_r2": "fit_r2", "scvelo_likelihood": "fit_likelihood"}
 
 
@@ -257,7 +245,7 @@ def rows_for_pair(name: str, compare_name: str) -> list[dict]:
     return rows, genes_frame
 
 
-def main():
+def backend_cosine_main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--pairs", default=",".join(DEFAULT_PAIRS),
@@ -294,5 +282,223 @@ def main():
               f"|v_sc|/|v_reg|={rmed:.2f} [{r25:.2f},{r75:.2f}]")
 
 
+# ============================================================================
+# genes
+# ============================================================================
+
+def col(var, names):
+    """First matching var column as a float array, else None."""
+    for n in names:
+        if n in var.columns:
+            return var[n].to_numpy(dtype=float)
+    return None
+
+
+def unspliced_fraction(adata):
+    """Per-gene mean unspliced / (spliced + unspliced) from the raw layers."""
+    if "unspliced" not in adata.layers or "spliced" not in adata.layers:
+        return None
+    u = np.asarray(adata.layers["unspliced"].sum(axis=0)).ravel()
+    s = np.asarray(adata.layers["spliced"].sum(axis=0)).ravel()
+    denom = u + s
+    return np.divide(u, denom, out=np.zeros_like(u, dtype=float), where=denom > 0)
+
+
+def adt_genes_from_coverage(path: Path) -> dict[str, dict]:
+    out = {}
+    with path.open() as handle:
+        for r in csv.DictReader(handle):
+            g = (r.get("gene_symbol") or "").strip()
+            if g:
+                out[normalize_gene_symbol(g)] = r
+    return out
+
+
+def genes_main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rna", type=Path, required=True, help="retained velocity h5ad")
+    parser.add_argument("--coverage", type=Path, required=True, help="kinetics coverage CSV")
+    parser.add_argument("--min-r2-grid", type=str, default="0.01,0.005,0.001,0.0",
+                        help="candidate min_r2 thresholds to count admitted genes")
+    args = parser.parse_args()
+
+    adata = ad.read_h5ad(args.rna)
+    var = adata.var
+    vgenes = var["velocity_genes"].to_numpy(dtype=bool) if "velocity_genes" in var else None
+    r2 = col(var, ["velocity_r2", "fit_r2", "r2"])
+    lik = col(var, ["fit_likelihood", "velocity_score"])
+    ufrac = unspliced_fraction(adata)
+
+    cov = adt_genes_from_coverage(args.coverage)
+    gene_pos = gene_alias_lookup(var.index.astype(str), var, normalizer=normalize_gene_symbol)
+
+    print(f"{'gene':<10}{'in_var':<7}{'vel_gene':<9}{'r2':>9}{'likelihood':>12}{'u_frac':>8}")
+    recoverable, steady, unknown, absent = [], [], [], []
+    for g in sorted(cov):
+        i = gene_pos.get(g)
+        if i is None:
+            print(f"{g:<10}{'no':<7}")
+            absent.append(g)
+            continue
+        vg = bool(vgenes[i]) if vgenes is not None else None
+        r = r2[i] if r2 is not None else float("nan")
+        lk = lik[i] if lik is not None else float("nan")
+        uf = ufrac[i] if ufrac is not None else float("nan")
+        print(f"{g:<10}{'yes':<7}{str(vg):<9}{r:>9.4f}{lk:>12.4f}{uf:>8.3f}")
+        if vg is False:
+            if uf < 0.05 or (not np.isnan(r) and r < 1e-3):
+                steady.append(g)
+            elif np.isnan(r):
+                unknown.append(g)
+            else:
+                recoverable.append(g)
+
+    print("\n--- admitted ADT genes at candidate min_r2 (of currently-excluded) ---")
+    grid = [float(x) for x in args.min_r2_grid.split(",")]
+    excluded = [g for g in cov if gene_pos.get(g) is not None
+                and vgenes is not None and not vgenes[gene_pos[g]]]
+    for thr in grid:
+        n = sum(1 for g in excluded
+                if r2 is not None and not np.isnan(r2[gene_pos[g]]) and r2[gene_pos[g]] >= thr)
+        print(f"  min_r2 >= {thr:<7}: {n}/{len(excluded)} excluded ADT genes would be admitted")
+
+    print(f"\nsummary: recoverable(real dynamics, low r2)={len(recoverable)}  "
+          f"steady-state(u_frac<0.05 or r2~0)={len(steady)}  "
+          f"unknown_missing_r2={len(unknown)}  not-in-var={len(absent)}")
+    if recoverable:
+        print("  recoverable -> " + ", ".join(recoverable))
+    if steady:
+        print("  steady-state (forcing them in will not help) -> " + ", ".join(steady))
+    if unknown:
+        print("  unknown (missing r2; inspect fit columns before relaxing thresholds) -> " + ", ".join(unknown))
+
+
+# ============================================================================
+# regeneration
+# ============================================================================
+
+def index_names(group) -> np.ndarray:
+    """The obs/var index of an h5ad group, as plain strings."""
+    key = group.attrs.get("_index", "_index")
+    if isinstance(key, bytes):
+        key = key.decode()
+    values = group[key][:]
+    return np.array([v.decode() if isinstance(v, bytes) else str(v) for v in values])
+
+
+def read_axes(path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    with h5py.File(path, "r") as handle:
+        obs = index_names(handle["obs"])
+        var = index_names(handle["var"])
+        layers = sorted(handle["layers"].keys()) if "layers" in handle else []
+    return obs, var, layers
+
+
+def regeneration_main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("regenerated", help="new velocity .h5ad")
+    parser.add_argument("cache", help="preprocessed .rna.h5ad built from the old one")
+    args = parser.parse_args()
+
+    src_obs, src_var, src_layers = read_axes(args.regenerated)
+    cch_obs, cch_var, cch_layers = read_axes(args.cache)
+
+    print(f"regenerated : {len(src_obs):7d} cells  {len(src_var):6d} genes")
+    print(f"cache       : {len(cch_obs):7d} cells  {len(cch_var):6d} genes")
+
+    same_cells = set(src_obs) == set(cch_obs)
+    missing_genes = set(cch_var) - set(src_var)
+    missing_layers = set(cch_layers) - set(src_layers)
+
+    print(f"cells identical      : {same_cells}")
+    print(f"cache genes ⊆ source : {not missing_genes}  (missing {len(missing_genes)})")
+    print(f"cache layers ⊆ source: {not missing_layers}  (missing {sorted(missing_layers)})")
+
+    if same_cells and not missing_genes and not missing_layers:
+        print("\nPASS — the regeneration reproduces the input behind the cache.")
+        return 0
+    print("\nFAIL — the regenerated file differs from what the cache was built from.")
+    if not same_cells:
+        print(f"  cells only in cache : {len(set(cch_obs) - set(src_obs))}")
+        print(f"  cells only in source: {len(set(src_obs) - set(cch_obs))}")
+    if missing_genes:
+        print(f"  genes dropped: {sorted(missing_genes)[:10]}")
+    return 1
+
+
+
+# ============================================================================
+# shuffle_strength
+# ============================================================================
+
+
+def unit_rows(matrix: np.ndarray) -> np.ndarray:
+    """Rows rescaled to unit length, dropping the cells that carry no velocity."""
+    norms = np.linalg.norm(matrix, axis=1)
+    keep = norms > 0
+    return matrix[keep] / norms[keep][:, None]
+
+
+def report_space(name: str, matrix: np.ndarray, seeds: list) -> None:
+    """cos(v_i, v_assigned) pooled over one permutation per seed, plus the field mean."""
+    units = unit_rows(matrix)
+    cosines = np.concatenate([
+        (units * units[velocity_row_permutation(units.shape[0], seed)]).sum(1)
+        for seed in seeds
+    ])
+    mean_direction = units.mean(0)
+    to_mean = units @ (mean_direction / np.linalg.norm(mean_direction))
+    print(f"  {name:11s} cos(real_i, assigned_i)  mean={cosines.mean():+.3f} "
+          f"median={np.median(cosines):+.3f}  |cos|>0.5: {100 * np.mean(np.abs(cosines) > 0.5):.1f}%")
+    print(f"  {name:11s} cos(real_i, field mean)  mean={to_mean.mean():+.3f} "
+          f"median={np.median(to_mean):+.3f}")
+
+
+def shuffle_strength_main() -> None:
+    """Report the permutation's strength in PC space and, for reference, in gene space.
+
+    A linear projection does not preserve cosines, so the gene-space number describes a
+    vector the model never sees -- the PC-space one is the control's real strength.
+    """
+    parser = argparse.ArgumentParser(
+        description="How different is a permuted velocity from the real one, per cell?")
+    parser.add_argument("rna", help="velocity h5ad carrying layers['velocity'] and varm['PCs']")
+    parser.add_argument("label", help="panel name for the printed header")
+    parser.add_argument("seeds", help="comma-separated permutation seeds")
+    args = parser.parse_args()
+
+    seeds = [int(seed) for seed in args.seeds.split(",")]
+    adata = ad.read_h5ad(args.rna)
+    velocity = np.nan_to_num(np.asarray(adata.layers["velocity"], dtype=np.float32), nan=0.0)
+    in_pc_space = velocity @ np.asarray(adata.varm["PCs"], dtype=np.float32)
+
+    print(f"{args.label}: {velocity.shape[0]} cells x {velocity.shape[1]} genes -> "
+          f"{in_pc_space.shape[1]} PCs, over {len(seeds)} seeds")
+    report_space("PC (model)", in_pc_space, seeds)
+    report_space("gene", velocity, seeds)
+
+
+# ============================================================================
+# dispatch
+# ============================================================================
+
+COMMANDS = {
+    "backend-cosine": backend_cosine_main,
+    "genes": genes_main,
+    "regeneration": regeneration_main,
+    "shuffle-strength": shuffle_strength_main,
+}
+
+
+def main() -> int:
+    """Route to a subcommand, leaving the rest of argv for its own parser."""
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__)
+        print(f"commands: {', '.join(COMMANDS)}")
+        return 2
+    command = sys.argv.pop(1)
+    return COMMANDS[command]() or 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

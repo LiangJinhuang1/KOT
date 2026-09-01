@@ -1,16 +1,5 @@
-"""Publication figure style for ML-conference submission (NeurIPS / ICML / ICLR).
-
-Import and call :func:`apply_style` once before plotting, size figures with
-:func:`figsize`, and save with :func:`save_figure` so every figure in the paper
-shares one typographic system and ships as embeddable vector PDF.
-
-Why the specifics:
-  * Arial/Helvetica are absent from the project container; Liberation Sans is
-    metric-compatible with Arial and is present, so it is the primary face.
-  * ``pdf.fonttype = 42`` embeds TrueType rather than Type-3. Several venues
-    reject Type-3 fonts outright, which is matplotlib's default for PDF.
-  * The size ladder is role-mapped and has exactly three steps (base / small /
-    tick). A figure that needs a fourth size needs a layout fix instead.
+"""Liberation Sans (Arial-metric, in the container). Type-42 PDF (venues reject Type-3).
+Three font sizes only: a fourth means the layout is wrong.
 """
 
 from __future__ import annotations

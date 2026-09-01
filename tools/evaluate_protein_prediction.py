@@ -1,33 +1,9 @@
 #!/usr/bin/env python3
-"""Protein-prediction quality for a finished KOT run, on its HELD-OUT cells.
+"""Score φ(r) on held-out cells. FOSCTTM is rank-only and can win while every
+value is the wrong scale. Subsets differ by one ingredient (alignment vs
+kinetics vs anchor) so a median over the whole panel cannot hide the gap.
 
-WHAT THIS ADDS. FOSCTTM asks whether a cell's predicted protein profile is nearer its own
-observed profile than to other cells' -- a purely RANK question, and one a model can win
-while every predicted value is wrong in scale. This scores the prediction directly:
-
-  per protein   spearman / pearson / nrmse of phi(r)[:, j] against the observed protein j
-  per cell      cosine and pearson between a cell's whole predicted and observed profile
-
-and, for the proteins in the kinetic residual, how well the two sides of the ODE track
-each other per protein (pearson / spearman / nrmse / sign agreement of J_phi.v vs the RHS).
-
-WHICH CELLS. The run's own validation split, rebuilt from its config exactly as
-tools/evaluate_checkpoints.py rebuilds it -- these are cells the run never fitted. A run
-with no split falls back to every cell and says so, because an in-sample number under the
-same column name would be a different quantity.
-
-PROTEIN SUBSETS. The panel is not homogeneous, so a single median hides the comparison
-worth making. Every metric is reported for:
-  all             the whole panel
-  kinetics        proteins in the ODE residual (kinetic mask)
-  alignment_only  proteins in the Sinkhorn but NOT in the residual -- the contrast that
-                  isolates what the kinetics term buys, since these two subsets differ by
-                  exactly that term
-  anchored        proteins with a measured beta anchor
-  not_anchored    the rest
-
-Usage:
-  python tools/evaluate_protein_prediction.py --runs 'cache/training/run_*_kinabl_*'
+  python tools/evaluate_protein_prediction.py --runs 'cache/training/run_*'
 """
 from __future__ import annotations
 
@@ -45,18 +21,26 @@ import torch
 from scipy.stats import rankdata
 
 from src.data.beta_anchor import resolve_beta_anchors
-from src.training.kot import jvp_and_rhs, per_cell_cosine, resolve_velocity_ablation
+from src.training.kot import (
+    anchor_subset_indices,
+    jvp_and_rhs,
+    per_cell_cosine,
+    resolve_velocity_ablation,
+)
 from tools.evaluate_checkpoints import (
     build_model_and_tensors,
+    cfg_with_model_overrides,
     collect_run_folders,
     load_dataset_for_run,
 )
-from tools.summarize_runs import KEY_COLUMNS, fitted_side
+from tools.summarize import KEY_COLUMNS, fitted_side
 
 # summary.csv's config keys, then the ablation axes that would otherwise collapse
-# two arms into one row (see tools/summarize_runs.py --extra).
-IDENTITY_COLUMNS = KEY_COLUMNS + ["kot_velocity_ablation", "kot_s_permute"]
-EVAL_COLUMNS = ["seed", "checkpoint", "dyn_velocity", "n_eval_cells", "held_out"]
+# two arms into one row (see tools/summarize.py runs --extra).
+IDENTITY_COLUMNS = KEY_COLUMNS + ["kot_velocity_ablation", "kot_s_permute",
+                                  "beta_anchor_subset_n"]
+EVAL_COLUMNS = ["seed", "checkpoint", "dyn_velocity", "dyn_mapping", "n_eval_cells",
+                "held_out"]
 
 EPS = 1e-12
 QUANTILES = (0.25, 0.50, 0.75)
@@ -86,6 +70,9 @@ def config_identity(run_cfg: dict, dataset: str) -> dict:
         "sinkhorn_reg": format_hparam(run_cfg.get("sinkhorn_reg")),
         "kot_velocity_ablation": resolve_velocity_ablation(run_cfg),
         "kot_s_permute": format_hparam(bool(run_cfg.get("kot_s_permute", False))),
+        # The anchor-count ladder differs ONLY in this key, so without it every rung
+        # collapses into one group and the ablation compares itself.
+        "beta_anchor_subset_n": format_hparam(run_cfg.get("beta_anchor_subset_n")),
     }
 
 
@@ -108,7 +95,7 @@ def column_spearman(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Spearman rho per column: Pearson on ranks, vectorised over columns.
 
     rankdata(axis=0) ranks each column independently, which is what makes this one call
-    instead of a Python loop over 134 proteins x 90k cells.
+    instead of a Python loop over the panel.
     """
     return column_pearson(rankdata(a, axis=0).astype(np.float64),
                           rankdata(b, axis=0).astype(np.float64))
@@ -144,24 +131,55 @@ def quantile_summary(values: np.ndarray, prefix: str) -> dict:
             f"{prefix}_n": int(clean.size)}
 
 
-def anchored_protein_mask(run_cfg: dict, protein_names: list, d_protein: int) -> np.ndarray:
-    """Which proteins carry a beta anchor, from the CSV if one is configured else the
-    manual index list. Resolved exactly as run_kot resolves it, so the subset matches the
-    proteins the run actually put a prior on."""
+def kinetic_mask(mask_t, d_protein: int) -> np.ndarray:
+    """Proteins in the ODE residual. No mask means every protein participates."""
+    if mask_t is None:
+        return np.ones(d_protein, dtype=bool)
+    return mask_t.cpu().numpy() != 0
+
+
+def anchored_protein_mask(run_cfg: dict, model_name: str, protein_names: list,
+                          d_protein: int, kin_mask: np.ndarray, seed: int) -> np.ndarray:
+    """Proteins this run, at this seed, actually put a beta prior on.
+
+    Every filter run_kot applies is applied here in the same order, because an anchored
+    subset that is not the run's own anchor set is not a control:
+      * the model's overrides first -- kot_noanchor and the oracle arms set
+        use_anchor=False, and reading the CSV regardless would report an anchored /
+        unanchored split for a run that anchored nothing;
+      * the CSV set when one resolves, else the manual index list (run_kot keeps the
+        manual list only when the CSV yields nothing);
+      * intersected with the kinetic mask -- beta enters the ODE only there, so an
+        anchor outside it constrains nothing;
+      * then thinned by beta_anchor_subset_n, the anchor-count ablation, which draws its
+        subset PER SEED. Without this every rung of that ladder (k00..k53) would report
+        the full active set, k00 included, and the ablation would compare identical
+        subsets.
+    """
+    run_cfg = cfg_with_model_overrides(run_cfg, model_name)
     mask = np.zeros(d_protein, dtype=bool)
+    if not bool(run_cfg.get("use_anchor", False)):
+        return mask
+
+    indices = []
     csv_path = run_cfg.get("beta_anchor_csv")
     if csv_path and Path(csv_path).exists():
         indices, _betas, _w, _s, _scale = resolve_beta_anchors(
             Path(csv_path), protein_names,
-            target_mean_beta=float(run_cfg.get("kot_anchor_beta", 0.5)),
+            target_mean_beta=float(run_cfg.get("beta_anchor_target", 0.5)),
             aggregate=str(run_cfg.get("beta_anchor_aggregate", "median")),
             stable_cv_max=run_cfg.get("beta_anchor_stable_cv_max"),
             fixed_scale=run_cfg.get("beta_anchor_fixed_scale"),
             min_quality=run_cfg.get("beta_anchor_min_r2"),
         )
-    else:
+    if not indices:
         indices = list(run_cfg.get("kot_anchor_indices", []) or [])
-    mask[[i for i in indices if 0 <= i < d_protein]] = True
+
+    active = [j for j in indices if 0 <= j < d_protein and kin_mask[j]]
+    subset_n = run_cfg.get("beta_anchor_subset_n")
+    if subset_n is not None:
+        active = [active[k] for k in anchor_subset_indices(len(active), int(subset_n), seed)]
+    mask[active] = True
     return mask
 
 
@@ -169,16 +187,21 @@ def subset_masks(kin_mask: np.ndarray, align_mask: np.ndarray,
                  anchor_mask: np.ndarray) -> dict:
     """The protein subsets each metric is reported over.
 
-    alignment_only is align AND NOT kinetics on purpose: it is the group whose phi is
-    shaped by the Sinkhorn term alone, so comparing it against `kinetics` isolates what
-    the ODE residual contributes rather than comparing two arbitrary halves of a panel.
+    Each contrast is a split of the term above it, never two arbitrary halves of the
+    panel. `kinetics` vs `alignment_only` splits the ALIGNED panel, so the two differ by
+    the ODE residual alone -- taking `kinetics` over the whole array instead would make
+    the comparison hold only for the proteins the two masks happen to share. `anchored`
+    vs `kinetic_unanchored` splits the KINETIC panel for the same reason: beta appears
+    only in the residual, so an anchor on a protein outside it constrains nothing and
+    would otherwise pad both anchor subsets with proteins the prior never touched.
     """
     return {
-        "all": np.ones_like(kin_mask),
-        "kinetics": kin_mask,
+        "measured_panel": np.ones_like(kin_mask),
+        "alignment": align_mask,
+        "kinetics": align_mask & kin_mask,
         "alignment_only": align_mask & ~kin_mask,
-        "anchored": anchor_mask,
-        "not_anchored": ~anchor_mask,
+        "anchored": kin_mask & anchor_mask,
+        "kinetic_unanchored": kin_mask & ~anchor_mask,
     }
 
 
@@ -199,7 +222,7 @@ def evaluate_one_seed(model, ckpt_path: Path, R_t, V_eff_t, P_t, S_t, mask_t,
     true = P_eval.cpu().numpy().astype(np.float64)
 
     d_protein = true.shape[1]
-    kin_mask = (mask_t.cpu().numpy() != 0) if mask_t is not None else np.ones(d_protein, bool)
+    kin_mask = kinetic_mask(mask_t, d_protein)
     align_mask = np.zeros(d_protein, bool)
     if align_cols is None:
         align_mask[:] = True
@@ -273,8 +296,14 @@ def main():
              "per-cell protein metrics do not use velocity at all (phi is a function of "
              "RNA), so this never affects them. 'real' scores every arm's JVP against the "
              "TRUE field, which is what makes dyn_* comparable ACROSS arms -- and is the "
-             "only option for the shuffle and S-permutation arms, whose inputs are drawn "
-             "per seed and cannot be rebuilt outside the seed loop.")
+             "only option for the shuffle arm, whose field is drawn per seed and cannot "
+             "be rebuilt outside the seed loop.")
+    parser.add_argument(
+        "--mapping", choices=["real", "as-trained"], default="real",
+        help="RNA->protein map S the dyn_* RHS is built from -- the same reference "
+             "question as --velocity, on the other input. 'real' scores an S-permuted arm "
+             "against the TRUE map, which is the only option for that control (its S is "
+             "drawn per seed) and is what makes dyn_* comparable across arms.")
     parser.add_argument("--out-prefix", default="cache/results/protein_eval")
     args = parser.parse_args()
 
@@ -290,10 +319,11 @@ def main():
                     run_folder, dataset_dir.name)
                 built = build_model_and_tensors(
                     run_cfg, rna_adata, protein_adata, model_dir.name, device,
-                    velocity_mode=args.velocity)
+                    velocity_mode=args.velocity, mapping_mode=args.mapping,
+                    with_velocity_backend=False)
                 model, R_t, V_eff_t, P_t, S_t, _obs, mask_t, align_cols, _vb, val_idx = built
                 protein_names = list(protein_adata.var_names)
-                anchor_mask = anchored_protein_mask(run_cfg, protein_names, P_t.shape[1])
+                kin_mask = kinetic_mask(mask_t, P_t.shape[1])
                 if val_idx is None:
                     print(f"[warn] {run_folder.name}: no validation split; scoring ALL "
                           f"cells (in-sample)")
@@ -302,11 +332,17 @@ def main():
                     ckpt = seed_dir / f"checkpoint_{args.checkpoint}.pt"
                     if not ckpt.exists():
                         continue
+                    seed = int(seed_dir.name.split("_")[1])
+                    # Per seed: beta_anchor_subset_n draws a different subset for each.
+                    anchor_mask = anchored_protein_mask(
+                        run_cfg, model_dir.name, protein_names, P_t.shape[1],
+                        kin_mask, seed)
                     meta = {
                         **config_identity(run_cfg, dataset_dir.name),
-                        "seed": int(seed_dir.name.split("_")[1]),
+                        "seed": seed,
                         "checkpoint": args.checkpoint,
                         "dyn_velocity": args.velocity,
+                        "dyn_mapping": args.mapping,
                         "n_eval_cells": int(len(val_idx) if val_idx is not None
                                             else R_t.shape[0]),
                         "held_out": val_idx is not None,

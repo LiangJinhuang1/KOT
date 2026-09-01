@@ -1,8 +1,4 @@
-"""Per-run alignment figures, built to ML-conference publication standard.
-
-Every figure here goes through :func:`src.visualization.style.save_figure`, so
-each one lands as an embeddable vector PDF alongside a 300-dpi PNG.
-"""
+"""Per-run alignment figures. All go through save_figure so fonts stay Type-42."""
 
 from __future__ import annotations
 

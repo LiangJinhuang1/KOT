@@ -15,12 +15,12 @@
 # evidence to ask for LESS, not to ask again.
 #
 # Usage:
-#   bash slurm/submit_adaptive.sh jobs_sweep_D.txt
-#   bash slurm/submit_adaptive.sh jobs_sweep_DH.txt --dependency afterok:12345
+#   bash slurm/submit_adaptive.sh jobs/archive/jobs_sweep_D.txt
+#   bash slurm/submit_adaptive.sh jobs/jobs_sweep_DH.txt --dependency afterok:12345
 #   bash slurm/submit_adaptive.sh jobs.txt --max-gpus 4 --min-gpus 1 --max-parallel 16
 #
 # Run it in the background -- it polls until the job clears its preflight:
-#   nohup bash slurm/submit_adaptive.sh jobs_sweep_D.txt > logs/adaptive_D.log 2>&1 &
+#   nohup bash slurm/submit_adaptive.sh jobs/archive/jobs_sweep_D.txt > logs/adaptive_D.log 2>&1 &
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

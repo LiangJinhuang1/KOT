@@ -1,37 +1,15 @@
-"""
-Validation split for hyperparameter selection.
+"""Validation split for hyperparameter selection.
 
-KOT trains without labels, so nothing a run computes about itself can say which
-hyperparameters are the right ones -- only the pairing can, and the pairing is
-what the headline FOSCTTM is reported on. Tuning on the full set is therefore
-tuning on the test set. This module carves a slice of cells out of the training
-pool to tune against instead: held out of both loss terms during the search,
-scored with the pairing, and never used for anything but ranking configurations.
-The final runs put those cells back into training and report the full-set metric
-unchanged.
+Tuning on the full set is tuning on the test FOSCTTM. This holds a barcode-hash
+slice out of both losses during search; full-data runs put those cells back
+(`val_holdout_from_training=false`).
 
-Two axes control how the slice is drawn.
-
-`split_seed` -- what the per-cell hash is keyed on. With `val_split_per_seed`
-the run's MODEL seed is mixed into it, so the four seeds of a config are four
-different splits and averaging over them averages over splits as well. The
-mixing is a hash of both, not a sum, so (base 1, seed 2) and (base 2, seed 1)
-cannot collide onto the same split. Crucially the config is NOT an input: two
-configs at the same model seed still get the identical split, which is what
-keeps the paired comparison across configs valid. With it off, one split serves
-every run, as before.
-
-`strata` -- optional per-cell labels. Without them a cell is validation iff its
-own hash falls below `fraction`, so each stratum's share is binomial around
-`fraction`: fine at n=5000, and capable of handing a 18-cell cell type zero
-validation cells. With them, every stratum contributes its own `fraction` share
-exactly (to rounding). The cost is that a cell's side then depends on which
-other cells share its stratum, so the assignment no longer survives cells being
-dropped upstream -- acceptable precisely when the split is redrawn per seed
-anyway, and the reason stratification and per-seed drawing arrived together.
-
-`split_digest` goes into diagnostics.json either way, so agreement between two
-runs is checkable after the fact rather than assumed.
+`val_split_per_seed` mixes the model seed into the hash (four seeds = four splits);
+off, one split serves every run. Config is not an input, so paired config
+comparisons stay on the same cells. `val_stratify_by` gives each stratum its own
+fraction (rare types otherwise can get zero val cells) but then a cell's side
+depends on who shares its stratum. `split_digest` is written so agreement is
+checkable.
 """
 
 from __future__ import annotations
@@ -40,9 +18,7 @@ import hashlib
 
 import numpy as np
 
-# blake2b digest_size=8 -> a uint64 per cell; dividing by its span gives the
-# uniform [0, 1) value the fraction thresholds against.
-UINT64_SPAN = float(2 ** 64)
+UINT64_SPAN = float(2 ** 64)  # digest_size=8 → uniform [0, 1) via / span
 
 
 def resolve_split_seed(base_seed: int, model_seed: int | None, per_seed: bool) -> int:
@@ -98,8 +74,8 @@ def validation_mask(obs_names, fraction: float, split_seed: int,
     `round(fraction * n)` cells of a shuffle: a count has to be filled from some
     order, so dropping a handful of cells upstream (a new preprocessing cache, a
     different gene filter) would shift the boundary and move OTHER cells across the
-    split. With a threshold, every cell's side is decided by its barcode alone and
-    the realized count is binomial around `fraction * n` (±0.6% of n at n=5000).
+    split. With a threshold, every cell's side is decided by its barcode alone
+    and the realized count is binomial around `fraction * n`.
 
     Passing `strata` trades that invariance for exact per-stratum shares; see the
     module docstring.
@@ -125,18 +101,13 @@ def split_digest(obs_names, mask: np.ndarray) -> str:
     return hashlib.blake2b(selected.encode(), digest_size=8).hexdigest()
 
 
-def held_out_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
-    """True for cells held out of the loss.
+def random_slice_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
+    """The random / stratified val_fraction slice as DRAWN, whatever is done with it.
 
-    Union of two independent restrictions:
-
-      * the random / stratified val_fraction slice (optionally inverted by
-        fit_tuning_subset, same rule as before)
-      * cells whose ``fit_obs_key`` value is outside ``fit_obs_values``
-
-    The group restriction is never inverted: Papalexi's CRISPR experiment trains on
-    NT cells and must not silently put knockout transcriptomes back into the loss
-    when fit_tuning_subset is on.
+    This is the reporting slice: with `val_holdout_from_training` off the cells go back
+    into the loss but their FOSCTTM is still measured and marked in-sample.
+    `random_holdout_mask` is the other question -- whether those cells are
+    removed from the loss.
     """
     val_fraction = float(cfg.get("val_fraction", 0.0))
     split_seed = resolve_split_seed(
@@ -157,10 +128,31 @@ def held_out_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
     mask = validation_mask(rna_obs.index, val_fraction, split_seed, strata=strata)
     if bool(cfg.get("fit_tuning_subset", False)) and val_fraction > 0.0:
         mask = ~mask
+    return mask
 
+
+def random_holdout_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
+    """The part of the random slice that is actually removed from the loss.
+
+    All-False when `val_holdout_from_training` is off. Deciding that here rather than at
+    each call site is what keeps `held_out_mask` and `fitted_row_indices` describing the
+    same cells -- they disagreed before, so a run with fit_obs_key silently dropped its
+    val slice from training after the config had asked for it back.
+    """
+    if not bool(cfg.get("val_holdout_from_training", True)):
+        return np.zeros(len(rna_obs.index), dtype=bool)
+    return random_slice_mask(rna_obs, cfg, model_seed)
+
+
+def group_holdout_mask(rna_obs, cfg: dict) -> np.ndarray:
+    """True for cells whose ``fit_obs_key`` value is outside ``fit_obs_values``.
+
+    Never inverted by fit_tuning_subset: a CRISPR fit restriction must not
+    silently put knockout transcriptomes back into the loss.
+    """
     fit_key = cfg.get("fit_obs_key") or None
     if fit_key is None:
-        return mask
+        return np.zeros(len(rna_obs.index), dtype=bool)
     if fit_key not in rna_obs.columns:
         raise ValueError(
             f"fit_obs_key={fit_key!r} is not an obs column. "
@@ -174,7 +166,28 @@ def held_out_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
         raise ValueError(
             f"fit_obs_values {list(allowed)} matched 0 cells in obs[{fit_key!r}]"
         )
-    return mask | ~allowed_mask
+    return ~allowed_mask
+
+
+def held_out_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
+    """True for cells held out of the loss: the union of the two restrictions.
+
+    They are independent. `val_holdout_from_training=false` returns the random slice to
+    training whether or not a group restriction is also set, and a group restriction
+    removes its cells whether or not a random slice exists.
+    """
+    return (random_holdout_mask(rna_obs, cfg, model_seed)
+            | group_holdout_mask(rna_obs, cfg))
+
+
+def reported_slice_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
+    """True for cells a run reports val metrics on, held out of the loss or not.
+
+    A superset of `held_out_mask`: it keeps the drawn random slice even when the config
+    returned those cells to training, so in-sample val columns are still measured.
+    """
+    return (random_slice_mask(rna_obs, cfg, model_seed)
+            | group_holdout_mask(rna_obs, cfg))
 
 
 def fitted_row_indices(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray | None:
@@ -192,9 +205,5 @@ def fitted_row_indices(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray
     None means every cell -- no split configured, or the split deliberately returned to
     training (val_holdout_from_training=false) and no fit_obs restriction is set.
     """
-    has_group = bool(cfg.get("fit_obs_key"))
-    val_fraction = float(cfg.get("val_fraction", 0.0))
-    holdout_random = val_fraction > 0.0 and bool(cfg.get("val_holdout_from_training", True))
-    if not has_group and not holdout_random:
-        return None
-    return np.nonzero(~held_out_mask(rna_obs, cfg, model_seed))[0]
+    mask = held_out_mask(rna_obs, cfg, model_seed)
+    return None if not mask.any() else np.nonzero(~mask)[0]

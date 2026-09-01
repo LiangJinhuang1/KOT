@@ -7,7 +7,7 @@ defaults:
   hvg_flavor: seurat_v3
   velocity_mode: dynamical
   # Velocity provider: 'scvelo_dynamical' (baseline) or 'regvelo' (GRN-informed).
-  # regvelo also needs grn_prior_csv (see tools/build_grn_prior.py) and the
+  # regvelo also needs grn_prior_csv (see tools/build_inputs.py grn-prior) and the
   # regvelo/scvi-tools stack in the container.
   velocity_backend: scvelo_dynamical
   dynamics_n_jobs: 8
@@ -44,9 +44,9 @@ datasets:
     retain_genes_csv: cache/results/mapping/adt_mapping_bmmc_cite_retained.csv
     velocity_backend: regvelo
     grn_prior_csv: cache/results/grn/grn_prior_bmmc_cite.csv
-    # 90k cells OOM at RegVelo's default full-batch, but small minibatches make the
-    # per-gene likelihood variance collapse (invalid Normal scale -> NaN, crash ~epoch 350).
-    # Use a large batch: closer to the stable full-batch regime, still fits ~64 GB.
+    # Large n OOMs at RegVelo's default full-batch; small minibatches collapse
+    # the per-gene likelihood (invalid Normal scale). Use a large batch: closer
+    # to full-batch stability, still fits memory.
     regvelo_batch_size: 16384
 
   bmmc_multiome:
@@ -86,7 +86,7 @@ datasets:
     grn_prior_csv: cache/results/grn/grn_prior_pbmc.csv
 
   # Papalexi ECCITE-seq (GSE153056), pooled 8-lane STARsolo. RNA input h5ad is built
-  # by tools/build_papalexi.py (spliced/unspliced from STARsolo Velocyto, cells matched
+  # by tools/build_inputs.py papalexi (spliced/unspliced from STARsolo Velocyto, cells matched
   # to the ECCITE metadata on the core barcode). Retains the 4 checkpoint-ADT target
   # genes (CD86, CD274, PDCD1LG2, HAVCR2) so KOT's kinetics can use them.
   papalexi_retained:

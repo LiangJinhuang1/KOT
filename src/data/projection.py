@@ -1,25 +1,5 @@
-"""
-Gene-to-protein projection matrix S, with alignment / kinetics masks and a report.
-
-S is a (D_p × D_genes) binary (or weighted) matrix where S[j, i] = 1 if gene i
-encodes protein j.  Used in the KOT ODE constraint:
-
-    J_φ(r) · v  =  κ(r) · (α(r) ⊙ S r − β ⊙ φ(r))
-
-The builder returns four objects, all indexed by the protein panel order:
-
-    S               (D_p, D_genes)  projection matrix
-    alignment_mask  (D_p,) bool     proteins that feed the Sinkhorn alignment
-    kinetic_mask    (D_p,) bool     proteins that feed the kinetic residual
-    mapping_report  list[dict]      one row per protein: mapped gene, mapping type,
-                                    alignment / kinetic flags, present_in_rna, reason
-
-Source of truth: if a curated mapping CSV is provided (via `mapping_records`), its
-decisions are authoritative — φ still predicts the full panel, Sinkhorn uses the
-`use_for_alignment` proteins, the kinetic loss uses the `use_for_kinetics` proteins,
-and a protein excluded from kinetics gets an all-zero S row (no uniform fallback).
-Without a CSV we fall back to explicit links (synthetic) or HGNC name matching, in
-which case every measured protein feeds alignment and the linked ones feed kinetics.
+"""Gene→protein S. A mapping CSV is source of truth: excluded proteins get a
+zero row, not a uniform fallback.
 """
 from __future__ import annotations
 
@@ -128,7 +108,7 @@ def build_projection_from_records(
             raise ValueError(
                 f"{len(missing)} panel protein(s) are not in the mapping CSV: "
                 f"{missing[:10]}{' ...' if len(missing) > 10 else ''}. Rebuild the mapping for "
-                f"this exact panel (tools/build_adt_mapping.py) — with require_full_panel, "
+                f"this exact panel (tools/build_inputs.py adt-mapping) — with require_full_panel, "
                 f"partial panel coverage is a hard error (a protein with no mapping cannot align)."
             )
         print(f"[projection] WARNING: {len(missing)} panel protein(s) not in mapping CSV "

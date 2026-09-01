@@ -1,11 +1,7 @@
-"""
-Resolve CITE-seq ADT marker names to their encoding gene symbols.
+"""ADT panel names to HGNC gene symbols.
 
-Antibody panel names (CD16, HLA-DR, CD8a) rarely equal the HGNC gene symbol
-(FCGR3A, HLA-DRA, CD8A). We resolve them authoritatively from the HGNC gene
-table (approved / previous / alias symbols), plus a small curated map for the
-few markers that name a protein *complex* or *isoform epitope* rather than a
-single gene, which HGNC cannot resolve to one symbol.
+CD16 ≠ FCGR3A. HGNC approved/previous/alias plus a curated map for complexes
+and isoform epitopes that have no single-gene HGNC alias.
 """
 from __future__ import annotations
 
@@ -42,7 +38,6 @@ GENE_ALIAS_COLUMNS = (
 
 
 def valid_gene_alias(value) -> str | None:
-    """Return a clean gene alias string, or None for empty/null-ish values."""
     text = str(value).strip()
     if not text or text.lower() in {"nan", "none", "na", "<na>"}:
         return None
@@ -54,7 +49,6 @@ def normalize_gene_symbol(value: str) -> str:
 
 
 def iter_gene_aliases(var_names: Iterable, var=None):
-    """Yield (position, alias) pairs from var_names plus common symbol columns."""
     for i, name in enumerate(var_names):
         alias = valid_gene_alias(name)
         if alias is not None:
@@ -75,7 +69,6 @@ def gene_alias_lookup(
     var=None,
     normalizer: Callable[[str], str] | None = None,
 ) -> dict[str, int]:
-    """Map normalized gene aliases to the first RNA feature position."""
     lookup: dict[str, int] = {}
     for i, alias in iter_gene_aliases(var_names, var):
         key = normalizer(alias) if normalizer is not None else alias
@@ -88,7 +81,6 @@ def gene_alias_set(
     var=None,
     normalizer: Callable[[str], str] | None = None,
 ) -> set[str]:
-    """All normalized gene aliases visible for an RNA matrix."""
     return {
         normalizer(alias) if normalizer is not None else alias
         for _, alias in iter_gene_aliases(var_names, var)
@@ -101,7 +93,6 @@ def aliases_for_positions(
     positions: Iterable[int],
     normalizer: Callable[[str], str] | None = None,
 ) -> set[str]:
-    """All aliases belonging to selected RNA feature positions."""
     keep = set(int(i) for i in positions)
     return {
         normalizer(alias) if normalizer is not None else alias
@@ -110,17 +101,14 @@ def aliases_for_positions(
 
 
 def alnum(name: str) -> str:
-    """Aggressive normalisation for cross-source name matching: keep A–Z0–9 only."""
     return re.sub(r"[^A-Z0-9]", "", name.upper())
 
 
 def strip_adt_suffix(name: str) -> str:
-    """Drop the TotalSeq panel suffix (CD8a_TotalSeqB → CD8a)."""
     return re.sub(r"_TotalSeq[A-Z]$", "", name)
 
 
 def load_hgnc_records(hgnc_path: Path = HGNC_PATH) -> dict[str, tuple[str, str]]:
-    """Map every known gene name (approved / previous / alias) → (symbol, HGNC ID)."""
     records: dict[str, tuple[str, str]] = {}
     with open(hgnc_path) as f:
         for row in csv.DictReader(f, delimiter="\t"):
@@ -137,15 +125,6 @@ def load_hgnc_records(hgnc_path: Path = HGNC_PATH) -> dict[str, tuple[str, str]]
 
 
 def resolve_marker(name: str, records: dict, manual: dict) -> tuple[str | None, str, str]:
-    """
-    Resolve one ADT marker → (gene_symbol, hgnc_id, mapping_type).
-
-    mapping_type is one of:
-      isotype         — isotype control, no target gene
-      complex_curated — multi-gene complex / isoform epitope, curated to one gene
-      one_to_one      — resolved to a single gene via HGNC
-      unmapped        — no single encoding gene (uncurated complex / not found)
-    """
     if "control" in name.lower():
         return None, "", "isotype"
     key = alnum(strip_adt_suffix(name))
@@ -160,13 +139,7 @@ def resolve_marker(name: str, records: dict, manual: dict) -> tuple[str | None, 
 
 
 def adt_to_gene(protein_names, hgnc_path: Path = HGNC_PATH) -> dict[str, str]:
-    """
-    Resolve ADT marker names → gene symbols: curated complex/isoform map first,
-    then HGNC aliases. Markers with no single encoding gene (isotype controls,
-    glycan epitopes, multi-gene complexes like TCR / HLA-A-B-C) are simply absent
-    from the result. Returns {} when the HGNC table is unavailable, so callers
-    fall back to plain name matching.
-    """
+    """{} if HGNC is missing so callers fall back to name matching, not a crash."""
     if not hgnc_path.exists():
         return {}
     records = load_hgnc_records(hgnc_path)
@@ -187,7 +160,7 @@ MAPPING_COLUMNS = [
 
 
 def parse_bool(value) -> bool | None:
-    """Parse a CSV cell to bool; '' → None (unknown, e.g. present_in_rna)."""
+    """'' is unknown (present_in_rna), not False."""
     if isinstance(value, bool):
         return value
     s = str(value).strip().lower()
@@ -201,15 +174,7 @@ def parse_bool(value) -> bool | None:
 
 
 def validate_mapping_records(records: list[dict]) -> None:
-    """
-    Validate the invariants an ADT→gene mapping table must satisfy, failing loud on
-    a malformed CSV rather than letting it silently distort alignment / kinetics:
-
-      * adt_name is unique across rows;
-      * use_for_kinetics=True implies a non-empty gene_symbol;
-      * an isotype control is never used for kinetics;
-      * every row excluded from kinetics carries an exclusion reason.
-    """
+    """Fail here; a malformed CSV would silently distort alignment and kinetics."""
     names = [r["adt_name"] for r in records]
     dupes = sorted({n for n in names if names.count(n) > 1})
     if dupes:
@@ -230,13 +195,6 @@ def validate_mapping_records(records: list[dict]) -> None:
 
 
 def load_mapping_records(path: Path) -> list[dict]:
-    """
-    Load the full ADT→gene mapping CSV: one normalized record per row with every
-    column (decision flags parsed to bool), validated by validate_mapping_records.
-
-    Preserves mapping_type, present_in_rna, use_for_alignment, use_for_kinetics
-    and excluded_because so the projection can honour the curated decisions.
-    """
     records: list[dict] = []
     with open(path) as f:
         reader = csv.DictReader(f)
@@ -261,24 +219,9 @@ def load_mapping_records(path: Path) -> list[dict]:
 
 def build_mapping_rows(protein_names, rna_symbols=None, hgnc_path: Path = HGNC_PATH,
                        kinetic_complex_allow=None) -> list[dict]:
-    """
-    One row per ADT marker with its gene resolution and usage flags.
-
-    use_for_alignment is True for every measured protein except isotype controls
-    (background, must not inform Sinkhorn). use_for_kinetics is INTENT and, so the
-    mapping_type actually means something, distinguishes confidence:
-
-      * one_to_one       → kinetics-eligible automatically (high-confidence 1:1).
-      * complex_curated  → a representative-chain approximation (e.g. CD3→CD3E,
-                           HLA-DR→HLA-DRA). NOT eligible automatically — only if its
-                           marker name or gene is in kinetic_complex_allow. This keeps
-                           the 1:1-vs-approximation distinction a deliberate choice.
-      * isotype / unmapped → never eligible.
-
-    Eligibility is intent (independent of any RNA matrix) so velocity retention can
-    recover a dropped gene; present_in_rna records matrix presence separately.
-    kinetic_complex_allow: iterable of ADT names or gene symbols allowed for kinetics
-    despite being complex_curated. rna_symbols=None leaves present_in_rna blank.
+    """Kinetics eligibility is intent, not matrix presence: a dropped gene can still
+    be recovered. complex_curated is not auto-eligible — that would erase the
+    1:1 vs representative-chain distinction. Isotypes never enter Sinkhorn.
     """
     records = load_hgnc_records(hgnc_path) if hgnc_path.exists() else {}
     manual = {alnum(k): v for k, v in MANUAL_ADT_TO_GENE.items()}

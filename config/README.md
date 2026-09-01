@@ -49,10 +49,11 @@ only for FOSCTTM evaluation.
 
 ## SLURM
 
-`slurm/train_stage.sh` wraps the runner for the cluster. Select models with the
+`slurm/train_slurm.sh` runs the runner on the cluster (recipes in slurm/README.md).
+Select models with the
 `MODELS` export (a group name or comma-list; empty = `default_models`):
 
 ```bash
-sbatch --export=ALL,STAGE=clean,SCALE=mean,MODELS=baselines slurm/train_stage.sh
-sbatch --export=ALL,STAGE=branch,SCALE=mean,MODELS=kot      slurm/train_stage.sh
+sbatch --export=ALL,RUN_CMD='python -u -m src.training.runner --stage clean --scale mean --models baselines' slurm/train_slurm.sh
+sbatch --export=ALL,RUN_CMD='python -u -m src.training.runner --stage branch --scale mean --models kot' slurm/train_slurm.sh
 ```

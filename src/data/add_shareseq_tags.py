@@ -1,13 +1,4 @@
-"""
-Add CB (cell barcode) and UB (UMI) tags to SHARE-seq BAM files.
-
-SHARE-seq read name format:
-  {illumina_id}_{barcode}_{umi}
-  e.g. A00794:80:HFTTTDRXX:2:2248:25536:17127_R1.34,R2.70,R3.39,P1.53_CACGATATCA
-
-Usage:
-  python src/data/add_shareseq_tags.py input.bam output.bam
-"""
+"""STARsolo needs CB/UB tags; SHARE-seq puts barcode and UMI in the read name."""
 import argparse
 import pysam
 

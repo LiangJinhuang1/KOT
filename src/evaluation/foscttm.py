@@ -5,17 +5,13 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 
+from src.evaluation.protocol import PROTOCOL_KEY
+
 PREDICTIONS_DIR = Path("data/predictions")
 
 
 def calc_frac_idx(x1_mat: np.ndarray, x2_mat: np.ndarray, batch_size: int = 1000) -> list[float]:
-    """
-    Fraction of samples closer than the true match, computed in batches.
-
-    Runs on GPU when available (falls back to CPU) — identical result to the
-    dense NumPy version, but the O(n²) distance work is the bottleneck at large
-    n (e.g. 90k cells), so the device matters. Row-batched to bound memory.
-    """
+    """Row-batched; GPU when available — the O(n²) distances are the bottleneck at large n."""
     x1_array = np.asarray(x1_mat, dtype=np.float32)
     x2_array = np.asarray(x2_mat, dtype=np.float32)
     if x1_array.ndim != 2 or x2_array.ndim != 2:
@@ -96,6 +92,7 @@ def save_prediction_h5ad(
     model_name: str,
     second_label: str,
     obs_names,
+    protocol: dict | None = None,
 ) -> None:
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     adata = ad.AnnData(X=aligned[0])
@@ -107,6 +104,10 @@ def save_prediction_h5ad(
     adata.uns["model"] = model_name
     adata.uns["dataset"] = dataset_name
     adata.uns["second_label"] = second_label
+    # Which cells the run was allowed to fit on, travelling with the prediction rather
+    # than being re-derived downstream from a filename (src/evaluation/protocol.py).
+    if protocol is not None:
+        adata.uns[PROTOCOL_KEY] = dict(protocol)
     path = PREDICTIONS_DIR / f"{model_name}_{dataset_name}.h5ad"
     adata.write_h5ad(path)
     print(f"Saved prediction: {path}")
@@ -121,6 +122,7 @@ def evaluate_and_save(
     obs_names=None,
     foscttm_scores=None,
     save_prediction: bool = True,
+    protocol: dict | None = None,
 ) -> float:
     degenerate = is_degenerate_embedding(aligned[0]) or is_degenerate_embedding(aligned[1])
     # foscttm_scores may be precomputed (e.g. per-batch alignment, where a global
@@ -149,13 +151,13 @@ def evaluate_and_save(
 
     # The prediction h5ad path is GLOBAL (data/predictions/), keyed only by model +
     # dataset + seed — so two runs that differ only in hyperparameters write the same
-    # file. In a parallel sweep that is a live HDF5 lock collision that kills the run
-    # (BlockingIOError), not just an overwrite. Sweeps pass save_prediction=False; the
-    # per-run copies under output_dir (aligned_*.npy, foscttm.csv) are unaffected.
+    # file. Two parallel arms writing the same path hit a live HDF5 lock, not just
+    # an overwrite. Sweeps pass save_prediction=False; the per-run copies under
+    # output_dir (aligned_*.npy, foscttm.csv) are unaffected.
     if save_prediction and model_name is not None and obs_names is not None:
         save_prediction_h5ad(
             aligned, foscttm_scores, mean_foscttm,
-            name, model_name, second_label, obs_names,
+            name, model_name, second_label, obs_names, protocol=protocol,
         )
 
     return mean_foscttm

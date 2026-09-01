@@ -5,9 +5,13 @@ import pandas as pd
 import torch
 
 from src.evaluation.perturbation import (
+    affine_calibration,
+    bootstrap_spearman_gap,
     build_scoring_set,
+    calibrate_direct,
     group_deltas,
     column_order_warning,
+    finite_pairs,
     knn_indices,
     predict_protein,
     score,
@@ -103,6 +107,76 @@ class GroupDeltaTests(unittest.TestCase):
         result = score(np.array([1.0, -1.0, 2.0]), np.array([0.5, -0.2, 3.0]))
         self.assertEqual(result["sign_acc"], 1.0)
         self.assertEqual(result["n_pairs"], 3)
+
+
+class CalibrationTests(unittest.TestCase):
+    """The direct predictor trains in CLR units; the benchmark scores in rna_size units."""
+
+    def test_a_known_per_protein_scale_is_recovered(self):
+        rng = np.random.default_rng(0)
+        predicted = rng.normal(size=(200, 3))
+        scale, offset = np.array([2.0, 0.5, -1.5]), np.array([1.0, -3.0, 0.25])
+        observed = predicted * scale + offset
+        a, b = affine_calibration(predicted, observed, np.arange(200))
+        np.testing.assert_allclose(a, scale, atol=1e-8)
+        np.testing.assert_allclose(b, offset, atol=1e-8)
+
+    def test_a_constant_column_is_left_alone_rather_than_zeroed(self):
+        predicted = np.column_stack([np.arange(20.0), np.ones(20)])
+        observed = np.column_stack([np.arange(20.0) * 3, np.arange(20.0)])
+        a, _ = affine_calibration(predicted, observed, np.arange(20))
+        self.assertAlmostEqual(a[0], 3.0)
+        self.assertEqual(a[1], 1.0)
+
+    def test_calibration_never_looks_at_knockout_cells(self):
+        """Fitted on controls only, so a knockout shift cannot leak into the scale."""
+        rng = np.random.default_rng(1)
+        predicted = rng.normal(size=(100, 2))
+        observed = predicted * np.array([4.0, 0.25])
+        control = np.zeros(100, dtype=bool)
+        control[:50] = True
+        _, scale_clean = calibrate_direct(predicted, observed, control)
+        moved = observed.copy()
+        moved[50:] += 17.0
+        _, scale_moved = calibrate_direct(predicted, moved, control)
+        np.testing.assert_allclose(scale_clean, scale_moved, atol=1e-6)
+
+    def test_calibration_cannot_manufacture_a_group_difference(self):
+        """group_deltas subtracts the control mean, so only the per-protein scale acts."""
+        rng = np.random.default_rng(2)
+        predicted = rng.normal(size=(80, 1))
+        observed = predicted * 5.0 + 2.0
+        control = np.zeros(80, dtype=bool)
+        control[:40] = True
+        groups = pd.Series(["NT"] * 40 + ["KO"] * 40)
+        calibrated, _ = calibrate_direct(predicted, observed, control)
+        raw = group_deltas(predicted, ["P"], groups, "NT", 5)["delta"].iloc[0]
+        cal = group_deltas(calibrated, ["P"], groups, "NT", 5)["delta"].iloc[0]
+        self.assertAlmostEqual(cal, raw * 5.0, places=4)
+
+
+class NonFiniteTests(unittest.TestCase):
+    def test_score_and_bootstrap_drop_the_same_pairs(self):
+        """The bootstrap used to keep NaN pairs, so nanmean averaged a biased subset."""
+        pred = np.array([1.0, 2.0, np.nan, 4.0, 5.0, 6.0])
+        ref = np.array([1.0, 1.5, 3.0, 3.5, 5.5, 6.5])
+        obs = np.array([1.0, 2.5, 3.0, 3.5, 5.0, 7.0])
+        self.assertEqual(score(pred, obs)["n_pairs"], 5)
+        self.assertEqual(int(finite_pairs(pred, ref, obs).sum()), 5)
+        gap, lo, hi = bootstrap_spearman_gap(pred, ref, obs, n_boot=200, seed=0)
+        self.assertTrue(np.isfinite([gap, lo, hi]).all())
+
+    def test_knn_never_uses_a_cell_with_no_protein_embedding(self):
+        """holdout_second leaves held-out cells NaN; they are not neighbours."""
+        rna = np.array([[0.0], [0.1], [5.0], [5.1]], dtype=np.float32)
+        protein = np.array([[0.0], [0.1], [np.nan], [np.nan]], dtype=np.float32)
+        observed = np.array([[1.0], [2.0], [99.0], [99.0]], dtype=np.float32)
+        control = np.array([True, True, False, False])
+        pred, name = predict_protein(rna, protein, observed, control, k=1,
+                                     device=torch.device("cpu"), use_direct=False)
+        self.assertEqual(name, "knn_control")
+        self.assertTrue(np.isfinite(pred).all())
+        self.assertTrue((pred < 90).all())
 
 
 if __name__ == "__main__":

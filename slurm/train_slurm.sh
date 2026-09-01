@@ -1,8 +1,17 @@
 #!/bin/bash
 #
+# THE single-job entry point for this repo: it runs any RUN_CMD inside the project
+# container. Per-tool wrapper scripts are not needed -- slurm/README.md carries the exact
+# command for each one, and slurm/parallel_train.sh is the many-runs-at-once counterpart.
+#
 # Usage:
 #   sbatch slurm/train_slurm.sh
 #   sbatch --export=ALL,RUN_CMD='PYTHONPATH=. python -u -m src.training.runner ...' slurm/train_slurm.sh
+#
+# GPU is used when the allocation has one and skipped when it does not, so a CPU-only tool
+# submits through the same script:
+#   sbatch --partition=jobs-cpu --gres=none --mem=96GB --time=08:00:00 \
+#     --export=ALL,RUN_CMD='...' slurm/train_slurm.sh
 #
 # GPU (cluster requires an exact model — generic gpu:1 is rejected):
 #   gpu:b200:1       → srvcore3
@@ -14,7 +23,10 @@
 #SBATCH --account=core-med1-telem
 #SBATCH --partition=jobs-gpu
 #SBATCH --gres=gpu:b200:1
-#SBATCH --cpus-per-gpu=8
+# --cpus-per-task, not --cpus-per-gpu: the two are mutually exclusive at submit time, so
+# the per-gpu form makes every `sbatch --cpus-per-task=N ... train_slurm.sh` a fatal error.
+# It also leaves SLURM_CPUS_PER_TASK unset, which silently drops the thread count below to 1.
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=128GB
 #SBATCH --time=07:00:00
 #SBATCH --job-name=scot_synthetic
@@ -38,6 +50,19 @@ echo "Workdir: $(pwd)"
 echo "Start time: $(date)"
 echo "CPUs per task: ${SLURM_CPUS_PER_TASK:-1}"
 [ -f main.py ] || { echo "ERROR: main.py not found in $(pwd)"; exit 1; }
+
+# GPU if the allocation has one, CPU otherwise. This script is the entry point for every
+# job in the repo, including numpy-only tools submitted with --gres=none, so it must not
+# demand a device they never asked for: without a GPU both `singularity --nv` and the CUDA
+# preflight are skipped rather than failing the job.
+if [ -n "${SLURM_JOB_GPUS:-}${SLURM_GPUS_ON_NODE:-}" ]; then
+  NV_FLAG="--nv"
+  echo "GPU allocation: ${SLURM_JOB_GPUS:-${SLURM_GPUS_ON_NODE}}"
+else
+  NV_FLAG=""
+  export SKIP_CUDA_PREFLIGHT=1
+  echo "No GPU in this allocation: running CPU-only, CUDA preflight skipped."
+fi
 
 CUDA_PREFLIGHT_REQUEUE="${CUDA_PREFLIGHT_REQUEUE:-1}"
 CUDA_PREFLIGHT_MAX_REQUEUES="${CUDA_PREFLIGHT_MAX_REQUEUES:-12}"
@@ -82,7 +107,7 @@ export PREPROCESS_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
 # 通过 srun + singularity 启动训练（CPU 预处理）
 set +e
-srun --cpu-bind=none singularity exec --nv --pwd "$(pwd)" "${CONTAINER}" /bin/bash -lc '
+srun --cpu-bind=none singularity exec ${NV_FLAG} --pwd "$(pwd)" "${CONTAINER}" /bin/bash -lc '
 set -euo pipefail
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$(pwd)${PYTHONPATH:+:${PYTHONPATH}}"

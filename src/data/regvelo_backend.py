@@ -1,21 +1,7 @@
-"""
-RegVelo velocity backend for the KOT pipeline.
-
-Drop-in alternative to run_scvelo (src/data/velocity.py): it produces the same
-output contract — a per-gene `velocity` layer, Ms/Mu moments, and the
-velocity_gene_diagnostics table. The only extra input is a prior gene regulatory
-network (GRN), built once per dataset by tools/build_grn_prior.py (DoRothEA to
-start; an ATAC-derived GRN for BMMC from its multiome companion later).
-
-RegVelo models transcription->splicing as one GRN-coupled ODE. For retained ADT
-target runs, use the docs' keep-dimension path: scVelo-style preprocessing first,
-then set_prior_grn(..., keep_dim=True) and preprocess_data(filter_on_r2=False).
-This keeps the ADT-target genes available for KOT while still using the upstream
-scVelo count/HVG filter to control obvious noise.
-
-set_prior_grn(adata, gt_net) takes the prior as rows=targets × cols=regulators.
-GRN edges are matched through AnnData gene aliases, then outputs are written by
-reg_vae.add_regvelo_outputs_to_adata(adata=adata).
+"""RegVelo velocity backend: same contract as run_scvelo (velocity layer, Ms/Mu,
+velocity_gene_diagnostics). Extra input is a GRN prior from
+tools/build_inputs.py grn-prior. For retained ADT-target runs use keep_dim=True
+and filter_on_r2=False so those genes stay available for KOT.
 """
 
 from __future__ import annotations
@@ -144,7 +130,7 @@ def run_regvelo(
     regvelo_log("constructing REGVELOVI model")
     reg_vae = REGVELOVI(adata, W=W, regulators=regulators)
     # RegVelo defaults to full-batch (the ODE solver holds a trajectory per cell), which
-    # OOMs on large datasets — pass a minibatch size for those (e.g. BMMC's 90k cells).
+    # OOMs on large datasets — pass a minibatch size for those.
     train_kwargs = {}
     if batch_size:
         train_kwargs["batch_size"] = int(batch_size)

@@ -37,7 +37,6 @@ from src.visualization.style import (
 
 
 def collect_benchmark(cache_dir: str | Path = "cache/training") -> pd.DataFrame:
-    """Tidy table of every completed run: one row per (run, model, dataset, seed)."""
     rows = []
     for summary in Path(cache_dir).rglob("*/summary.txt"):
         record: dict[str, str] = {}
@@ -85,10 +84,9 @@ def find_collapsed(df: pd.DataFrame) -> pd.Series:
 
     The kinetics residual is scale-degenerate — shrinking phi (and kappa, alpha
     with it) lowers the loss without the ODE becoming any more satisfied — so a
-    collapsed run is a training failure, not a measurement. Median FOSCTTM for
-    collapsed runs is at chance (0.46) against 0.07 for healthy ones, and the
-    ODE-consistency diagnostic *rises* under collapse, so these cannot be spotted
-    from the physics metrics alone.
+    collapsed run is a training failure, not a measurement. Physics metrics can
+    look *better* under collapse, so these cannot be spotted from the ODE
+    diagnostics alone.
     """
     ratio = pd.to_numeric(df.get("phi_variance_ratio"), errors="coerce")
     return ratio.notna() & (ratio < PHI_COLLAPSE_THRESHOLD)

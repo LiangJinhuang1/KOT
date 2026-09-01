@@ -1,8 +1,4 @@
-"""kappa-beta scaling degeneracy across the anchor ladder, both panels x both configs.
-
-One message (§7.2): where the beta prior binds, kappa rescales inversely to beta and the
-product kappa*beta -- what the ODE right-hand side depends on -- does not move.
-"""
+"""Where the β prior binds, κ rescales inversely; κ·β (what the ODE sees) does not."""
 import json, glob, collections
 import sys
 from pathlib import Path

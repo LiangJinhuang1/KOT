@@ -4,6 +4,8 @@ import numpy as np
 
 from src.data.splits import (
     fitted_row_indices,
+    held_out_mask,
+    reported_slice_mask,
     resolve_split_seed,
     split_digest,
     validation_mask,
@@ -197,6 +199,46 @@ class FitObsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fit_obs_key"):
             fitted_row_indices(
                 obs, {"fit_obs_key": "perturbation", "fit_obs_values": ["NT"]}, 42)
+
+    def test_returning_the_val_slice_to_training_survives_a_group_restriction(self):
+        """val_holdout_from_training=false used to be overridden by fit_obs_key alone."""
+        obs = self.obs()
+        cfg = {
+            "val_fraction": 0.2,
+            "val_holdout_from_training": False,
+            "fit_obs_key": "gene",
+            "fit_obs_values": ["NT"],
+        }
+        fitted = fitted_row_indices(obs, cfg, 42)
+        # Every NT cell is fitted: the group restriction still bites, the random one does not.
+        self.assertEqual(fitted.tolist(), list(range(80)))
+
+    def test_the_two_restrictions_are_independent(self):
+        obs = self.obs()
+        group_only = fitted_row_indices(
+            obs, {"fit_obs_key": "gene", "fit_obs_values": ["NT"]}, 42)
+        both = fitted_row_indices(
+            obs, {"val_fraction": 0.2, "fit_obs_key": "gene", "fit_obs_values": ["NT"]}, 42)
+        self.assertLess(both.size, group_only.size)
+        self.assertTrue(set(both).issubset(set(group_only)))
+
+    def test_in_sample_val_is_still_reported_when_returned_to_training(self):
+        """val_holdout_from_training=false must keep MEASURING the slice, not silence it.
+
+        Full-data runs use this mode: the val cells go back into the loss
+        and their FOSCTTM is reported marked in-sample.
+        """
+        obs = self.obs()
+        cfg = {"val_fraction": 0.2, "val_holdout_from_training": False}
+        self.assertFalse(held_out_mask(obs, cfg, 42).any())
+        self.assertGreater(int(reported_slice_mask(obs, cfg, 42).sum()), 0)
+
+    def test_the_reported_slice_contains_everything_held_out(self):
+        obs = self.obs()
+        cfg = {"val_fraction": 0.2, "fit_obs_key": "gene", "fit_obs_values": ["NT"]}
+        held = held_out_mask(obs, cfg, 42)
+        reported = reported_slice_mask(obs, cfg, 42)
+        self.assertTrue((reported | held == reported).all())
 
     def test_random_holdout_without_group_is_unchanged(self):
         obs = self.obs()

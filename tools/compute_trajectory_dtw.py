@@ -1,35 +1,5 @@
 #!/usr/bin/env python3
-"""
-Post-hoc trajectory DTW from saved KOT checkpoints.
-
-For every (run, model, seed, checkpoint) it loads `checkpoint_<name>.pt`,
-restores the model, maps RNA -> protein with phi, and computes the trajectory
-DTW distance against the observed protein trajectory along pseudotime:
-
-  traj_dtw_temporal : phi(r) ordered by PREDICTED pseudotime (nearest-neighbour
-                      protein match) vs observed protein ordered by TRUE
-                      pseudotime — recovery of the temporal ordering.
-  traj_dtw_recon    : both ordered by TRUE pseudotime — warp-tolerant
-                      reconstruction score.
-
-This is the axis FOSCTTM (matching) and JVP-cosine (physics) do not cover, so it
-is written to its own summary rather than folded into the FOSCTTM eval. Results
-are saved per run (so they travel with the run when it is copied) plus one
-combined aggregate:
-
-  <run_folder>/trajectory_dtw_summary.csv     (one file per run)
-  cache/results/trajectory_dtw_summary.csv    (all runs combined; --output)
-
-Usage:
-  python tools/compute_trajectory_dtw.py                       # all runs
-  python tools/compute_trajectory_dtw.py --runs cache/training/run_20260617_085640
-  python tools/compute_trajectory_dtw.py --runs "cache/training/run_20260617_*"
-  python tools/compute_trajectory_dtw.py --n-bins 50 --output my_dtw.csv
-
-Reuses load_dataset_for_run / build_model_and_tensors / collect_run_folders from
-evaluate_checkpoints.py, so the model architecture and input tensors match those
-used at training time exactly.
-"""
+"""Trajectory DTW from checkpoints. FOSCTTM is matching; JVP is physics; this is order."""
 
 from __future__ import annotations
 
@@ -98,8 +68,10 @@ def dtw_for_run(run_folder: Path, device, n_bins: int) -> list[dict]:
                 data_cache[dataset_name] = load_dataset_for_run(run_folder, dataset_name)
             rna_adata, protein_adata, run_cfg, _ = data_cache[dataset_name]
 
-            model, R_t, _V_t, P_t, _S_t, rna_obs, _mask_t, _align_cols = build_model_and_tensors(
+            (model, R_t, _V_t, P_t, _S_t, rna_obs, _mask_t, _align_cols,
+             _velocity_backend, _val_idx) = build_model_and_tensors(
                 run_cfg, rna_adata, protein_adata, model_name, device,
+                with_velocity_backend=False,
             )
 
             for seed_dir in sorted(

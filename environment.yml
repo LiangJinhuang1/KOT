@@ -23,6 +23,7 @@ dependencies:
   - pip:
       - geomloss
       - pykeops
+      - maxfuse
       - moscot
       - scglue
       - scvi-tools
