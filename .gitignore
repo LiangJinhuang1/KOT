@@ -25,7 +25,6 @@ assistant.py
 jobs_*.txt
 jobs/
 archive/
-figures/anchor_ablation/
 
 # --- Python ---
 __pycache__/
