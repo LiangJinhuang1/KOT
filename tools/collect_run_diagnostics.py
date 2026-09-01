@@ -70,6 +70,7 @@ DEFAULT_HPARAMS = [
     "dyn_warmup_epochs", "g_freeze_epochs",
     "phase1_epochs", "phase2_epochs", "phase3_epochs", "phase3_lr_scale",
     "kot_velocity_gauge_normalize", "kot_velocity_shuffle",
+    "kot_velocity_ablation", "kot_velocity_corrupt", "kot_s_permute",
     "kot_kinetics_require_velocity_gene",
     "phi_spectral_norm", "use_anchor", "beta_anchor_csv", "beta_anchor_subset_n",
 ]
@@ -86,6 +87,11 @@ DEFAULT_METRICS = [
     "train_foscttm", "train_n_cells",
     "val_holdout", "val_split_digest", "runtime_seconds",
     "jvp_rhs_cos_median", "jvp_rhs_cos_mean", "rel_residual_median",
+    # Branch accuracy is the v2b-branch stage's whole point: the A<->B swap is the
+    # degeneracy static OT cannot resolve, so only the dynamics term can. loss_dyn is the
+    # ODE residual the arm actually reached, flattened out of checkpoint_losses.
+    "branch_accuracy", "branch_accuracy_branched", "branch_n_branched",
+    "loss_dyn", "loss_align", "loss_total",
     # traj_dtw_recon orders both trajectories by TRUE pseudotime; traj_dtw_temporal orders
     # the prediction by its OWN pseudotime and so improves when that pseudotime collapses
     # (nodyn scores 0.702 vs 0.841 with dynamics on, while time_spearman falls to -0.32).

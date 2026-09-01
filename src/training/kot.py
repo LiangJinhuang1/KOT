@@ -31,7 +31,7 @@ from src.losses.jvp_physics import kinetics_loss
 from src.data.projection import projection_matrix_from_adatas
 from src.data.adt_gene_map import load_mapping_records
 from src.data.beta_anchor import resolve_beta_anchors
-from src.data.splits import resolve_split_seed, split_digest, validation_mask
+from src.data.splits import held_out_mask, resolve_split_seed, split_digest
 from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
 from src.evaluation.trajectory_dtw import trajectory_dtw
 from src.visualization import FOSCTTM_CHANCE, METHOD_COLORS, MODALITY_COLORS
@@ -385,6 +385,212 @@ def velocity_row_permutation(n_cells: int, seed: int) -> np.ndarray:
     return np.random.default_rng(seed).permutation(n_cells)
 
 
+VELOCITY_ABLATIONS = ("none", "shuffle", "reverse", "zero")
+
+
+def resolve_velocity_ablation(cfg: dict) -> str:
+    """Which velocity control this run uses, with the legacy boolean folded in.
+
+    kot_velocity_shuffle predates the enum and is written into every run dir and jobs
+    file of the permutation control, so it stays readable as an alias rather than
+    silently doing nothing on an old config. Asking for two different controls at once
+    is a contradiction the config cannot resolve, so it is an error, not a precedence
+    rule.
+    """
+    ablation = str(cfg.get("kot_velocity_ablation", "none")).lower()
+    if ablation not in VELOCITY_ABLATIONS:
+        raise ValueError(
+            f"kot_velocity_ablation must be one of {list(VELOCITY_ABLATIONS)}, "
+            f"got {ablation!r}"
+        )
+    if bool(cfg.get("kot_velocity_shuffle", False)):
+        if ablation not in ("none", "shuffle"):
+            raise ValueError(
+                f"kot_velocity_shuffle=true contradicts "
+                f"kot_velocity_ablation={ablation!r}; set only one of them."
+            )
+        return "shuffle"
+    return ablation
+
+
+def apply_velocity_ablation(velocity: np.ndarray, confidence: np.ndarray | None,
+                            cfg: dict) -> tuple[np.ndarray, np.ndarray | None]:
+    """The kinetics-term control: the real velocity field, or one piece of it broken.
+
+    Each arm removes one kind of information from L_dyn and leaves everything else in
+    the run identical, so a gap against the real arm names what the kinetics term was
+    using rather than just showing that it matters:
+
+      shuffle  every cell gets ANOTHER cell's real velocity. Keeps the vectors, their
+               per-cell norms (so the gauge below is unchanged) and the gene-gene
+               structure; destroys only which cell each velocity belongs to.
+      reverse  v -> -v. Keeps every norm, the gauge and the cell correspondence;
+               destroys only the arrow of time, so J_phi.v runs back down the
+               trajectory while its magnitude still matches the RHS.
+      zero     v -> 0, hence J_phi.v = 0 exactly. The residual keeps only the state
+               relation kappa(alpha*Sr - beta*phi), which is what isolates how much of
+               the alignment comes from the static half of the ODE.
+
+    The confidence rides the shuffle: it grades that cell's own velocity fit, so leaving
+    it behind would decouple the weight from the vector it weights and make the two arms
+    differ in two ways rather than one. reverse and zero move nothing between cells, so
+    it stays where it is. `confidence` is None for callers that only need to rebuild the
+    velocity -- checkpoint re-evaluation reports physics, which never weights by it.
+
+    The printed line is the audit trail that the control actually fired, and the only
+    honest one -- the JVP-RHS cosine cannot serve as that check, because the ODE
+    right-hand side contains no v.
+    """
+    ablation = resolve_velocity_ablation(cfg)
+    corrupt = float(cfg.get("kot_velocity_corrupt", 0.0))
+    if not 0.0 <= corrupt <= 1.0:
+        raise ValueError(f"kot_velocity_corrupt must be in [0, 1], got {corrupt}")
+    if corrupt > 0.0 and ablation != "none":
+        raise ValueError(
+            f"kot_velocity_corrupt={corrupt} contradicts kot_velocity_ablation="
+            f"{ablation!r}: the mixture already spans real (x=0) to shuffled (x=1)."
+        )
+    n = velocity.shape[0]
+    if corrupt > 0.0:
+        print(f"[kot] CORRUPTED velocity (control): v <- {1 - corrupt:.2f}*v + "
+              f"{corrupt:.2f}*v[perm] over {n} cells (x={corrupt})")
+        return corrupt_velocity(velocity, confidence, corrupt, int(cfg.get("seed", 42)))
+    if ablation == "none":
+        return velocity, confidence
+    if ablation == "shuffle":
+        perm = velocity_row_permutation(n, int(cfg.get("seed", 42)))
+        print(f"[kot] SHUFFLED velocity (control): rows permuted across {n} cells, "
+              f"{int((perm == np.arange(n)).sum())} left in place")
+        return velocity[perm], (None if confidence is None else confidence[perm])
+    if ablation == "reverse":
+        print(f"[kot] REVERSED velocity (control): v -> -v over {n} cells, "
+              f"per-cell norms and the gauge unchanged")
+        return -velocity, confidence
+    print(f"[kot] ZEROED velocity (control): J_phi.v = 0 over {n} cells, "
+          f"kinetics residual keeps only the state term")
+    return np.zeros_like(velocity), confidence
+
+
+def median_norm_ratio(reference: np.ndarray, candidate: np.ndarray) -> float:
+    """Scalar putting `candidate`'s median per-cell norm back onto `reference`'s.
+
+    Medians rather than means so a few very fast cells cannot set the scale for all of
+    them, and nonzero rows only, for the same reason build_effective_velocity uses them:
+    a cell with no velocity carries no length to match and would drag the median down.
+    Returns 1.0 when either side has no nonzero row, which leaves the field untouched.
+    """
+    ref = np.linalg.norm(reference, axis=1)
+    cand = np.linalg.norm(candidate, axis=1)
+    ref, cand = ref[ref > DIAG_EPS], cand[cand > DIAG_EPS]
+    if ref.size == 0 or cand.size == 0:
+        return 1.0
+    return float(np.median(ref) / np.median(cand))
+
+
+def corrupt_velocity(velocity: np.ndarray, confidence: np.ndarray | None, fraction: float,
+                     seed: int) -> tuple[np.ndarray, np.ndarray | None]:
+    """Mix a cell's own velocity with another cell's: (1-x)*v + x*v[perm].
+
+    The dose-response version of the shuffle. x=0 returns the real field and x=1 returns
+    exactly the shuffle arm -- same permutation, same seed -- so the endpoints ARE the two
+    arms already run and only the interior is new. That is what makes the curve readable
+    as one axis rather than five unrelated runs.
+
+    The confidence is interpolated on the same x. It grades the cell's own velocity fit,
+    so at x it is grading a vector that is x of the way to someone else's; blending it
+    keeps the weight matched to the vector it weights, and makes x=1 reproduce the shuffle
+    arm's confidence rather than jumping to it.
+
+    The raw mixture is NOT norm-preserving: v and v[perm] are near-independent, so its
+    length follows sqrt((1-x)^2 + x^2) -- 1.00 at x=0, ~0.71 at x=0.5, 1.00 at x=1. The
+    interior arms would then carry shorter velocity as well as more wrongly directed
+    velocity, and a FOSCTTM dip at x=0.5 could be either. So the mixture is rescaled by one
+    scalar per arm, restoring its median per-cell norm to the field it came from.
+
+    That scalar is exactly 1.0 at both endpoints and so cannot disturb them: at x=0 the
+    mixture IS v, and at x=1 it is v[perm], whose per-cell norms are a permutation of v's
+    and therefore share its median. The endpoint identities with the real and shuffle arms
+    survive bit-for-bit, and only the interior is corrected.
+
+    This is deliberately not the velocity gauge. The gauge is a global setting that also
+    rescales the real arm, and on the synthetic stage it amplifies a small true velocity
+    until dyn overpowers align (branch accuracy falls to chance while the JVP cosine rises
+    -- measured, see jobs_synth_gauge_pilot.txt). This scalar only ever touches a corrupted
+    arm, and leaves every other arm exactly as it was.
+    """
+    perm = velocity_row_permutation(velocity.shape[0], seed)
+    mixed = (1.0 - fraction) * velocity + fraction * velocity[perm]
+    mixed = mixed * median_norm_ratio(velocity, mixed)
+    if confidence is None:
+        return mixed.astype(velocity.dtype), None
+    mixed_conf = (1.0 - fraction) * confidence + fraction * confidence[perm]
+    return mixed.astype(velocity.dtype), mixed_conf.astype(confidence.dtype)
+
+
+def branch_accuracy_scores(state_true: np.ndarray, state_pred: np.ndarray) -> dict:
+    """Fraction of cells whose nearest protein match carries the same branch label.
+
+    The confusion matrix beside this holds the same information, but as a nested list it
+    is invisible to tools/collect_run_diagnostics.py, which only columns flat scalars --
+    so the number a sweep is actually read on has to be its own key.
+
+    Two numbers, because they answer different questions. `branch_accuracy` is over every
+    labelled cell and matches the confusion matrix. `branch_accuracy_branched` keeps only
+    cells on a real branch (label starting "Branch_"), which is the metric the v2b-branch
+    stage is built for: the A<->B swap is the degeneracy that static OT genuinely cannot
+    resolve, and progenitor cells sit before the bifurcation, so including them dilutes
+    the measurement toward 1.0 with cells that were never ambiguous. On a trunk-only
+    stage every label is "Trunk", so the first is trivially 1.0 and the second is NaN --
+    which is the honest report, not a failure.
+    """
+    if len(state_true) == 0:
+        return {"branch_accuracy": float("nan"), "branch_accuracy_branched": float("nan"),
+                "branch_n_branched": 0}
+    branched = np.char.startswith(state_true.astype(str), "Branch_")
+    matched = state_true == state_pred
+    return {
+        "branch_accuracy": float(np.mean(matched)),
+        "branch_accuracy_branched": (
+            float(np.mean(matched[branched])) if branched.any() else float("nan")
+        ),
+        "branch_n_branched": int(branched.sum()),
+    }
+
+
+def permute_s_rows(S: np.ndarray, seed: int) -> np.ndarray:
+    """Give each mapped protein another mapped protein's gene row.
+
+    The control for the RNA->protein map itself: S keeps its shape, its values and its
+    per-row sparsity, so a gap against the real arm measures which gene feeds which
+    protein and not how much structure S carries.
+
+    Only rows that carry a link take part. A protein has a non-zero S row exactly when
+    it is kinetically active (`assert_no_orphan_s_rows`), so permuting inside that set
+    leaves the kinetic mask untouched, leaves the count that survives the velocity-gene
+    filter unchanged, and leaves the gene set behind the RNA-side velocity weight
+    (a column property of S) identical -- the mapping is the only thing that moves.
+    """
+    mapped = np.nonzero((S != 0).any(axis=1))[0]
+    perm = np.random.default_rng(seed).permutation(len(mapped))
+    permuted = S.copy()
+    permuted[mapped] = S[mapped[perm]]
+    return permuted
+
+
+def apply_s_permutation(S: np.ndarray, cfg: dict) -> np.ndarray:
+    """S under the mapping control, or S itself. Seeded off the run seed like the
+    velocity shuffle, so each seed draws its own broken mapping and the control carries
+    the same seed variance as the arm it is compared against."""
+    if not bool(cfg.get("kot_s_permute", False)):
+        return S
+    permuted = permute_s_rows(S, int(cfg.get("seed", 42)))
+    mapped = np.nonzero((S != 0).any(axis=1))[0]
+    kept = int((permuted[mapped] == S[mapped]).all(axis=1).sum())
+    print(f"[kot] PERMUTED S rows (control): RNA->protein map reassigned across "
+          f"{len(mapped)} mapped proteins, {kept} left in place")
+    return permuted
+
+
 def resolve_velocity_confidence(rna_adata, n_cells: int) -> np.ndarray:
     """Per-cell scVelo velocity_confidence, or all-ones when the column is absent."""
     if "velocity_confidence" in rna_adata.obs.columns:
@@ -487,7 +693,20 @@ def summarize_distribution(values, prefix: str) -> dict:
     return {f"{prefix}_{s}": stats[s] for s in STAT_SUFFIXES}
 
 
-def bounded_head_saturation(values: np.ndarray, min_value: float, max_value: float | None,
+def head_bounds(head) -> tuple[float | None, float | None]:
+    """(min, max) of a BoundedPositiveMLP head, or (None, None) for one with no bounds.
+
+    Two heads have none: an unbounded softplus head, and a Fixed* head, which is a
+    registered buffer rather than something trained. Saturation asks whether a LEARNED
+    head is being pinned by its limits instead of by the data, so a fixed head has
+    nothing to report -- and reporting nothing is what keeps kot_oracle / kot_fixedkappa
+    / kot_fixedalpha from dying on an attribute their head never had.
+    """
+    return getattr(head, "min_value", None), getattr(head, "max_value", None)
+
+
+def bounded_head_saturation(values: np.ndarray, min_value: float | None,
+                            max_value: float | None,
                             prefix: str, edge_frac: float = 0.05) -> dict:
     """How much of a BoundedPositiveMLP head sits at its limits instead of being learned.
 
@@ -497,7 +716,7 @@ def bounded_head_saturation(values: np.ndarray, min_value: float, max_value: flo
     not the data, is setting them. Reported because `alpha_max` is one extreme of ~10^5
     entries and says nothing about the bulk. Empty for an unbounded (softplus) head.
     """
-    if max_value is None:
+    if max_value is None or min_value is None:
         return {}
     span = max_value - min_value
     flat = np.asarray(values).reshape(-1)
@@ -607,7 +826,66 @@ def velocity_backend_skip(out: dict, reason: str) -> dict:
     return out
 
 
-def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dict) -> dict:
+def align_velocity_fields(rna_adata, velocity: np.ndarray, other, layer: str):
+    """Both velocity fields on the (cell, gene) grid the two files share.
+
+    Matched BY NAME, never by position: the two AnnData objects were filtered and ordered
+    independently, so comparing row i to row i would silently pair different cells.
+    Returns (v_self, v_other, cells, genes); empty indexes mean nothing is shared and the
+    caller reports that rather than dividing by zero.
+
+    The comparison field is NaN-scrubbed here because backends leave NaN for genes they
+    could not fit, and one NaN poisons an entire row's dot product.
+    """
+    self_cells = pd.Index(rna_adata.obs_names)
+    self_genes = pd.Index(rna_adata.var_names)
+    cells = self_cells.intersection(pd.Index(other.obs_names))
+    genes = self_genes.intersection(pd.Index(other.var_names))
+    if len(cells) == 0 or len(genes) == 0:
+        return np.zeros((0, 0)), np.zeros((0, 0)), cells, genes
+    v_self = velocity[self_cells.get_indexer(cells)][:, self_genes.get_indexer(genes)]
+    v_other = np.nan_to_num(to_dense(other.layers[layer], np.float32), nan=0.0)
+    v_other = v_other[pd.Index(other.obs_names).get_indexer(cells)][
+        :, pd.Index(other.var_names).get_indexer(genes)
+    ]
+    return v_self, v_other, cells, genes
+
+
+def log_norm_ratio_stats(a: np.ndarray, b: np.ndarray, axis: int, prefix: str) -> dict:
+    """How much LONGER one field's vectors are than the other's, as a ratio.
+
+    Cosine answers only half of "how different are these two velocity fields": it is
+    scale-invariant, so two fields that agree perfectly in direction but differ 10x in
+    magnitude score 1.0. The difference decomposes exactly into direction and magnitude --
+    for unit-scaled vectors ||a - b||^2 = 2(1 - cos), so once the cosine is known the only
+    remaining information is this ratio.
+
+    Summarised in the LOG domain and exponentiated back, so that 2x and 0.5x are equal and
+    opposite rather than one being pulled toward the mean by the other. Rows where either
+    side is empty carry no ratio and are dropped rather than counted as 1.0.
+    """
+    norm_a = np.linalg.norm(a, axis=axis)
+    norm_b = np.linalg.norm(b, axis=axis)
+    usable = (norm_a > DIAG_EPS) & (norm_b > DIAG_EPS)
+    if not usable.any():
+        return {f"{prefix}_{k}": float("nan") for k in ("median", "q25", "q75")} | {
+            f"{prefix}_n": 0}
+    log_ratio = np.log(norm_a[usable]) - np.log(norm_b[usable])
+    q25, median, q75 = np.quantile(log_ratio, (0.25, 0.50, 0.75))
+    return {f"{prefix}_median": float(np.exp(median)), f"{prefix}_q25": float(np.exp(q25)),
+            f"{prefix}_q75": float(np.exp(q75)), f"{prefix}_n": int(usable.sum())}
+
+
+def per_gene_cosine(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Cosine per GENE (column) across cells -- the diagonal of the cross-backend
+    gene-by-gene product, i.e. how much the two providers agree about each gene's velocity
+    over the whole population. The per-cell cosine asks the transposed question."""
+    denom = np.linalg.norm(a, axis=0) * np.linalg.norm(b, axis=0)
+    return (a * b).sum(axis=0) / (denom + DIAG_EPS)
+
+
+def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dict,
+                                       velocity_weight: np.ndarray | None = None) -> dict:
     """Per-cell cos(v_i from this run, v_i from a second velocity backend).
 
     scVelo and RegVelo never meet inside one run — datasets.yaml swaps `rna_path` between
@@ -617,6 +895,15 @@ def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dic
     other backend's h5ad and this measures that difference directly, per cell, over the
     cells and genes the two files share.
 
+    Reported twice. `velocity_backend_cos_*` is over every shared gene -- how different
+    the two fields are as published. `velocity_backend_cos_kot_*` applies the run's
+    RNA-side velocity weight first, so it is the agreement over exactly the coordinates
+    that reach J_phi.v: with kot_velocity_s_linked_only or kot_velocity_rna_reliability on,
+    most genes never enter the Jacobian, and two backends can disagree wildly on genes KOT
+    never looks at. Gauge normalisation is deliberately NOT applied -- it is one global
+    scalar per field, so it cancels in a per-cell cosine and would change nothing. With no
+    weight configured the two sets are equal by construction.
+
     A configuration that cannot be compared (no path configured, missing file, missing
     layer, no shared cells/genes, velocity not in gene space) is reported as NaN with a
     reason rather than raising. A file that exists but cannot be read does raise.
@@ -624,7 +911,9 @@ def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dic
     compare_path = cfg.get("kot_velocity_compare_h5ad")
     layer = str(cfg.get("kot_velocity_compare_layer", "velocity"))
     out = summarize_distribution([], "velocity_backend_cos")
+    out.update(summarize_distribution([], "velocity_backend_cos_kot"))
     out.update({
+        "velocity_backend_kot_n_genes": 0,
         "velocity_backend_compare_h5ad": str(compare_path) if compare_path else None,
         "velocity_backend_compare_layer": layer,
         "velocity_backend_label": cfg.get("kot_velocity_compare_label"),
@@ -651,39 +940,75 @@ def compute_velocity_backend_agreement(rna_adata, velocity: np.ndarray, cfg: dic
             out, f"layer '{layer}' missing from '{compare_path}' "
                  f"(has: {list(other.layers.keys())})")
 
-    self_cells = pd.Index(rna_adata.obs_names)
     self_genes = pd.Index(rna_adata.var_names)
-    cells = self_cells.intersection(pd.Index(other.obs_names))
-    genes = self_genes.intersection(pd.Index(other.var_names))
+    v_self, v_other, cells, genes = align_velocity_fields(
+        rna_adata, velocity, other, layer)
+    del other                          # free the comparison AnnData before the einsum
     if len(cells) == 0 or len(genes) == 0:
         return velocity_backend_skip(
             out, f"no shared cells/genes with '{compare_path}' "
                  f"({len(cells)} cells, {len(genes)} genes)")
 
-    v_self = velocity[self_cells.get_indexer(cells)][:, self_genes.get_indexer(genes)]
-    v_other = np.nan_to_num(to_dense(other.layers[layer], np.float32), nan=0.0)
-    v_other = v_other[pd.Index(other.obs_names).get_indexer(cells)][
-        :, pd.Index(other.var_names).get_indexer(genes)
-    ]
-    del other                          # free the comparison AnnData before the einsum
-
-    dot = np.einsum("ij,ij->i", v_self, v_other).astype(np.float64)
-    denom = np.linalg.norm(v_self, axis=1) * np.linalg.norm(v_other, axis=1)
-    cos = dot / (denom + DIAG_EPS)
-
+    cos = per_cell_cosine(v_self, v_other)
     out.update(summarize_distribution(cos, "velocity_backend_cos"))
+    # The same comparison restricted to the genes KOT actually pushes through the
+    # Jacobian. The weight is indexed over the run's full gene axis, so it is subset to
+    # the shared genes the same way the two velocity matrices were.
+    if velocity_weight is None:
+        weight_shared = np.ones(len(genes), dtype=np.float32)
+    else:
+        weight_shared = velocity_weight[self_genes.get_indexer(genes)]
+    cos_kot = per_cell_cosine(v_self * weight_shared[None, :],
+                              v_other * weight_shared[None, :])
+    out.update(summarize_distribution(cos_kot, "velocity_backend_cos_kot"))
+    out["velocity_backend_kot_n_genes"] = int((weight_shared != 0).sum())
+    # The magnitude half of the difference, on the same vectors the cosine used.
+    out.update(log_norm_ratio_stats(v_self, v_other, 1, "velocity_backend_norm_ratio"))
+    out.update(log_norm_ratio_stats(v_self * weight_shared[None, :],
+                                    v_other * weight_shared[None, :], 1,
+                                    "velocity_backend_norm_ratio_kot"))
     out["velocity_backend_n_cells"] = int(len(cells))
     out["velocity_backend_n_genes"] = int(len(genes))
     # Cells where one backend produced no velocity at all: their cosine is a forced 0 and
-    # says nothing about agreement, so report how many rows are in that state.
-    out["velocity_backend_zero_frac"] = float(np.mean(denom <= DIAG_EPS))
+    # says nothing about agreement, so report how many rows are in that state. Reported
+    # for BOTH gene sets -- a cell can carry velocity somewhere in the transcriptome and
+    # none at all on the handful of genes the mask keeps, and those forced zeros drag the
+    # masked median toward 0 while the unmasked fraction still reads 0%.
+    out["velocity_backend_zero_frac"] = zero_norm_fraction(v_self, v_other)
+    out["velocity_backend_kot_zero_frac"] = zero_norm_fraction(
+        v_self * weight_shared[None, :], v_other * weight_shared[None, :])
     out["velocity_backend_status"] = "ok"
     print(f"[kot] velocity-backend cos vs {compare_path}: "
           f"median={out['velocity_backend_cos_median']:+.3f} "
           f"mean={out['velocity_backend_cos_mean']:+.3f} "
           f"[q25={out['velocity_backend_cos_q25']:+.3f}, q75={out['velocity_backend_cos_q75']:+.3f}] "
           f"over {len(cells)} cells x {len(genes)} genes")
+    print(f"[kot] velocity-backend cos (KOT-masked): "
+          f"median={out['velocity_backend_cos_kot_median']:+.3f} "
+          f"mean={out['velocity_backend_cos_kot_mean']:+.3f} "
+          f"[q25={out['velocity_backend_cos_kot_q25']:+.3f}, "
+          f"q75={out['velocity_backend_cos_kot_q75']:+.3f}] "
+          f"over {out['velocity_backend_kot_n_genes']}/{len(genes)} genes in the JVP")
     return out
+
+
+def zero_norm_fraction(a: np.ndarray, b: np.ndarray) -> float:
+    """Fraction of rows where either side has no direction at all, so the cosine is a
+    forced 0 that means "no evidence" rather than "orthogonal"."""
+    denom = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+    return float(np.mean(denom <= DIAG_EPS))
+
+
+def per_cell_cosine(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Row-wise cosine, with a floored denominator so an all-zero row gives 0, not NaN.
+
+    A cell whose kept genes are all zero in either field has no direction to compare; a
+    forced 0 says "no evidence" and is counted by velocity_backend_zero_frac, whereas a
+    NaN would silently drop the cell out of every quantile below.
+    """
+    dot = np.einsum("ij,ij->i", a, b).astype(np.float64)
+    denom = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+    return dot / (denom + DIAG_EPS)
 
 
 def build_effective_velocity(
@@ -771,8 +1096,8 @@ def compute_jvp_rhs_diagnostics(
     out.update(summarize_distribution(kappa_np, "kappa"))
     out.update(summarize_distribution(alpha_np, "alpha"))
     # Where α and κ sit relative to their bounds, and the per-protein α the panel learned.
-    out.update(bounded_head_saturation(kappa_np, model.kappa.min_value, model.kappa.max_value, "kappa"))
-    out.update(bounded_head_saturation(alpha_np, model.g.min_value, model.g.max_value, "alpha"))
+    out.update(bounded_head_saturation(kappa_np, *head_bounds(model.kappa), "kappa"))
+    out.update(bounded_head_saturation(alpha_np, *head_bounds(model.g), "alpha"))
     out["alpha_frac_constant_across_cells"] = constant_output_fraction(alpha_np)
     out["alpha_per_protein_mean"] = alpha_np.mean(axis=0).tolist()
     # Back-compat aliases for the existing plots / CSVs / collect_run_diagnostics.py.
@@ -1302,9 +1627,11 @@ def compute_full_diagnostics(model, inputs: DiagInputs, subset: int = 1024) -> d
         for t_label, p_label in zip(state_true, state_pred):
             conf[label_to_idx[t_label], label_to_idx[p_label]] += 1
         conf_mat = conf.tolist()
+        branch_scores = branch_accuracy_scores(state_true, state_pred)
     else:
         labels = []
         conf_mat = []
+        branch_scores = branch_accuracy_scores(np.array([]), np.array([]))
 
     phi_np = phi_metric.cpu().numpy()
     p_np = P_metric.cpu().numpy()
@@ -1342,6 +1669,7 @@ def compute_full_diagnostics(model, inputs: DiagInputs, subset: int = 1024) -> d
         "traj_dtw_recon":            traj_dtw_recon,
         "branch_confusion_matrix":   conf_mat,
         "branch_confusion_labels":   labels,
+        **branch_scores,
         "phi_variance":              var_phi,
         "p_variance":                var_p,
         "phi_variance_ratio":        phi_var_ratio,
@@ -1571,6 +1899,11 @@ def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
         d["checkpoint"]        = name
         d["checkpoint_epoch"]  = ep
         d["checkpoint_losses"] = lo
+        # Flat copies too: checkpoint_losses is a dict, and collect_run_diagnostics.py
+        # columns only scalars, so the dynamics loss is unreadable without these.
+        d.update({f"loss_{key}": value for key, value in lo.items()})
+        if name == "best_align":
+            diagnostics.update({f"loss_{key}": value for key, value in lo.items()})
         with open(out / f"diagnostics_{name}.json", "w") as f:
             json.dump(d, f, indent=2)
         pd.DataFrame({"foscttm": pc["foscttm"]}).to_csv(
@@ -2075,6 +2408,11 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         use_explicit_links=use_explicit_links,
         require_full_panel=require_full_panel,
     )
+    # Control for the RNA->protein map: reassign gene rows across mapped proteins. It has
+    # to happen here, on the feature-space S, because S_model below is projected through
+    # the PCs -- permuting rows after that would shuffle protein PCA components, which
+    # are not proteins and carry no mapping to destroy.
+    S_np = apply_s_permutation(S_np, cfg)
     # Kinetics mask over the protein axis: only in feature space is each protein a
     # row of φ; in representation mode the protein-PCA axis mixes proteins, so no
     # per-protein masking (all components participate).
@@ -2096,22 +2434,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         rna_adata, velocity_layer, D_r, use_feature_space,
     )
     conf = resolve_velocity_confidence(rna_adata, n)
-    # Control: give every cell another cell's real velocity. Permuting rows keeps the
-    # vectors, their per-cell norms (so the gauge below is unchanged) and the gene-gene
-    # structure, and destroys only the cell-to-velocity correspondence -- so a gap
-    # against the real run measures the information in that correspondence, not the
-    # scale or the mere presence of a kinetics term. The confidence rides the same
-    # permutation: it grades that cell's own velocity fit, so leaving it behind would
-    # decouple the weight from the vector it weights and make the two arms differ in
-    # two ways rather than one.
-    if bool(cfg.get("kot_velocity_shuffle", False)):
-        perm = velocity_row_permutation(n, int(cfg.get("seed", 42)))
-        V, conf = V[perm], conf[perm]
-        # One line per seed: the audit trail that the control actually fired, and the
-        # only honest one -- the JVP-RHS cosine cannot serve as that check, because the
-        # ODE right-hand side contains no v.
-        print(f"[kot] SHUFFLED velocity (control): rows permuted across {n} cells, "
-              f"{int((perm == np.arange(n)).sum())} left in place")
+    # Kinetics-term control: shuffle / reverse / zero the velocity, each breaking one
+    # kind of information in L_dyn (see apply_velocity_ablation). "none" is the real arm.
+    V, conf = apply_velocity_ablation(V, conf, cfg)
 
     # (Velocity gauge normalisation now happens on the EFFECTIVE velocity V_eff below,
     # after the RNA-side weight is applied — the gauge must be measured from the exact
@@ -2143,21 +2468,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     S_t    = to_tensor(S_model, device)   # (D_p, D_r)
     conf_t = to_tensor(conf,  device)   # (n,)
 
-    # ---- Validation split (development only; see src/data/splits.py) ----
-    # Held out of BOTH loss terms, so ranking configurations on it is not ranking them
-    # on the cells the headline FOSCTTM is reported on. Membership is decided by the
-    # barcode hash, with nothing to load and no file to keep in sync. The final runs set
-    # val_holdout_from_training=false and train on everything; the val columns are then
-    # in-sample and say so.
-    #
-    # val_split_per_seed mixes THIS run's seed into the hash, so a config's seeds are
-    # drawn against different splits and the seed mean is a mean over splits too. The
-    # config is not an input, so two configs at the same seed still share a split and
-    # the paired comparison across configs holds.
-    #
-    # val_stratify_by names an obs column whose every level then contributes its own
-    # share exactly, instead of a binomial share that can round to zero for a rare
-    # cell type. Unset (the default) keeps the plain barcode threshold.
+    # ---- Held-out cells (see src/data/splits.py) ----
+    # One mask for the random/stratified val_fraction slice and for CRISPR group
+    # holdout (fit_obs_key). KOT still evaluates φ on every cell; only the loss is
+    # restricted, so knockout transcriptomes can be scored out of sample.
     val_fraction   = float(cfg.get("val_fraction", 0.0))
     val_split_seed = resolve_split_seed(
         int(cfg.get("val_split_seed", 20260825)),
@@ -2165,31 +2479,12 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         bool(cfg.get("val_split_per_seed", False)),
     )
     val_stratify_by = cfg.get("val_stratify_by") or None
-    val_strata = None
-    if val_stratify_by is not None and val_fraction > 0.0:
-        if val_stratify_by not in rna_adata.obs.columns:
-            raise ValueError(
-                f"val_stratify_by={val_stratify_by!r} is not an obs column of the RNA "
-                f"AnnData. Available: {sorted(rna_adata.obs.columns)}"
-            )
-        val_strata = rna_adata.obs[val_stratify_by].astype(str).to_numpy()
-    val_mask_np = validation_mask(rna_adata.obs_names, val_fraction, val_split_seed,
-                                  strata=val_strata)
-    # Which side of the fixed split this run FITS.
-    #
-    #   fit_tuning_subset=true   fit the SMALL side (val_fraction of the cells) -- the
-    #                            tuning subset the sweep is allowed to select on. Rank
-    #                            such a sweep on train_foscttm.
-    #   fit_tuning_subset=false  the original behaviour: fit the large side.
-    #
-    # Inverting the mask here rather than special-casing train_idx below keeps every
-    # downstream name honest: `val` always means "held out of this run's loss" and
-    # `train` always means "fitted by this run", whichever side that is. The split
-    # itself is untouched, so the two sides stay exact complements.
-    if bool(cfg.get("fit_tuning_subset", False)) and val_fraction > 0.0:
-        val_mask_np = ~val_mask_np
+    fit_obs_key = cfg.get("fit_obs_key") or None
+    val_mask_np = held_out_mask(rna_adata.obs, cfg, seed)
     n_val = int(val_mask_np.sum())
-    val_holdout = bool(cfg.get("val_holdout_from_training", True)) and n_val > 0
+    val_holdout = n_val > 0 and (
+        bool(cfg.get("val_holdout_from_training", True)) or fit_obs_key is not None
+    )
     val_idx_t = (
         to_index_tensor(np.nonzero(val_mask_np)[0], device) if n_val > 0 else None
     )
@@ -2201,10 +2496,11 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     n_train = n - n_val if val_holdout else n
     if n_val > 0:
         held = "held out of training" if val_holdout else "IN training (val is in-sample)"
-        strat = f" | stratified by {val_stratify_by} ({len(np.unique(val_strata))} levels)" \
-            if val_strata is not None else ""
+        strat = f" | stratified by {val_stratify_by}" if val_stratify_by is not None else ""
+        group = (f" | fit_obs {fit_obs_key} in {list(cfg.get('fit_obs_values', []))}"
+                 if fit_obs_key is not None else "")
         print(f"[kot] validation split: {n_val}/{n} cells ({100 * n_val / n:.1f}%) {held} "
-              f"| split_seed={val_split_seed}{strat} "
+              f"| split_seed={val_split_seed}{strat}{group} "
               f"digest={split_digest(rna_adata.obs_names, val_mask_np)}")
     else:
         print("[kot] validation split: off (val_fraction=0)")
@@ -2251,7 +2547,8 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # velocity field, which is the only way to see how much of a scVelo-vs-RegVelo result
     # gap comes from the input rather than from KOT.
     velocity_diag = velocity_norm_diagnostics(V_eff)
-    velocity_diag.update(compute_velocity_backend_agreement(rna_adata, V, cfg))
+    velocity_diag.update(
+        compute_velocity_backend_agreement(rna_adata, V, cfg, velocity_weight_np))
     print(f"[kot] ‖v_eff‖ per cell: median={velocity_diag['v_eff_norm_median']:.4g} "
           f"mean={velocity_diag['v_eff_norm_mean']:.4g} "
           f"[q25={velocity_diag['v_eff_norm_q25']:.4g}, q75={velocity_diag['v_eff_norm_q75']:.4g}]  "
@@ -2925,6 +3222,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     # differ, and the resolved one is what the digest can be reproduced from.
     diagnostics["val_split_seed_resolved"] = int(val_split_seed) if n_val > 0 else None
     diagnostics["val_stratify_by"]   = val_stratify_by if n_val > 0 else None
+    diagnostics["fit_obs_key"]       = fit_obs_key
+    diagnostics["fit_obs_values"]    = (
+        list(cfg.get("fit_obs_values", [])) if fit_obs_key is not None else None
+    )
     diagnostics["n_train_cells"]     = int(n_train)
     diagnostics["early_stopping_monitor"] = early_stopping_monitor
     diagnostics["best_dyn_epoch"]    = int(best_dyn_epoch) if best_dyn_state is not None else None

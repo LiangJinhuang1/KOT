@@ -9,9 +9,10 @@ beta-anchor error. This turns the first into the second, so the paper table and 
 sweep never disagree about what a config scored.
 
 `--extra` appends key columns after the standard ones. Use it when the axis that
-separates two arms is not in the standard set -- a velocity-shuffle control and its
-real arm are identical in every standard column, so without it they collapse into one
-row and the file silently averages the two arms together.
+separates two arms is not in the standard set -- a kinetics control and its real arm are
+identical in every standard column, so without it they collapse into one row and the file
+silently averages the two arms together. For the kinetics ablations that means
+`--extra kot_velocity_ablation,kot_s_permute`.
 
 Usage:
   python tools/summarize_runs.py <per_seed.csv> <out.csv> [--extra col[,col...]]

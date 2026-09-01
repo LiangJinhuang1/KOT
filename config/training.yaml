@@ -176,9 +176,25 @@ defaults:
   kot_fixed_beta: null
   kot_beta_warmstart_from_anchor: false   # init β at anchor targets, keep trainable + soft prior
   kot_beta_anchor_shuffle: false          # control: permute β* across proteins (assertion vs recovery test)
-  # Control: permute velocity rows across cells. Keeps the vectors, their norms and the
-  # gauge; destroys only which cell each velocity belongs to.
+  # Kinetics-term controls. Each breaks ONE kind of information the ODE residual could be
+  # using and leaves the rest of the run identical, so the FOSCTTM gap against the real
+  # arm names what L_dyn contributes rather than only showing that it does:
+  #   shuffle  cell -> velocity correspondence (real vectors, wrong cells)
+  #   reverse  the arrow of time (v -> -v; norms, gauge and cell identity all intact)
+  #   zero     all velocity (J_phi.v = 0, leaving only the state term kappa(alpha*Sr - beta*phi))
+  kot_velocity_ablation: none
+  # Deprecated alias for kot_velocity_ablation=shuffle, kept so the run dirs and jobs
+  # files of the permutation control stay readable. Setting both is an error.
   kot_velocity_shuffle: false
+  # Dose-response between the real field (0.0) and the row shuffle (1.0):
+  #   v <- (1-x)*v + x*v[perm], with the confidence mixed on the same x.
+  # Same permutation as the shuffle arm at the same seed, so x=1 reproduces it exactly.
+  # Mutually exclusive with kot_velocity_ablation (the mixture already spans both ends).
+  kot_velocity_corrupt: 0.0
+  # Control: give each mapped protein another mapped protein's gene row in S. Preserves
+  # S's shape, values, per-row sparsity and the kinetic mask; destroys only which gene
+  # feeds which protein.
+  kot_s_permute: false
   kot_velocity_rna_reliability: false     # zero velocity of non-velocity_gene RNA coords before the JVP
   kot_velocity_s_linked_only: false       # JVP uses only S-linked (panel-coding) genes' velocity; fair scVelo-vs-RegVelo control
   kot_velocity_gauge_normalize: true      # rescale velocity to unit RMS per-cell norm (κ is bounded → compare direction not magnitude)
@@ -548,13 +564,18 @@ datasets:
     align_batch_key: batch
     seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
-  # Papalexi ECCITE-seq (GSE153056). Only a 4-marker checkpoint ADT panel (CD86,
-  # PD-L1, PD-L2, TIM3), so the alignment metric is inherently noisy — this is a
-  # supporting case, not a headline benchmark. No beta-anchor CSV is available for
-  # this panel, but the ADT-target genes are still kinetics-eligible when retained.
+  # CRISPR perturbation-response (Papalexi ECCITE-seq), not an alignment benchmark.
+  # FOSCTTM on a 4-protein panel is unidentifiable. The paper metric is predicted vs
+  # observed protein Δ(knockout, protein) from tools/papalexi_perturbation_benchmark.py.
+  # Train φ on NT cells only, then apply it to held-out knockout transcriptomes.
+  # save_prediction_cells=all keeps φ(r) for those KOs in data/predictions/.
+  # No beta-anchor CSV is available for this panel.
   papalexi_retained:
     modality_pair: rna_protein
-    val_fraction: 0.2          # dev-only holdout for tuning (~20k cells)
+    val_fraction: 0.0
+    fit_obs_key: gene
+    fit_obs_values: [NT]
+    save_prediction_cells: all
     preprocessing_cache_version: papalexi_gene_alias_v1
     kot_use_feature_space: true
     kot_rna_layer: Ms
@@ -576,11 +597,14 @@ datasets:
     sinkhorn_max_points: 8192            # ~20k cells: minibatch the align Sinkhorn
     seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
 
-  # Velocity-provider ablation: identical KOT config to papalexi_retained, but the
-  # dataset's rna_path (datasets.yaml) points at the RegVelo velocity h5ad.
+  # Same CRISPR protocol as papalexi_retained, RegVelo velocity. Do not report this
+  # arm as a CRISPR result: the velocity field on a steady-state cell line collapses φ.
   papalexi_regvelo:
     modality_pair: rna_protein
-    val_fraction: 0.2          # dev-only holdout for tuning (~20k cells)
+    val_fraction: 0.0
+    fit_obs_key: gene
+    fit_obs_values: [NT]
+    save_prediction_cells: all
     preprocessing_cache_version: papalexi_gene_alias_v1
     kot_use_feature_space: true
     kot_rna_layer: Ms

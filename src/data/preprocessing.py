@@ -178,6 +178,18 @@ def preprocess_atac(adata, min_cells=3, n_components=30, n_neighbors=30):
 
 # --- cached pipeline ---
 
+def source_stamp(path) -> str:
+    """Path plus size and mtime, so regenerating an input in place misses the cache.
+
+    The velocity pipeline always writes the same filename, so a path-only key served
+    stale caches silently. size/mtime rather than a content hash: these inputs reach
+    9 GB and every parallel run would pay for it.
+    """
+    abs_path = os.path.abspath(path)
+    stat = os.stat(abs_path)
+    return f"{abs_path}|size={stat.st_size}|mtime={int(stat.st_mtime)}"
+
+
 def load_and_preprocess_cached(
     rna_path,
     protein_path=None,
@@ -202,19 +214,19 @@ def load_and_preprocess_cached(
     atac_n_components=30,
     atac_n_neighbors=30,
 ):
-    key_parts = os.path.abspath(rna_path)
+    key_parts = source_stamp(rna_path)
     if rna_raw_layer:
         key_parts += f"|rna_raw_layer={rna_raw_layer}"
     if protein_path:
-        key_parts += f"|{os.path.abspath(protein_path)}|protein_label={protein_label}"
+        key_parts += f"|{source_stamp(protein_path)}|protein_label={protein_label}"
     if protein_obsm_key:
         key_parts += f"|protein_obsm_key={protein_obsm_key}"
     if atac_path:
-        key_parts += f"|{os.path.abspath(atac_path)}|atac_label={atac_label}"
+        key_parts += f"|{source_stamp(atac_path)}|atac_label={atac_label}"
     if cache_version:
         key_parts += f"|cache_version={cache_version}"
     if rna_umap_path:
-        key_parts += f"|rna_umap_path={os.path.abspath(rna_umap_path)}"
+        key_parts += f"|rna_umap_path={source_stamp(rna_umap_path)}"
     key_parts += (
         "|preprocess_schema=2"
         f"|rna_min_cells={int(rna_min_cells)}"

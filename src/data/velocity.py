@@ -121,7 +121,7 @@ def load_velocyto_dir(sample: str, velocyto_dir: Path) -> ad.AnnData:
     if not pd.Index(var.index).is_unique:
         duplicated = int(pd.Index(var.index).duplicated().sum())
         print(f"  {sample}: RNA gene symbols include {duplicated} duplicate feature(s); "
-              "AnnData will make var_names unique while var['gene_name'] keeps the symbols")
+              "var_names are made unique while var['gene_name'] keeps the symbols")
 
     adata = ad.AnnData(X=(spliced + unspliced).tocsr(), obs=obs, var=var)
     adata.layers["spliced"] = spliced
@@ -129,6 +129,9 @@ def load_velocyto_dir(sample: str, velocyto_dir: Path) -> ad.AnnData:
     adata.layers["ambiguous"] = ambiguous
     adata.obs.index.name = None
     adata.var.index.name = None
+    # Before the caller concatenates: anndata 0.12 raises on duplicate var labels
+    # instead of deduplicating on construction, as older versions did.
+    adata.var_names_make_unique()
     return adata
 
 
@@ -236,8 +239,11 @@ def build_integrated_h5ad(report_path: Path, original_h5ad: Path, output_path: P
         sample_velocity.obs["batch"] = batch
         velocity_parts.append(sample_velocity)
 
-    velocity = ad.concat(velocity_parts, join="inner")
-    velocity.var_names_make_unique()
+    # merge="same" keeps the var columns every part agrees on. Without it anndata drops
+    # them all, make_gene_index falls back from gene_id to the symbol index, and the
+    # merge below compares symbols against the original's Ensembl ids: 864 of 13953
+    # genes match instead of 13881.
+    velocity = ad.concat(velocity_parts, join="inner", merge="same")
     velocity_gene_index = make_gene_index(velocity.var)
     velocity.var["_merge_gene_key"] = velocity_gene_index
 
@@ -795,7 +801,6 @@ def parse_args():
     parser.add_argument("--n-neighbors", type=int, default=None)
     parser.add_argument("--velocity-mode", choices=["dynamical", "stochastic", "deterministic"], default=None)
     parser.add_argument("--dynamics-n-jobs", type=int, default=None)
-    parser.add_argument("--random-state", type=int, default=None)
     parser.add_argument("--regvelo-batch-size", type=int, default=None)
     parser.add_argument("--regvelo-max-epochs", type=int, default=None)
     return parser.parse_args()
@@ -836,7 +841,6 @@ def main() -> None:
         "n_neighbors": args.n_neighbors,
         "velocity_mode": args.velocity_mode,
         "dynamics_n_jobs": args.dynamics_n_jobs,
-        "random_state": args.random_state,
         "regvelo_batch_size": args.regvelo_batch_size,
         "regvelo_max_epochs": args.regvelo_max_epochs,
     }

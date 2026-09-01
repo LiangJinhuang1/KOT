@@ -17,7 +17,11 @@ from src.utils.arrays import matrix_from_adata
 from src.data.preprocessing import load_and_preprocess_cached
 from src.data.synthetic_linked_ode import stage_output_paths
 from src.data.splits import fitted_row_indices
-from src.evaluation.foscttm import evaluate_and_save, calc_domainAveraged_FOSCTTM
+from src.evaluation.foscttm import (
+    calc_domainAveraged_FOSCTTM,
+    evaluate_and_save,
+    save_prediction_h5ad,
+)
 from src.visualization.alignment import (
     coembedding_plot_kwargs,
     plot_coembedding,
@@ -310,9 +314,11 @@ SUMMARY_CONFIG_KEYS = [
     "n_epochs", "early_stopping_patience", "early_stopping_monitor",
     "batch_size", "sinkhorn_reg",
     "dyn_warmup_epochs", "g_freeze_epochs",
-    "kot_velocity_gauge_normalize", "kot_velocity_shuffle", "use_anchor",
+    "kot_velocity_gauge_normalize", "kot_velocity_shuffle",
+    "kot_velocity_ablation", "kot_velocity_corrupt", "kot_s_permute", "use_anchor",
     "val_fraction", "val_holdout_from_training",
     "val_split_per_seed", "val_stratify_by", "fit_tuning_subset",
+    "fit_obs_key", "save_prediction_cells",
 ]
 SUMMARY_METRIC_KEYS = [
     # val_foscttm is the held-out number a search is chosen on; mean_foscttm is the
@@ -321,6 +327,7 @@ SUMMARY_METRIC_KEYS = [
     "train_foscttm", "train_n_cells", "val_n_cells",
     "runtime_seconds",
     "jvp_rhs_cos_median", "rel_residual_median", "time_spearman", "time_mae",
+    "branch_accuracy", "branch_accuracy_branched", "loss_dyn", "loss_align",
     "phi_variance_ratio", "kappa_median", "alpha_median", "beta_mean",
     "grad_norm_median",
     "best_align", "best_align_epoch", "best_val_align", "best_val_align_epoch",
@@ -672,22 +679,40 @@ def run_one(name: str, dataset: dict, run_cfg: dict) -> None:
     # one over every cell -- and the second silently uses held-out proteins as
     # distractors for fitted cells. Applied here rather than inside a model so every
     # model, KOT and baselines alike, is scored on the same cells.
+    #
+    # CRISPR OOD (save_prediction_cells=all) is the exception for the prediction
+    # h5ad: φ must be stored on held-out knockout cells so the perturbation
+    # benchmark can score them. FOSCTTM stays on the fitted cells.
+    aligned_full = [np.asarray(part) for part in aligned]
     eval_rows = fitted_row_indices(rna_adata.obs, run_cfg, run_seed)
     eval_obs_names = rna_adata.obs_names
+    aligned_eval = aligned_full
     if eval_rows is not None:
-        aligned = [np.asarray(part)[eval_rows] for part in aligned]
+        aligned_eval = [part[eval_rows] for part in aligned_full]
         eval_obs_names = rna_adata.obs_names[eval_rows]
         if batch_foscttm is not None:
             batch_foscttm = np.asarray(batch_foscttm)[eval_rows]
         print(f"[{result_name}] benchmark FOSCTTM on the {len(eval_rows)} fitted cells")
 
+    save_prediction = bool(run_cfg.get("save_prediction_h5ad", True))
+    save_all_cells = str(run_cfg.get("save_prediction_cells", "fitted")) == "all"
     mean_foscttm = evaluate_and_save(
-        aligned, result_name, output_dir, second_label,
+        aligned_eval, result_name, output_dir, second_label,
         model_name=model_name,
         obs_names=eval_obs_names,
         foscttm_scores=batch_foscttm,
-        save_prediction=bool(run_cfg.get("save_prediction_h5ad", True)),
+        save_prediction=save_prediction and not save_all_cells,
     )
+    if save_prediction and save_all_cells:
+        n_all = aligned_full[0].shape[0]
+        save_prediction_h5ad(
+            aligned_full,
+            [float("nan")] * n_all,
+            mean_foscttm,
+            result_name, model_name, second_label, rna_adata.obs_names,
+        )
+        print(f"[{result_name}] prediction h5ad keeps all {n_all} cells "
+              f"({0 if eval_rows is None else n_all - len(eval_rows)} held out of the loss)")
     diagnostics["mean_foscttm"] = float(mean_foscttm)
     save_diagnostics(output_dir, diagnostics)
 

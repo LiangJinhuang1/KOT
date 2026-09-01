@@ -50,11 +50,12 @@ from src.data.preprocessing import load_and_preprocess_cached
 from src.data.synthetic_linked_ode import stage_output_paths
 from src.data.projection import projection_matrix_from_adatas
 from src.data.adt_gene_map import load_mapping_records
-from src.data.splits import resolve_split_seed, validation_mask
+from src.data.splits import held_out_mask
 from src.models.KOT import KOTModel
 from src.training.kot import (
     FixedAlpha,
     FixedKappa,
+    apply_velocity_ablation,
     build_effective_velocity,
     build_velocity_weight,
     compute_velocity_backend_agreement,
@@ -62,6 +63,7 @@ from src.training.kot import (
     compute_full_diagnostics,
     compute_per_cell_diagnostics,
     matrix_from_adata,
+    resolve_velocity_ablation,
     set_fixed_beta,
     to_index_tensor,
     to_tensor,
@@ -375,6 +377,17 @@ def build_model_and_tensors(
         use_explicit_links=use_explicit_links,
         require_full_panel=require_full_panel,
     )
+    # The run's own mapping, including the permutation control (run_kot applies it in
+    # exactly this position, before the PC projection). velocity_mode="real" asks for the
+    # TRUE inputs, so it scores an S-permuted run against the real map as well.
+    if velocity_mode == "as-trained" and run_cfg.get("kot_s_permute", False):
+        # Seeded off the model seed, but these tensors are built once per (run, model)
+        # outside the seed loop, so the run's own permutation cannot be rebuilt here.
+        raise ValueError(
+            "This run trained with kot_s_permute=true; its S is per-seed and cannot be "
+            "reproduced here. Use --velocity real to score it against the true mapping "
+            "instead (written as diagnostics_<ckpt>_realvel.json)."
+        )
     if use_feature_space:
         S_model = S_np.copy()
     elif "PCs" in rna_adata.varm and "PCs" in protein_adata.varm:
@@ -423,26 +436,31 @@ def build_model_and_tensors(
     # normalisation). The diagnostics take this single vector — re-evaluating a checkpoint
     # on a raw or differently-scaled velocity would report physics numbers that do not match
     # the run that produced the checkpoint.
-    # Reproduce the run's own velocity by default: a shuffled run trained against a
-    # permuted field, so re-evaluating it on the real one would overwrite its physics
-    # numbers with a different quantity under the same name. velocity_mode="real"
-    # deliberately asks for that comparison and is written under its own checkpoint name.
-    if run_cfg.get("kot_velocity_shuffle", False) and velocity_mode == "as-trained":
-        # The permutation is drawn per model seed, but these tensors are built once per
-        # (run, model) outside the seed loop, so the run's own field cannot be rebuilt
-        # here. Refuse rather than evaluate against a different permutation and write the
-        # result under the run's own diagnostics name.
-        raise ValueError(
-            "This run trained with kot_velocity_shuffle=true; its velocity is per-seed "
-            "and cannot be reproduced here. Use --velocity real to score it against the "
-            "true velocity instead (written as diagnostics_<ckpt>_realvel.json)."
-        )
+    # Reproduce the run's own velocity by default: a control arm trained against a broken
+    # field, so re-evaluating it on the real one would overwrite its physics numbers with
+    # a different quantity under the same name. velocity_mode="real" deliberately asks for
+    # that comparison and is written under its own checkpoint name.
+    if velocity_mode == "as-trained":
+        if resolve_velocity_ablation(run_cfg) == "shuffle":
+            # The permutation is drawn per model seed, but these tensors are built once
+            # per (run, model) outside the seed loop, so the run's own field cannot be
+            # rebuilt here. Refuse rather than evaluate against a different permutation
+            # and write the result under the run's own diagnostics name. reverse and zero
+            # carry no seed, so they reproduce exactly and fall through.
+            raise ValueError(
+                "This run trained with the velocity shuffle control; its velocity is "
+                "per-seed and cannot be reproduced here. Use --velocity real to score it "
+                "against the true velocity instead (written as "
+                "diagnostics_<ckpt>_realvel.json)."
+            )
+        V, _ = apply_velocity_ablation(V, None, run_cfg)
     velocity_weight_np = build_velocity_weight(rna_adata, S_np, run_cfg, use_feature_space)
     V_eff_t = to_tensor(build_effective_velocity(V, velocity_weight_np, run_cfg), device)
     # This tool overwrites each run's diagnostics_<ckpt>.json, so it has to reproduce the
     # cross-backend velocity cosine too — otherwise re-evaluating a run silently strips it.
     # Checkpoint-independent (the velocity is fixed input), so it is computed once here.
-    velocity_backend = compute_velocity_backend_agreement(rna_adata, V, run_cfg)
+    velocity_backend = compute_velocity_backend_agreement(
+        rna_adata, V, run_cfg, velocity_weight_np)
 
     phi_dims        = list(run_cfg.get("phi_dims", [1024, 512, 256]))
     kappa_dims      = list(run_cfg.get("kappa_dims", [64, 32]))
@@ -489,26 +507,11 @@ def build_model_and_tensors(
     # on the run's SEED, and with val_stratify_by it is drawn per stratum, so passing
     # the bare val_split_seed here would silently rebuild a different set of cells.
     # diagnostics.json records val_split_digest; that is what this can be checked against.
-    val_fraction = float(run_cfg.get("val_fraction", 0.0))
-    val_stratify_by = run_cfg.get("val_stratify_by") or None
-    val_strata = None
-    if val_stratify_by is not None and val_fraction > 0.0:
-        if val_stratify_by not in rna_adata.obs.columns:
-            raise ValueError(
-                f"val_stratify_by={val_stratify_by!r} is not an obs column of the RNA "
-                f"AnnData; cannot rebuild the run's validation split."
-            )
-        val_strata = rna_adata.obs[val_stratify_by].astype(str).to_numpy()
-    val_mask = validation_mask(
-        rna_adata.obs_names,
-        val_fraction,
-        resolve_split_seed(
-            int(run_cfg.get("val_split_seed", 20260825)),
-            run_cfg.get("seed"),
-            bool(run_cfg.get("val_split_per_seed", False)),
-        ),
-        strata=val_strata,
-    )
+    # Through held_out_mask, the SAME function training uses. Rebuilding the rule here
+    # is what let this drift: it reproduced only the random/stratified slice, so a run
+    # with fit_obs_key (Papalexi trains on NT cells alone) had its knockout cells scored
+    # as if they had been fitted, and fit_tuning_subset's inversion was ignored outright.
+    val_mask = held_out_mask(rna_adata.obs, run_cfg, run_cfg.get("seed"))
     val_idx_t = (
         to_index_tensor(np.nonzero(val_mask)[0], device) if val_mask.any() else None
     )
@@ -702,9 +705,10 @@ def main():
     )
     parser.add_argument(
         "--velocity", choices=["as-trained", "real"], default="as-trained",
-        help="Which velocity to score against. 'real' ignores kot_velocity_shuffle and "
-             "asks whether a shuffled-trained model fits the TRUE field; results go to "
-             "diagnostics_<ckpt>_realvel.json so the run's own numbers are preserved.",
+        help="Which inputs to score against. 'real' ignores kot_velocity_ablation and "
+             "kot_s_permute and asks whether a control-trained model fits the TRUE "
+             "velocity and mapping; results go to diagnostics_<ckpt>_realvel.json so the "
+             "run's own numbers are preserved.",
     )
     args = parser.parse_args()
 

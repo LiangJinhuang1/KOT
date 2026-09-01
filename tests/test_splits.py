@@ -159,5 +159,51 @@ class FittedRowIndicesTests(unittest.TestCase):
                                         fitted_row_indices(obs, strat, 42)))
 
 
+class FitObsTests(unittest.TestCase):
+    """Papalexi CRISPR: train on NT only, score knockout transcriptomes out of sample."""
+
+    def obs(self, n=200):
+        import pandas as pd
+        labels = ["NT"] * 80 + ["CMTM6"] * 60 + ["STAT1"] * 60
+        return pd.DataFrame({"gene": labels},
+                            index=[f"cell_{i:05d}" for i in range(n)])
+
+    def test_only_allowed_labels_are_fitted(self):
+        obs = self.obs()
+        cfg = {"val_fraction": 0.0, "fit_obs_key": "gene", "fit_obs_values": ["NT"]}
+        fitted = fitted_row_indices(obs, cfg, 42)
+        self.assertEqual(fitted.tolist(), list(range(80)))
+
+    def test_group_holdout_survives_fit_tuning_subset(self):
+        # Inverting the random slice must not put knockout cells back into the loss.
+        obs = self.obs()
+        cfg = {
+            "val_fraction": 0.2,
+            "fit_tuning_subset": True,
+            "fit_obs_key": "gene",
+            "fit_obs_values": ["NT"],
+        }
+        fitted = fitted_row_indices(obs, cfg, 42)
+        self.assertTrue((obs["gene"].to_numpy()[fitted] == "NT").all())
+        self.assertLess(fitted.size, 80)
+
+    def test_empty_allow_list_is_rejected(self):
+        obs = self.obs()
+        with self.assertRaisesRegex(ValueError, "fit_obs_values is empty"):
+            fitted_row_indices(obs, {"fit_obs_key": "gene", "fit_obs_values": []}, 42)
+
+    def test_missing_column_is_rejected(self):
+        obs = self.obs()
+        with self.assertRaisesRegex(ValueError, "fit_obs_key"):
+            fitted_row_indices(
+                obs, {"fit_obs_key": "perturbation", "fit_obs_values": ["NT"]}, 42)
+
+    def test_random_holdout_without_group_is_unchanged(self):
+        obs = self.obs()
+        cfg = {"val_fraction": 0.2}
+        fitted = fitted_row_indices(obs, cfg, 42)
+        self.assertEqual(fitted.size, int((~validation_mask(obs.index, 0.2, 20260825)).sum()))
+
+
 if __name__ == "__main__":
     unittest.main()
