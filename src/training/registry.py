@@ -1,7 +1,8 @@
-"""Trainable models: import path plus `oos` capability.
+"""Trainable models: import path, `oos` capability, and what its output means.
 
-protocol.resolve_oos_mode reads `oos`; the runner reads module/function.
-Unlisted `kot_*` names are still native; listed names must still carry `oos`.
+protocol.resolve_oos_mode reads `oos`; protocol.predictor_kind reads `predictor`; the
+runner reads module/function. Unlisted `kot_*` names are still native; listed names must
+still carry `oos`.
 """
 
 from __future__ import annotations
@@ -10,6 +11,12 @@ from __future__ import annotations
 NATIVE = "native"
 HOLDOUT_SECOND = "holdout_second"
 PAIRED = "paired"
+
+# What a model's aligned RNA output IS, which decides how the perturbation benchmark
+# reads it: coordinates of the second modality itself, or a shared latent space that
+# needs kNN imputation to become a protein prediction.
+DIRECT = "direct"
+LATENT = "latent"
 
 
 def kot_spec() -> dict:
@@ -25,12 +32,14 @@ MODELS = {
     "scot": {
         "module": "src.training.scot",
         "function": "run_scot",
+        "predictor": LATENT,
         "oos": HOLDOUT_SECOND,
         "batch_split": True,
     },
     "moscot": {
         "module": "src.training.moscot",
         "function": "run_moscot",
+        "predictor": LATENT,
         "oos": HOLDOUT_SECOND,
         "extra": "baselines",
         "batch_split": True,
@@ -38,6 +47,7 @@ MODELS = {
     "glue": {
         "module": "src.training.glue",
         "function": "run_glue",
+        "predictor": LATENT,
         "oos": HOLDOUT_SECOND,
         "extra": "baselines",
         "counts": True,
@@ -45,24 +55,64 @@ MODELS = {
     "uniport": {
         "module": "src.training.uniport",
         "function": "run_uniport",
+        "predictor": LATENT,
         "oos": HOLDOUT_SECOND,
     },
     "maxfuse": {
         "module": "src.training.maxfuse",
         "function": "run_maxfuse",
+        "predictor": LATENT,
         "oos": HOLDOUT_SECOND,
         "extra": "baselines",
     },
     "totalvi": {
         "module": "src.training.totalvi",
         "function": "run_totalvi",
+        "predictor": LATENT,
         "oos": PAIRED,
         "extra": "baselines",
+        "counts": True,
+    },
+    # Supervised RNA→protein translators. They fit on the PAIRED (RNA, protein) of the
+    # cells the protocol allows and predict protein from RNA alone for every cell, so
+    # they honour holdout_second while using a pairing KOT is never given. `paired_fit`
+    # is what keeps that difference visible in the ranking table.
+    "ridge": {
+        "module": "src.training.protein_regression",
+        "function": "run_ridge",
+        "oos": HOLDOUT_SECOND,
+        "predictor": DIRECT,
+        "paired_fit": True,
+    },
+    "mlp": {
+        "module": "src.training.protein_regression",
+        "function": "run_mlp",
+        "oos": HOLDOUT_SECOND,
+        "predictor": DIRECT,
+        "paired_fit": True,
+    },
+    "scipenn": {
+        "module": "src.training.scipenn",
+        "function": "run_scipenn",
+        "oos": HOLDOUT_SECOND,
+        "predictor": DIRECT,
+        "paired_fit": True,
+        "extra": "protein_baselines",
+        "counts": True,
+    },
+    "scbutterfly": {
+        "module": "src.training.scbutterfly",
+        "function": "run_scbutterfly",
+        "oos": HOLDOUT_SECOND,
+        "predictor": DIRECT,
+        "paired_fit": True,
+        "extra": "protein_baselines",
         "counts": True,
     },
     "linear_ode": {
         "module": "src.training.linear_ode",
         "function": "run_linear_ode",
+        "predictor": LATENT,
         "oos": HOLDOUT_SECOND,
         "batch_split": True,
     },
@@ -81,6 +131,8 @@ MODELS = {
 COUNT_MODELS = {name for name, spec in MODELS.items() if spec.get("counts")}
 # O(n²) OT methods: with align_batch_key they run per biological batch.
 BATCH_SPLIT_MODELS = {name for name, spec in MODELS.items() if spec.get("batch_split")}
+# Models that read the (RNA, protein) pairing of the cells they fit. KOT does not.
+PAIRED_FIT_MODELS = {name for name, spec in MODELS.items() if spec.get("paired_fit")}
 
 MODEL_OVERRIDES = {
     "kot_nodyn": {"lambda_dyn": 0.0},

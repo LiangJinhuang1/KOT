@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import anndata as ad
@@ -109,7 +110,12 @@ def save_prediction_h5ad(
     if protocol is not None:
         adata.uns[PROTOCOL_KEY] = dict(protocol)
     path = PREDICTIONS_DIR / f"{model_name}_{dataset_name}.h5ad"
-    adata.write_h5ad(path)
+    # Write a unique tmp then replace: two processes opening the same HDF5 dest
+    # take the file lock (errno 11) and abort remaining seeds. Last writer still
+    # wins, which is the global-path contract; the lock is not.
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    adata.write_h5ad(tmp_path)
+    os.replace(tmp_path, path)
     print(f"Saved prediction: {path}")
 
 
@@ -151,9 +157,8 @@ def evaluate_and_save(
 
     # The prediction h5ad path is GLOBAL (data/predictions/), keyed only by model +
     # dataset + seed — so two runs that differ only in hyperparameters write the same
-    # file. Two parallel arms writing the same path hit a live HDF5 lock, not just
-    # an overwrite. Sweeps pass save_prediction=False; the per-run copies under
-    # output_dir (aligned_*.npy, foscttm.csv) are unaffected.
+    # file. Parallel arms should pass save_prediction=False (--no-predictions); the
+    # per-run copies under output_dir (aligned_*.npy, foscttm.csv) are unaffected.
     if save_prediction and model_name is not None and obs_names is not None:
         save_prediction_h5ad(
             aligned, foscttm_scores, mean_foscttm,

@@ -7,6 +7,7 @@ from src.data.splits import (
     held_out_mask,
     reported_slice_mask,
     resolve_split_seed,
+    selection_validation_mask,
     split_digest,
     validation_mask,
 )
@@ -175,6 +176,25 @@ class FitObsTests(unittest.TestCase):
         cfg = {"val_fraction": 0.0, "fit_obs_key": "gene", "fit_obs_values": ["NT"]}
         fitted = fitted_row_indices(obs, cfg, 42)
         self.assertEqual(fitted.tolist(), list(range(80)))
+
+    def test_group_holdout_is_never_checkpoint_selection_validation(self):
+        obs = self.obs()
+        cfg = {"val_fraction": 0.0, "fit_obs_key": "gene", "fit_obs_values": ["NT"]}
+        self.assertFalse(selection_validation_mask(obs, cfg, 42).any())
+        self.assertTrue(
+            (reported_slice_mask(obs, cfg, 42) == (obs["gene"] != "NT")).all()
+        )
+
+    def test_checkpoint_selection_validation_is_drawn_only_from_allowed_group(self):
+        obs = self.obs()
+        cfg = {
+            "val_fraction": 0.2,
+            "fit_obs_key": "gene",
+            "fit_obs_values": ["NT"],
+        }
+        selected = selection_validation_mask(obs, cfg, 42)
+        self.assertTrue((obs.loc[selected, "gene"] == "NT").all())
+        self.assertAlmostEqual(int(selected.sum()) / 80, 0.2, delta=0.1)
 
     def test_group_holdout_survives_fit_tuning_subset(self):
         # Inverting the random slice must not put knockout cells back into the loss.

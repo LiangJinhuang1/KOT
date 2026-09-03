@@ -54,6 +54,10 @@ METHOD_COLORS = {
     "glue":       "#009E73",
     "uniport":    "#4CB79A",
     "totalvi":    "#8CCFBC",
+    # Linkage-driven matching — its own hue. MaxFuse starts from the SAME ADT→gene
+    # links KOT's Sinkhorn term sees, so it is the one baseline that shares KOT's
+    # prior; giving it a family of its own keeps that distinction visible.
+    "maxfuse":    "#CC79A7",
     # Convex ODE baseline — neutral
     "linear_ode": "#767676",
 }
@@ -73,6 +77,7 @@ METHOD_LABELS = {
     "moscot":     "moscot",
     "glue":       "GLUE",
     "uniport":    "uniPort",
+    "maxfuse":    "MaxFuse",
     "totalvi":    "totalVI (paired)",
     "linear_ode": "Linear ODE",
 }

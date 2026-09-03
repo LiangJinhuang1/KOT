@@ -19,15 +19,37 @@ from sklearn.decomposition import PCA
 
 from src.visualization import (
     FOSCTTM_CHANCE, LINEAGE_COLORS, LINEAGE_ORDER, METHOD_COLORS, MODALITY_COLORS,
-    MODALITY_MARKERS, lineage, method_label, state_color_map, state_label,
+    MODALITY_MARKERS, dataset_label, lineage, method_label, state_color_map,
+    state_label,
 )
 from src.visualization.style import (
     apply_style, chance_line, embedding_axes, figsize, ink, median_tick,
     panel_letter, save_figure, set_verify,
 )
-from src.visualization.alignment import modality_mixing
+from src.visualization.ablation import ladder_panel, read_arms, real_panel
+from src.evaluation.knn_alignment import alignment_curve
+from src.evaluation.protocol import resolve_oos_mode
+from src.training.registry import MODELS as REGISTERED_MODELS
+from src.visualization.alignment import confusion_panel, modality_mixing
 from src.visualization.benchmark import collect_benchmark, find_collapsed
 from src.visualization.kinetics import collect_beta, plot_beta_recovery
+from src.visualization.prediction import (
+    canonical_rows, coverage_strip_panel, pooled_calibration_panel,
+    ranked_protein_panel,
+)
+from src.visualization.diagnostics import (
+    anchor_panel, checkpoint_panel, collect_flags, flag_panel,
+    gradient_panel, read_by_config, read_checkpoints,
+)
+from src.visualization.linkage import (
+    dataset_colors, funnel_panel, read_coverage, terms_panel,
+)
+from src.visualization.methods import (
+    collect_runtimes, curated_method_runs, knn_curve_panel, runtime_panel,
+)
+from src.visualization.physics import (
+    group_violin_panel, load_per_cell, paint_panel, pair_panel,
+)
 from src.visualization.runs import (
     CACHE_DIR, curated_runs, is_collapsed, read_diagnostics, run_rank,
 )
@@ -156,6 +178,15 @@ def co_embedding_scatter(ax, xy_r: np.ndarray, xy_p: np.ndarray, rng):
     ax.scatter(pts[order, 0], pts[order, 1], color=cols[order], **POINT_STYLE)
 
 
+def bare_axes(ax):
+    """No ticks, no spines, no arrows — for grid panels where one shared arrow pair
+    on the corner panel names the axes for the whole figure."""
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
 def modality_legend(ax, loc: str = "best"):
     """The RNA / Protein key, once per figure rather than once per panel."""
     return ax.legend(handles=[
@@ -203,7 +234,8 @@ def figure3(out: Path, max_cells: int = 12000, seed: int = 0):
 
     # --- a: benchmark across both real datasets -----------------------------
     ax = fig.add_subplot(gs[0, 0])
-    order = ["kot", "kot_nodyn", "moscot", "scot", "glue", "uniport", "linear_ode"]
+    order = ["kot", "kot_nodyn", "maxfuse", "moscot", "scot", "glue", "uniport",
+             "linear_ode"]
     datasets = ["bmmc_cite_retained", "pbmc_retained"]
     offsets = {datasets[0]: -0.17, datasets[1]: +0.17}
     marks = {datasets[0]: "o", datasets[1]: "s"}
@@ -355,6 +387,32 @@ def branch_identity_pairs() -> pd.DataFrame | None:
     return wide.dropna(subset=need).reset_index()
 
 
+def branch_confusion(model: str) -> tuple[list, list] | None:
+    """The median-identity curated branch run's confusion matrix for one model.
+
+    Median rather than best, so the panel shows a typical run of that arm and not the
+    seed where the degeneracy happened to resolve.
+    """
+    curated = curated_runs()
+    hits = []
+    for dj in CACHE_DIR.rglob(f"*/{model}/synthetic_linked_ode/seed_*/diagnostics.json"):
+        run = dj.relative_to(CACHE_DIR).parts[0]
+        if "branch" not in run or (curated and run not in curated):
+            continue
+        d = read_diagnostics(dj)
+        cm, labels = d.get("branch_confusion_matrix"), d.get("branch_confusion_labels")
+        if not cm or not labels or is_collapsed(d):
+            continue
+        scores = branch_scores(cm)
+        if scores is not None:
+            hits.append((scores[0], cm, labels))
+    if not hits:
+        return None
+    hits.sort(key=lambda h: h[0])
+    _, cm, labels = hits[len(hits) // 2]
+    return cm, labels
+
+
 def figure1b(out: Path, max_cells: int = 8000, seed: int = 0):
     """The ablation as a picture: what the kinetics term does to the co-embedding.
 
@@ -454,8 +512,8 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
     obs = a.obs.iloc[:n].reset_index(drop=True)
     z = np.load(run / "per_cell_diagnostics.npz", allow_pickle=True)
 
-    fig, axes = plt.subplots(1, 4, figsize=figsize("full", 1.85), layout="constrained")
-    fig.get_layout_engine().set(w_pad=0.09, wspace=0.07)
+    fig, axes = plt.subplots(1, 5, figsize=figsize("full", 1.85), layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.07, wspace=0.06)
 
     # a: the generative system, coloured by state
     ax = axes[0]
@@ -465,7 +523,7 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
     for st, c in state_color_map(states).items():
         m = states == st
         ax.scatter(xy[m, 0], xy[m, 1], color=c, label=state_label(st), **POINT_STYLE)
-    ax.set_title("Ground-truth system")
+    ax.set_title("Ground truth")
     ax.legend(markerscale=6, loc="best")
     embedding_axes(ax, "PC 1", "PC 2")
     panel_letter(ax, "a")
@@ -478,8 +536,10 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
     mix = modality_mixing(xy_r, xy_p, random_state=seed)
     ax.set_title("After alignment")
     if mix is not None:
-        ax.text(0.5, -0.04, f"mixing {mix:.2f}", transform=ax.transAxes,
-                fontsize=6.5, color="0.3", ha="center", va="top")
+        # Inside the panel, top-left: below the axes it lands on the "PC 1" arrow
+        # label that embedding_axes draws in that corner.
+        ax.text(0.02, 0.98, f"mixing {mix:.2f}", transform=ax.transAxes,
+                fontsize=6.5, color="0.3", ha="left", va="top")
     embedding_axes(ax, "PC 1", "PC 2")
     panel_letter(ax, "b")
 
@@ -525,7 +585,7 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
                 median_tick(ax, float(np.median(vals)), x, half=0.12,
                             color=ink(color), lw=1.3, orient="horizontal", zorder=6)
         ax.set_xticks(range(len(groups)))
-        ax.set_xticklabels([g for g, _ in groups])
+        ax.set_xticklabels([g for g, _ in groups], rotation=30, ha="right")
         ax.set_xlim(-0.55, len(groups) - 0.45)
         ax.set_ylim(0, 1.05)
         ax.set_ylabel("Fraction of cells")
@@ -545,8 +605,392 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
         ax.set_title("Branch resolution")
     panel_letter(ax, "d")
 
+    # e: the same degeneracy as a confusion matrix. Panel d gives the numbers; this
+    # says WHERE the alignment-only arm sends the cells, which is the A<->B swap the
+    # mirror-symmetric construction makes unresolvable without dynamics. Only the
+    # failing arm is shown — KOT's matrix is diagonal, and panel d already reports it.
+    ax = axes[4]
+    found = branch_confusion("kot_nodyn")
+    if found is None:
+        ax.text(0.5, 0.5, "no curated branch run\nwith a confusion matrix",
+                transform=ax.transAxes, color="0.45", ha="center", va="center")
+        ax.set_xticks([]); ax.set_yticks([])
+    else:
+        confusion_panel(ax, *found)
+    ax.set_title("Alignment only")
+    panel_letter(ax, "e")
+
     print(f"[fig2] stage={stage}  mixing={mix if mix is None else round(mix, 3)}")
     save_figure(fig, out / "fig2_synthetic")
+
+
+# The configuration the synthetic and real ablations were both run under, and the one
+# config/training.yaml declares. The sweep also ran (0.01, 500); pooling the two would
+# average a training difference into the corruption effect.
+ABLATION_LR_BETA = 0.001
+ABLATION_WARMUP = 300
+
+
+def figure5(out: Path):
+    """Velocity corruption: a dose-response on synthetic, and what it does on real data."""
+    apply_style()
+    fig, axd = plt.subplot_mosaic([["a", "c"], ["b", "c"]], figsize=figsize("full", 3.4))
+
+    syn = read_arms("synthetic_branch_summary.csv", ABLATION_LR_BETA, ABLATION_WARMUP)
+    # kot_fixedalpha is left out: it sits at FOSCTTM ~0.47 on every rung, so it has no
+    # dose-response to show and its non-monotone cosine only obscures the two arms that
+    # do. It belongs in the ablation table, not in the panel making this claim.
+    arms = ["kot_oracle", "kot_fixedkappa"]
+
+    ax = axd["a"]
+    ladder_panel(ax, syn, "mean_foscttm", arms, ylabel="FOSCTTM",
+                 chance=FOSCTTM_CHANCE)
+    ax.tick_params(labelbottom=False)
+    ax.set_title("Synthetic: alignment")
+    ax.legend(loc="upper left", frameon=False)
+    panel_letter(ax, "a")
+
+    ax = axd["b"]
+    ladder_panel(ax, syn, "jvp_rhs_cos_median", arms, ylabel="JVP\u00b7RHS cosine")
+    ax.set_title("Synthetic: ODE agreement")
+    ax.set_ylim(-0.95, 1.1)
+    ax.set_xlabel("Velocity corrupted")
+    panel_letter(ax, "b")
+
+    ax = axd["c"]
+    real = read_arms("kinetics_ablation_real_summary.csv", ABLATION_LR_BETA, ABLATION_WARMUP)
+    real_panel(ax, real, "mean_foscttm", ["bmmc_cite_retained", "pbmc_retained"],
+               xlabel="FOSCTTM", chance=FOSCTTM_CHANCE)
+    ax.set_title("Real CITE-seq")
+    ax.legend(handles=[
+        Line2D([0], [0], marker=m, color=METHOD_COLORS["kot"], lw=0, ms=3.4,
+               fillstyle=f, markeredgewidth=0.8, label=dataset_label(d))
+        for d, m, f in (("bmmc_cite_retained", "o", "none"), ("pbmc_retained", "s", "full"))],
+        loc="lower right", frameon=False)
+    panel_letter(ax, "c")
+
+    fig.tight_layout()
+    save_figure(fig, out / "fig5_velocity")
+
+
+def figure6(out: Path, dataset: str = "bmmc_cite_retained", max_cells: int = 14000,
+            seed: int = 0):
+    """Where the ODE holds: the per-cell cosine on the embedding, by lineage, and
+    against per-cell pairing quality."""
+    apply_style()
+    rng = np.random.default_rng(seed)
+
+    run = pick_run(dataset, "kot",
+                   require=("aligned_rna.npy", "per_cell_diagnostics.npz"))
+    if run is None:
+        print(f"[fig6] no {dataset} run carries per_cell_diagnostics.npz")
+        return
+    per_cell = load_per_cell(run)
+    xr, xp = load_aligned(run)
+    n = len(xr)
+    idx = rng.choice(n, min(n, max_cells), replace=False)
+    xy_r, _ = joint_embedding(xr, xp, idx, seed)
+    cos = per_cell["jvp_rhs_cos"]
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize("full", 2.4))
+
+    ax = axes[0]
+    mappable = paint_panel(ax, xy_r, cos[idx])
+    embedding_axes(ax)
+    ax.set_title("ODE agreement per cell")
+    bar = fig.colorbar(mappable, ax=ax, fraction=0.046, pad=0.02)
+    bar.set_label("JVP·RHS cosine")
+    bar.outline.set_visible(False)
+    panel_letter(ax, "a")
+
+    ax = axes[1]
+    lineages = load_lineages(newest_protein_cache(dataset.replace("_retained", "")), n)
+    if lineages is None:
+        ax.set_visible(False)
+    else:
+        group_violin_panel(ax, cos, lineages.to_numpy(), LINEAGE_ORDER, LINEAGE_COLORS)
+        ax.set_ylabel("JVP·RHS cosine")
+        ax.set_title("By lineage")
+    panel_letter(ax, "b")
+
+    ax = axes[2]
+    pair_panel(ax, cos, per_cell["foscttm"])
+    ax.set_xlabel("JVP·RHS cosine")
+    ax.set_ylabel("FOSCTTM")
+    ax.set_title("Fit versus pairing")
+    chance_line(ax, FOSCTTM_CHANCE)
+    panel_letter(ax, "c")
+
+    fig.tight_layout()
+    save_figure(fig, out / "fig6_percell")
+
+
+def figure7(out: Path):
+    """Predicted protein against measured protein: coverage, per marker, and pooled."""
+    apply_style()
+    fig, axes = plt.subplots(1, 3, figsize=figsize("full", 2.5),
+                             gridspec_kw=dict(width_ratios=[1, 1.5, 1.2]))
+
+    # Short names: panel a fits four group ticks in a third-width panel, and the full
+    # dataset names collide over them. They are spelled out in panel b's title.
+    frames = {short: canonical_rows(d) for short, d in
+              (("BMMC", "bmmc_cite_retained"), ("PBMC", "pbmc_retained"))}
+
+    ax = axes[0]
+    coverage_strip_panel(ax, frames)
+    ax.set_ylabel("Spearman ρ, per protein")
+    panel_letter(ax, "a")
+
+    ax = axes[1]
+    ranked_protein_panel(ax, frames["PBMC"])
+    ax.set_xlabel("Protein, ranked")
+    ax.set_ylabel("Spearman ρ")
+    ax.set_title(f'{dataset_label("pbmc_retained")}, 12 seeds')
+    ax.legend(loc="lower left", frameon=False)
+    panel_letter(ax, "b")
+
+    ax = axes[2]
+    # PBMC only: it is the one real dataset whose runs saved the full ADT panel.
+    run = pick_run("pbmc_retained", "kot",
+                   require=("phi_full_panel.npy", "protein_full_panel.npy"))
+    if run is None:
+        print("[fig7] no PBMC run saved phi_full_panel.npy")
+        ax.set_visible(False)
+    else:
+        pooled_calibration_panel(ax, np.load(run / "phi_full_panel.npy"),
+                                 np.load(run / "protein_full_panel.npy"))
+        ax.set_xlabel("Measured ADT (z)")
+        ax.set_ylabel("Predicted φ(r) (z)")
+        ax.set_title("All markers pooled")
+    panel_letter(ax, "c")
+
+    fig.tight_layout()
+    save_figure(fig, out / "fig7_prediction")
+
+
+# Methods carried through the cross-method panels, in the Fig. 3a row order. moscot,
+# SCOT and Linear ODE are absent because their curated runs did not save aligned
+# arrays, not because they were dropped — the caption has to say which eight became six.
+GRID_MODELS = ["kot", "kot_nodyn", "maxfuse", "glue", "uniport"]
+
+
+def figure8(out: Path, dataset: str = "bmmc_cite_retained", max_cells: int = 9000,
+            seed: int = 0):
+    """Every method's co-embedding, coloured by modality and by lineage."""
+    apply_style()
+    rng = np.random.default_rng(seed)
+
+    runs = curated_method_runs(dataset, GRID_MODELS)
+    models = [m for m in GRID_MODELS if m in runs]
+    if not models:
+        print(f"[fig8] no curated {dataset} runs with aligned arrays")
+        return
+    print(f"[fig8] {len(models)} methods: {', '.join(models)}")
+
+    fig, axes = plt.subplots(2, len(models), figsize=figsize("full", 2.6),
+                             layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.01, hspace=0.02)
+    cache = newest_protein_cache(dataset.replace("_retained", ""))
+
+    for col, model in enumerate(models):
+        xr, xp = load_aligned(runs[model])
+        n = len(xr)
+        idx = rng.choice(n, min(n, max_cells), replace=False)
+        xy_r, xy_p = joint_embedding(xr, xp, idx, seed)
+
+        ax = axes[0, col]
+        co_embedding_scatter(ax, xy_r, xy_p, rng)
+        ax.set_title(method_label(model))
+        # Mixing inside the panel, not appended to the title: a two-line title
+        # collides with the panel letter, and the number belongs to the picture.
+        ax.text(0.02, 0.98, f"mixing {modality_mixing(xy_r, xy_p):.2f}",
+                transform=ax.transAxes, color="0.35", ha="left", va="top")
+        bare_axes(ax)
+
+        ax = axes[1, col]
+        lineages = load_lineages(cache, n)
+        if lineages is None:
+            # MaxFuse's batching returns fewer cells than the run started with, so its
+            # rows cannot be mapped back to cell types. Said on the panel rather than
+            # left as a blank the reader has to interpret.
+            ax.text(0.5, 0.5, f"labels unavailable\n(n = {n:,})", transform=ax.transAxes,
+                    ha="center", va="center", color="0.45")
+            bare_axes(ax)
+            continue
+        labels = lineages.to_numpy()[idx]
+        for name in LINEAGE_ORDER:
+            mask = labels == name
+            if mask.any():
+                ax.scatter(xy_r[mask, 0], xy_r[mask, 1], color=LINEAGE_COLORS[name],
+                           **POINT_STYLE)
+        bare_axes(ax)
+
+    embedding_axes(axes[1, 0], "Dim 1", "Dim 2")
+    modality_legend(axes[0, -1], loc="lower right")
+    fig.text(0.005, 0.72, "By modality", rotation=90, va="center", ha="left")
+    fig.text(0.005, 0.28, "By lineage", rotation=90, va="center", ha="left")
+    panel_letter(axes[0, 0], "a")
+    panel_letter(axes[1, 0], "b")
+    save_figure(fig, out / "fig8_coembedding")
+
+
+def figure9(out: Path, seed: int = 0):
+    """Beyond FOSCTTM: where the true partner ranks, and what each method costs."""
+    apply_style()
+    datasets = ["bmmc_cite_retained", "pbmc_retained"]
+    fractions = np.geomspace(1e-4, 0.1, 24)
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize("full", 2.3), layout="constrained")
+
+    ax = axes[0]
+    runs = curated_method_runs(datasets[0], GRID_MODELS)
+    curves = {}
+    for model in GRID_MODELS:
+        if model not in runs:
+            continue
+        xr, xp = load_aligned(runs[model])
+        curves[model] = alignment_curve(xr, xp, fractions, seed=seed)
+        print(f"[fig9] {model}: top-1% recovery {curves[model][fractions >= 0.01][0]:.3f}")
+    knn_curve_panel(ax, curves, fractions)
+    ax.set_title(f"{dataset_label(datasets[0])}, 6k-cell subsample")
+    ax.legend(loc="upper left", frameon=False)
+    panel_letter(ax, "a")
+
+    ax = axes[1]
+    runtime_panel(ax, collect_runtimes(datasets), GRID_MODELS)
+    ax.set_title("Cost")
+    ax.text(0.03, 0.97, "mixed hardware", transform=ax.transAxes, color="0.45",
+            ha="left", va="top")
+    panel_letter(ax, "b")
+
+    save_figure(fig, out / "fig9_beyond_foscttm")
+
+
+# The two real CITE-seq panels. Papalexi has four antibodies, so its funnel is a flat
+# line that says nothing about attrition; it belongs in the perturbation figure instead.
+COVERAGE_DATASETS = ["bmmc_cite_retained", "pbmc_retained"]
+
+
+def figure1c(out: Path):
+    """How much RNA-protein linkage survives, and which term each survivor feeds."""
+    apply_style()
+    coverage = read_coverage(COVERAGE_DATASETS)
+    # Modality colours would be wrong here (nothing on this figure is RNA-vs-protein) and
+    # method colours would be wrong too, so the two datasets take neutral tints of the
+    # focal blue, distinguished by lightness rather than hue.
+    colors = dataset_colors(COVERAGE_DATASETS, ["#0072B2", "#9ECAE1"])
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize("full", 2.2), layout="constrained",
+                             gridspec_kw=dict(width_ratios=[1.25, 1]))
+
+    funnel_panel(axes[0], coverage, colors)
+    axes[0].set_title("Attrition of the antibody panel")
+    panel_letter(axes[0], "a")
+
+    terms_panel(axes[1], coverage, colors)
+    axes[1].set_title("What each link feeds")
+    axes[1].legend(loc="upper right", frameon=False)
+    panel_letter(axes[1], "b")
+
+    save_figure(fig, out / "fig1c_linkage")
+
+
+def supplement(out: Path):
+    """Two supplementary figures: how checkpoints and gradients behaved, and how often
+    a run failed or a knob mattered."""
+    apply_style()
+    dest = out / "appendix"
+    colors = dataset_colors(COVERAGE_DATASETS, ["#0072B2", "#9ECAE1"])
+
+    # --- S1: selection and optimisation ------------------------------------
+    checkpoints = read_checkpoints()
+    # KOT only. The question is what the checkpoint choice costs, and adding the
+    # ablation arm doubles the points without bearing on it.
+    models = ["kot"]
+    fig, axes = plt.subplots(1, 3, figsize=figsize("full", 2.4), layout="constrained")
+
+    ax = axes[0]
+    checkpoint_panel(ax, checkpoints, "mean_foscttm", models)
+    ax.set_ylabel("FOSCTTM")
+    ax.set_title("Cost of the checkpoint choice")
+    panel_letter(ax, "a")
+
+    ax = axes[1]
+    checkpoint_panel(ax, checkpoints, "jvp_rhs_cos", models)
+    ax.set_ylabel("JVP·RHS cosine")
+    ax.set_title("…on the other metric")
+    panel_letter(ax, "b")
+
+    ax = axes[2]
+    gradient_panel(ax, read_by_config("summary_warmup_lambda_cfgBC_by_config.csv"))
+    ax.set_title("Do the two terms fight?")
+    ax.legend(loc="best", frameon=False)
+    panel_letter(ax, "c")
+
+    save_figure(fig, dest / "figS1_optimization")
+
+    # --- S2: failure rate and what the knobs buy ---------------------------
+    fig, axes = plt.subplots(1, 3, figsize=figsize("full", 2.4), layout="constrained")
+
+    ax = axes[0]
+    flags = collect_flags(COVERAGE_DATASETS)
+    flag_panel(ax, flags, colors)
+    ax.set_title("Run outcomes")
+    ax.legend(loc="upper right", frameon=False)
+    panel_letter(ax, "a")
+
+    anchors = read_by_config("anchor_ablation_cfgB_by_config.csv")
+    ax = axes[1]
+    anchor_panel(ax, anchors, "mean_foscttm", colors)
+    ax.set_ylabel("FOSCTTM")
+    ax.set_title("Anchors and alignment")
+    panel_letter(ax, "b")
+
+    ax = axes[2]
+    anchor_panel(ax, anchors, "beta_anchor_mean_abs_err", colors)
+    ax.set_ylabel(r"$\beta$ anchor error")
+    ax.set_title("Anchors and β")
+    ax.legend(loc="best", frameon=False)
+    panel_letter(ax, "c")
+
+    save_figure(fig, dest / "figS2_stability")
+
+
+def tables(out: Path):
+    """Supplementary tables: what each method was allowed to see, and which links exist.
+
+    Written as CSV rather than drawn. Both are reference material a reader looks a row up
+    in, and a rendered image of a table cannot be searched, sorted or copied.
+    """
+    dest = out / "tables"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Read from the registry rather than a list kept here: a model added to the runner
+    # and forgotten in this table is exactly how a method ends up in a benchmark with no
+    # declared protocol.
+    protocol = pd.DataFrame(
+        [{"model": method_label(m), "out_of_sample_mode": resolve_oos_mode(m)}
+         for m in sorted(set(REGISTERED_MODELS) | {"kot"})])
+    protocol.to_csv(dest / "protocol.csv", index=False)
+    print(f"[tables] protocol.csv: {len(protocol)} models")
+
+    links = []
+    for dataset, stem in (("BMMC CITE-seq", "bmmc_cite_retained"),
+                          ("PBMC CITE-seq", "pbmc_retained"),
+                          ("Papalexi ECCITE-seq", "papalexi")):
+        path = Path("cache/results/mapping") / f"adt_mapping_{stem}.csv"
+        if not path.exists():
+            print(f"[tables] no mapping CSV for {dataset}")
+            continue
+        table = pd.read_csv(path)
+        table.insert(0, "dataset", dataset)
+        links.append(table)
+    if links:
+        mapping = pd.concat(links, ignore_index=True)
+        mapping.to_csv(dest / "adt_gene_links.csv", index=False)
+        used = mapping["use_for_alignment"] & mapping["present_in_rna"]
+        print(f"[tables] adt_gene_links.csv: {len(mapping)} rows, {int(used.sum())} "
+              "usable alignment links")
 
 
 def appendix(out: Path):
@@ -589,6 +1033,9 @@ def main():
     print("\n=== Figure 1b: ablation co-embedding ===")
     figure1b(args.out)
 
+    print("\n=== Figure 1c: linkage coverage ===")
+    figure1c(args.out)
+
     print("\n=== Figure 2: synthetic recovery ===")
     figure2(args.out)
 
@@ -599,8 +1046,25 @@ def main():
     for note in plot_beta_recovery(collect_beta(), args.out / "fig4_kinetics"):
         print("   ", note)
 
+    print("\n=== Figure 5: velocity corruption ===")
+    figure5(args.out)
+
+    print("\n=== Figure 6: per-cell physics ===")
+    figure6(args.out)
+
+    print("\n=== Figure 7: protein prediction ===")
+    figure7(args.out)
+
+    print("\n=== Figure 8: co-embedding by method ===")
+    figure8(args.out)
+
+    print("\n=== Figure 9: rank shape and cost ===")
+    figure9(args.out)
+
     print("\n=== Appendix ===")
     appendix(args.out)
+    supplement(args.out)
+    tables(args.out)
 
 
 if __name__ == "__main__":

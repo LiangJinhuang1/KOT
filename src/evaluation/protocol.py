@@ -7,13 +7,29 @@ oos is declared on the model registry:
   holdout_second  full RNA, second modality restricted (OT baselines; they still
                   see held-out RNA).
   paired          both modalities of the same cell — a leakage ceiling.
+
+Orthogonal to the mode: `uses_fit_pairing` says whether the method read WHICH fitted
+RNA goes with WHICH fitted protein. A supervised translator does and KOT does not, so
+the two sit in the same protocol but not on the same footing.
+
+`supervision_regime` collapses those two axes into the one label a results table has to
+carry. Methods in different regimes were not given the same information, and a table
+that ranks them in one list implies they were.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from src.training.registry import HOLDOUT_SECOND, MODELS as REGISTERED_MODELS, NATIVE, PAIRED
+from src.training.registry import (
+    DIRECT,
+    HOLDOUT_SECOND,
+    LATENT,
+    MODELS as REGISTERED_MODELS,
+    NATIVE,
+    PAIRED,
+    PAIRED_FIT_MODELS,
+)
 
 PROTOCOL_KEY = "kot_protocol"
 
@@ -27,7 +43,40 @@ LEGACY_PROTOCOL = {
     "predictor": "",
     "out_of_distribution": False,
     "paired_oracle": False,
+    "uses_fit_pairing": False,
 }
+
+
+# What a run was actually shown, across both axes. Ordered weakest to strongest: a
+# method lower in this list was given strictly less than one above it.
+UNPAIRED_FIT = "unpaired_fit"
+PAIRED_FIT = "paired_fit"
+UNPAIRED_ALL_CELLS = "unpaired_all_cells"
+PAIRED_ALL_CELLS = "paired_all_cells"
+
+SUPERVISION_DESCRIPTION = {
+    UNPAIRED_FIT: ("both modalities of the fitted cells as unpaired distributions; "
+                   "no perturbed cell's protein"),
+    PAIRED_FIT: ("the fitted cells' (RNA, protein) PAIRING; no perturbed cell's protein"),
+    UNPAIRED_ALL_CELLS: ("both modalities of every cell, unpaired, including the "
+                         "perturbations it is scored on"),
+    PAIRED_ALL_CELLS: ("the (RNA, protein) pairing of every cell, including the "
+                       "perturbations it is scored on"),
+}
+
+
+def supervision_regime(protocol: dict) -> str:
+    """What this run was shown, as one label for the results table.
+
+    Two runs can share an `oos_mode` and still not be comparable: holdout_second covers
+    both an unpaired OT method and a supervised regression, and an unrestricted run has
+    seen the very perturbations it is scored on. Naming the regime is what stops a
+    reader inferring that one number beat another under equal conditions.
+    """
+    if not protocol["out_of_distribution"]:
+        return PAIRED_ALL_CELLS if (protocol["uses_fit_pairing"] or protocol["paired_oracle"]) \
+            else UNPAIRED_ALL_CELLS
+    return PAIRED_FIT if protocol["uses_fit_pairing"] else UNPAIRED_FIT
 
 
 def resolve_oos_mode(model_name: str) -> str:
@@ -44,9 +93,25 @@ def resolve_oos_mode(model_name: str) -> str:
     return spec["oos"]
 
 
-def predictor_kind(run_cfg: dict) -> str:
-    """From config, not the model name: a name list mis-scores every kot_* variant."""
-    return "direct" if bool(run_cfg.get("kot_use_feature_space", False)) else "latent"
+def predictor_kind(run_cfg: dict, model_name: str) -> str:
+    """Whether the aligned RNA output is already in second-modality coordinates.
+
+    Every registered model declares this, because a dataset-level
+    `kot_use_feature_space` otherwise stamped the latent baselines run beside KOT as
+    direct ADT predictors. Only the kot_* family reads the config switch, since for
+    them it genuinely is one.
+    """
+    if model_name.startswith("kot"):
+        return DIRECT if bool(run_cfg.get("kot_use_feature_space", False)) else LATENT
+    spec = REGISTERED_MODELS.get(model_name)
+    if spec is None or "predictor" not in spec:
+        raise KeyError(
+            f"model '{model_name}' does not declare what its aligned RNA output is. Add "
+            f"'predictor': DIRECT or LATENT to MODELS in src.training.registry. Guessing "
+            "from the config is what stamped every baseline on papalexi_retained as a "
+            "direct ADT predictor, because that dataset sets kot_use_feature_space for KOT."
+        )
+    return spec["predictor"]
 
 
 def plan_fit_restriction(run_cfg: dict, model_name: str, fit_rows: np.ndarray | None,
@@ -99,9 +164,10 @@ def protocol_stamp(run_cfg: dict, model_name: str, n_cells: int,
         "fit_obs_values": [str(v) for v in (run_cfg.get("fit_obs_values") or [])],
         "n_fit_cells": int(len(fit_rows)) if restricted else int(n_cells),
         "n_cells": int(n_cells),
-        "predictor": predictor_kind(run_cfg),
+        "predictor": predictor_kind(run_cfg, model_name),
         "out_of_distribution": bool(restricted),
         "paired_oracle": mode == PAIRED,
+        "uses_fit_pairing": model_name in PAIRED_FIT_MODELS,
     }
 
 
@@ -118,4 +184,6 @@ def read_protocol(uns) -> dict:
         "predictor": str(stamp["predictor"]),
         "out_of_distribution": bool(stamp["out_of_distribution"]),
         "paired_oracle": bool(stamp["paired_oracle"]),
+        # Added after the first stamped runs; those files predate supervised baselines.
+        "uses_fit_pairing": bool(stamp.get("uses_fit_pairing", False)),
     }

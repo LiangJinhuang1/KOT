@@ -18,6 +18,18 @@
 #   bash slurm/submit_adaptive.sh jobs/archive/jobs_sweep_D.txt
 #   bash slurm/submit_adaptive.sh jobs/jobs_sweep_DH.txt --dependency afterok:12345
 #   bash slurm/submit_adaptive.sh jobs.txt --max-gpus 4 --min-gpus 1 --max-parallel 16
+#   bash slurm/submit_adaptive.sh jobs.txt --gpu-order b200,a100     # try b200, fall back
+#
+# GPU TYPE FALLBACK. b200 (srvcore3, 8) and a100 (srvdgx1 8 + srvdrai2 2) are separate
+# pools with separate QOS caps, so one can be saturated while the other is idle. The
+# script now walks --gpu-order in sequence and submits to the first type with a free card,
+# instead of queueing behind a full pool while another sits empty.
+#
+# Only b200, a100 and a100_10gb pass the cluster submit filter, and a100_10gb matches no
+# real gres on any node -- srvdrai2's MIG slices are `nvidia_a100_80gb_pcie_1g.10gb` and
+# its two RTX Pro 6000 Blackwells are `nvidia_rtx_pro_6000_blackwell_server_edition`.
+# Those 9 cards are therefore idle but unreachable; ask the admins to add the filter
+# aliases if they are ever needed.
 #
 # Run it in the background -- it polls until the job clears its preflight:
 #   nohup bash slurm/submit_adaptive.sh jobs/archive/jobs_sweep_D.txt > logs/adaptive_D.log 2>&1 &
@@ -30,6 +42,7 @@ MIN_GPUS=1
 MAX_PARALLEL=16
 NODE=srvcore3
 GRES=b200
+GPU_ORDER=b200,a100
 DEPENDENCY=""
 WAIT_FREE_SEC=300        # how long to wait for a free GPU before giving up
 
@@ -39,7 +52,8 @@ while [ $# -gt 0 ]; do
     --min-gpus)     MIN_GPUS="$2";     shift 2 ;;
     --max-parallel) MAX_PARALLEL="$2"; shift 2 ;;
     --node)         NODE="$2";         shift 2 ;;
-    --gres)         GRES="$2";         shift 2 ;;
+    --gres)         GRES="$2"; GPU_ORDER="$2"; shift 2 ;;
+    --gpu-order)    GPU_ORDER="$2";    shift 2 ;;
     --dependency)   DEPENDENCY="$2";   shift 2 ;;
     --wait-free)    WAIT_FREE_SEC="$2";shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
@@ -49,30 +63,52 @@ done
 
 # Free GPUs of this type on this node: configured minus allocated. A node with nothing
 # allocated has no gres entry in AllocTRES at all, hence the :-0 defaults.
-free_gpus() {
-  local cfg alloc
-  cfg=$(scontrol show node "${NODE}" 2>/dev/null | tr ',' '\n' \
-        | grep -oE "gres/gpu:${GRES}=[0-9]+" | head -1 | cut -d= -f2)
-  alloc=$(scontrol show node "${NODE}" 2>/dev/null \
-        | sed -n 's/.*AllocTRES=\([^ ]*\).*/\1/p' | tr ',' '\n' \
-        | grep -oE "gres/gpu:${GRES}=[0-9]+" | head -1 | cut -d= -f2)
-  echo $(( ${cfg:-0} - ${alloc:-0} ))
+# Free cards of one type, summed over EVERY node that has them: a100 lives on two nodes,
+# so counting a single node would report a pool as full while the other one is idle.
+free_of_type() {
+  local type="$1" total=0 node cfg alloc
+  for node in $(sinfo -h -N -o "%N" | sort -u); do
+    cfg=$(scontrol show node "${node}" 2>/dev/null | sed -n 's/.*CfgTRES=\([^ ]*\).*/\1/p' \
+          | tr ',' '\n' | grep -oE "gres/gpu:${type}=[0-9]+" | head -1 | cut -d= -f2)
+    [ -z "${cfg}" ] && continue
+    alloc=$(scontrol show node "${node}" 2>/dev/null | sed -n 's/.*AllocTRES=\([^ ]*\).*/\1/p' \
+          | tr ',' '\n' | grep -oE "gres/gpu:${type}=[0-9]+" | head -1 | cut -d= -f2)
+    total=$(( total + cfg - ${alloc:-0} ))
+  done
+  echo "${total}"
+}
+
+free_gpus() { free_of_type "${GRES}"; }
+
+# First type in --gpu-order with at least MIN_GPUS free; empty when every pool is full.
+pick_gpu_type() {
+  local type
+  for type in $(echo "${GPU_ORDER}" | tr ',' ' '); do
+    if [ "$(free_of_type "${type}")" -ge "${MIN_GPUS}" ]; then echo "${type}"; return; fi
+  done
+  echo ""
 }
 
 # Wait for at least MIN_GPUS to be free, so the first request is sized to reality
 # rather than to a number picked before anyone else's job finished.
 waited=0
-while [ "$(free_gpus)" -lt "${MIN_GPUS}" ]; do
+while :; do
+  chosen=$(pick_gpu_type)
+  [ -n "${chosen}" ] && break
   if [ "${waited}" -ge "${WAIT_FREE_SEC}" ]; then
-    echo "no ${GRES} GPU free on ${NODE} after ${WAIT_FREE_SEC}s; giving up." >&2
+    echo "no GPU free in [${GPU_ORDER}] after ${WAIT_FREE_SEC}s; giving up." >&2
+    for t in $(echo "${GPU_ORDER}" | tr ',' ' '); do
+      echo "  ${t}: $(free_of_type "${t}") free" >&2
+    done
     exit 1
   fi
   sleep 30; waited=$(( waited + 30 ))
 done
+GRES="${chosen}"
 
 free=$(free_gpus)
 n=$(( free < MAX_GPUS ? free : MAX_GPUS ))
-echo "[adaptive] ${free} ${GRES} free on ${NODE}; starting at ${n} GPU(s), floor ${MIN_GPUS}."
+echo "[adaptive] chose ${GRES} from [${GPU_ORDER}]: ${free} free; starting at ${n} GPU(s), floor ${MIN_GPUS}."
 
 while [ "${n}" -ge "${MIN_GPUS}" ]; do
   dep_flag=(); [ -n "${DEPENDENCY}" ] && dep_flag=(--dependency="${DEPENDENCY}")

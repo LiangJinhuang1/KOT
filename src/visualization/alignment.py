@@ -20,6 +20,7 @@ from src.visualization import (
 )
 from src.visualization.style import (
     SCATTER_STYLE,
+    STYLE_STATE,
     apply_style,
     chance_line,
     embedding_axes,
@@ -449,3 +450,29 @@ def plot_training_loss(loss_csv, save_dir, model_name):
 
     fig.tight_layout(pad=0.3)
     return save_figure(fig, save_dir / "training_loss")
+
+
+def confusion_panel(ax, matrix, labels, *, cmap: str = "Blues",
+                    fontsize: float | None = None):
+    """Row-normalised confusion between true and assigned branch.
+
+    Row-normalised, not count-normalised: the branch stage is built with unequal
+    occupancy, so raw counts make the largest branch look like the best-resolved one.
+    Each row then reads as "of the cells that truly belong to X, where did they go".
+    """
+    counts = np.asarray(matrix, dtype=float)
+    shares = counts / counts.sum(axis=1, keepdims=True)
+    image = ax.imshow(shares, cmap=cmap, vmin=0, vmax=1)
+    short = [str(name).replace("Branch_", "").replace("Progenitor", "Prog") for name in labels]
+    ax.set_xticks(range(len(short)), short)
+    ax.set_yticks(range(len(short)), short)
+    ax.set_xlabel("Assigned")
+    ax.set_ylabel("True")
+    # Two significant figures at tick size: at the ladder's base size the three
+    # numbers in a row touch in a third-width panel.
+    size = fontsize if fontsize is not None else STYLE_STATE["ladder"][2]
+    for i in range(shares.shape[0]):
+        for j in range(shares.shape[1]):
+            ax.text(j, i, f"{shares[i, j]:.2f}", ha="center", va="center",
+                    fontsize=size, color="white" if shares[i, j] > 0.5 else "#1A1A1A")
+    return image

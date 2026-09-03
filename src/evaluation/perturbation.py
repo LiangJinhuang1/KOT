@@ -45,6 +45,100 @@ def build_scoring_set(observed: pd.DataFrame, adt_gene_map: dict[str, str],
     return kept[["knockout", "adt", "delta", "cohens_d"]].rename(columns={"delta": "obs_delta"})
 
 
+def sufficient_knockouts(groups: pd.Series, replicates: pd.Series, control_label: str,
+                         min_cells: int, min_replicates: int) -> list[str]:
+    """Knockouts sampled well enough to carry an effect estimate at all.
+
+    The rule is `min_cells` cells in EACH of at least `min_replicates` replicates, not
+    that many cells in total that happen to span that many replicates. A knockout with
+    200 cells in one replicate and 2 in another has one replicate-level effect estimate,
+    not two, and cannot contribute a replicate correlation.
+
+    Sufficiency is a property of the DESIGN -- how many cells, spread over how many
+    replicates -- so it can be fixed before any model is scored. Selecting instead on
+    whether the observed effect reached significance would define the benchmark by its
+    own answers, and would drop every perturbation whose true effect is small, which is
+    where a cross-modal model has the most to prove.
+
+    ONE definition, shared by the observed-response table (run_kot_crispr.py) and the
+    benchmark scoring set (tools/papalexi.py). Two copies would be two thresholds.
+    """
+    kept = []
+    for target in sorted(set(groups.unique()) - {control_label}):
+        mask = (groups == target).to_numpy()
+        per_replicate = replicates[mask].value_counts()
+        if int((per_replicate >= min_cells).sum()) >= min_replicates:
+            kept.append(target)
+    return kept
+
+
+def replicate_effects(protein: np.ndarray, adt_names: list[str], cognate_rna: pd.DataFrame,
+                      adt_gene_map: dict[str, str], groups: pd.Series, replicates: pd.Series,
+                      control_label: str) -> pd.DataFrame:
+    """Observed response per (perturbation, replicate, protein), against that replicate's NT.
+
+    The control is taken WITHIN the replicate, not pooled across all of them. A batch
+    shift shared by the knockout and its own controls then cancels, which is the whole
+    reason the replicate is in the key; pooling the controls would leave that shift in
+    every effect and make the replicates look more consistent than they are.
+
+    `protein_effect_se` is the Welch standard error of the difference in means, so an
+    effect from 20 cells is visibly less certain than one from 1,000 rather than sitting
+    in the table looking equally solid.
+    """
+    gene_of = {adt: adt_gene_map[adt] for adt in adt_names}
+    is_control = (groups == control_label).to_numpy()
+    rows = []
+    for replicate in sorted(replicates.unique()):
+        in_replicate = (replicates == replicate).to_numpy()
+        control_mask = is_control & in_replicate
+        if control_mask.sum() < 2:
+            continue
+        for target in sorted(set(groups.unique()) - {control_label}):
+            ko_mask = (groups == target).to_numpy() & in_replicate
+            if ko_mask.sum() < 2:
+                continue
+            for j, adt in enumerate(adt_names):
+                ko, nt = protein[ko_mask, j], protein[control_mask, j]
+                gene = gene_of[adt]
+                cognate = float("nan")
+                if gene in cognate_rna.columns:
+                    values = cognate_rna[gene].to_numpy()
+                    cognate = float(values[ko_mask].mean() - values[control_mask].mean())
+                rows.append({
+                    "perturbation": target,
+                    "replicate": str(replicate),
+                    "protein": adt,
+                    "n_ko_cells": int(ko_mask.sum()),
+                    "n_nt_cells": int(control_mask.sum()),
+                    "delta_protein": float(ko.mean() - nt.mean()),
+                    "delta_cognate_rna": cognate,
+                    "protein_effect_se": float(np.sqrt(ko.var(ddof=1) / len(ko)
+                                                       + nt.var(ddof=1) / len(nt))),
+                })
+    return pd.DataFrame(rows)
+
+
+def build_sufficiency_scoring_set(observed: pd.DataFrame, adt_gene_map: dict[str, str],
+                                  knockouts: list[str]) -> pd.DataFrame:
+    """Every non-self (knockout, protein) pair for the sufficiently sampled knockouts.
+
+    Same self-pair exclusion as `build_scoring_set` and the same output columns; what
+    differs is that nothing here consults a p-value or an effect size.
+    """
+    df = observed[observed["knockout"].isin(knockouts)].copy()
+    df["is_self_pair"] = [
+        adt_gene_map[adt] == knockout
+        for adt, knockout in zip(df["adt"], df["knockout"])
+    ]
+    kept = df[~df["is_self_pair"]].copy()
+    dropped = df[df["is_self_pair"]]
+    print(f"[scoring set] {len(kept)} pairs over {len(knockouts)} sufficiently sampled "
+          f"knockouts, {len(dropped)} self-pairs excluded: "
+          f"{', '.join(f'{r.knockout}->{r.adt}' for r in dropped.itertuples())}")
+    return kept[["knockout", "adt", "delta", "cohens_d"]].rename(columns={"delta": "obs_delta"})
+
+
 def finite_pairs(*arrays: np.ndarray) -> np.ndarray:
     """Mask of positions where every input is finite.
 
@@ -184,6 +278,39 @@ def affine_calibration(predicted: np.ndarray, observed: np.ndarray,
     movable = variance > 0
     a[movable] = (p_centred[:, movable] * o_centred[:, movable]).sum(axis=0) / variance[movable]
     return a, o_mean - a * p_mean
+
+
+def positive_scale(predicted: np.ndarray, observed: np.ndarray, rows: np.ndarray,
+                   min_sd_ratio: float = 0.0) -> np.ndarray:
+    """Per-protein POSITIVE scale, sd(observed)/sd(predicted), fitted on `rows`.
+
+    A unit correction, not a fit. `affine_calibration`'s least-squares slope can come out
+    NEGATIVE, and that is not a rescale: it inverts the prediction. Granting that to an
+    ablation lets the ablation undo itself -- the reversed-velocity arm predicts protein
+    backwards, and a signed slope flips it back, which turned its Spearman from -0.12 into
+    +0.42 and made it beat the unablated model. A model has to get the direction right on
+    its own; only its scale is allowed to be corrected.
+
+    A protein whose prediction is constant over `rows` has no identifiable scale and is
+    left at 1 rather than blown up to infinity.
+
+    `min_sd_ratio` guards the case in between, which is worse than either: a prediction
+    that is not quite constant. The zero-velocity control arm's phi has sd 0.002x the
+    observed spread, so this divides its numerical dust by 0.002 and hands the scorer a
+    ranked prediction -- that degenerate arm then posted the HIGHEST primary Spearman of
+    any ablation. A column below the ratio is scaled to NaN so it is dropped from scoring
+    and reported as absent, rather than scored as though it had predicted something. The
+    default is 0.0, which is the historical behaviour; the CRISPR benchmark sets it.
+    """
+    predicted_sd = predicted[rows].std(axis=0)
+    observed_sd = observed[rows].std(axis=0)
+    scale = np.ones(predicted.shape[1], dtype=np.float64)
+    movable = predicted_sd > 0
+    scale[movable] = observed_sd[movable] / predicted_sd[movable]
+    if min_sd_ratio > 0:
+        degenerate = movable & (predicted_sd < min_sd_ratio * observed_sd)
+        scale[degenerate] = np.nan
+    return scale
 
 
 def calibrate_direct(predicted: np.ndarray, observed: np.ndarray,

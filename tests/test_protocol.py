@@ -49,9 +49,17 @@ class CapabilityTests(unittest.TestCase):
 
 
 class PredictorTests(unittest.TestCase):
-    def test_feature_space_runs_are_direct_whatever_the_model_is_called(self):
-        self.assertEqual(predictor_kind({"kot_use_feature_space": True}), "direct")
-        self.assertEqual(predictor_kind({}), "latent")
+    def test_feature_space_runs_are_direct_whatever_the_kot_variant_is_called(self):
+        self.assertEqual(predictor_kind({"kot_use_feature_space": True}, "kot_nodyn"), "direct")
+        self.assertEqual(predictor_kind({}, "kot"), "latent")
+
+    def test_the_registry_beats_a_dataset_level_feature_space_flag(self):
+        """papalexi_retained sets kot_use_feature_space for KOT; a latent baseline run on
+        that dataset must not be stamped as predicting in ADT coordinates."""
+        feature_space = {"kot_use_feature_space": True}
+        self.assertEqual(predictor_kind(feature_space, "moscot"), "latent")
+        self.assertEqual(predictor_kind(feature_space, "ridge"), "direct")
+        self.assertEqual(predictor_kind({}, "scipenn"), "direct")
 
 
 class RestrictionPlanTests(unittest.TestCase):
@@ -118,6 +126,14 @@ class StampTests(unittest.TestCase):
         self.assertFalse(stamp["paired_oracle"])
         self.assertEqual((stamp["n_fit_cells"], stamp["n_cells"]), (30, 100))
         self.assertEqual(stamp["predictor"], "direct")
+        self.assertFalse(stamp["uses_fit_pairing"])
+
+    def test_a_supervised_translator_is_stamped_as_using_the_pairing(self):
+        stamp = protocol_stamp({"fit_obs_key": "gene", "fit_obs_values": ["NT"]},
+                               "ridge", n_cells=100, fit_rows=np.arange(30))
+        self.assertTrue(stamp["out_of_distribution"])
+        self.assertTrue(stamp["uses_fit_pairing"])
+        self.assertFalse(protocol_stamp({}, "kot", n_cells=10, fit_rows=None)["uses_fit_pairing"])
 
     def test_unrestricted_run_reports_every_cell_as_fitted(self):
         stamp = protocol_stamp({}, "glue", n_cells=100, fit_rows=None)

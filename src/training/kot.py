@@ -31,9 +31,11 @@ from src.losses.jvp_physics import kinetics_loss
 from src.data.projection import projection_matrix_from_adatas
 from src.data.adt_gene_map import load_mapping_records
 from src.data.beta_anchor import resolve_beta_anchors
+from src.training.protein_supervised import adt_targets, protein_target_units
 from src.data.splits import (
+    group_holdout_mask,
     held_out_mask,
-    reported_slice_mask,
+    selection_validation_mask,
     resolve_split_seed,
     split_digest,
 )
@@ -1736,7 +1738,7 @@ def validation_metrics(per_cell: dict) -> dict:
 def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
                         velocity_diag: dict, checkpoints: list, best_align_state,
                         model, diag_inputs: DiagInputs, model_name: str, seed: int,
-                        grad_interaction_rows: list) -> None:
+                        grad_interaction_rows: list, protein_units: str) -> None:
     """Everything a finished run leaves on disk, in one place.
 
     Writes diagnostics.json, one .pt per recorded checkpoint, a per-checkpoint
@@ -1759,6 +1761,11 @@ def write_run_artifacts(output_dir, diagnostics: dict, best_align_full: dict,
                 "losses":     lo,
                 "model_name": model_name,
                 "seed":       seed,
+                # The units phi was trained to predict. A scorer that rescales phi onto
+                # observed ADT has to know this: a CLR checkpoint and an rna_size one
+                # have identical shapes, so without the stamp the two are
+                # indistinguishable and the wrong one is silently reported.
+                "protein_units": protein_units,
             },
             ckpt_path,
         )
@@ -2248,12 +2255,23 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     protein_layer = cfg.get("kot_protein_layer")
     velocity_layer = cfg.get("kot_velocity_layer") or cfg.get("velocity_layer")
 
+    # The protein target goes through the SAME contract as the supervised baselines
+    # (src/training/protein_supervised.adt_targets), so `protein_target_normalization`
+    # means one thing for every method on a dataset. Reading protein_adata.X directly
+    # trained phi on CLR while ridge, MLP, sciPENN and scButterfly trained on the
+    # benchmark's rna_size units, and CLR is a per-cell row operation that the
+    # per-protein rescale in the CRISPR scorer cannot invert: a PERFECT CLR map scores
+    # spearman +0.37 on the Papalexi primary set against ridge's +0.51, so phi was
+    # ranked against a ceiling it could not reach. Worse, CLR closure forces the four
+    # predicted deltas onto one compositional axis -- phi got PDL1 right (+0.74) and
+    # the other three exactly backwards.
     if use_feature_space:
         x = matrix_from_adata(rna_adata, rna_layer, "RNA")
-        y = matrix_from_adata(second_adata, protein_layer, "protein")
+        y = adt_targets(context, cfg)
         print(
             "[kot] Using feature-space inputs: "
-            f"RNA={x.shape} ({rna_layer or 'X'}), protein={y.shape} ({protein_layer or 'X'})"
+            f"RNA={x.shape} ({rna_layer or 'X'}), protein={y.shape} "
+            f"({protein_target_units(cfg, protein_layer)})"
         )
 
     n, D_r = x.shape
@@ -2347,9 +2365,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     conf_t = to_tensor(conf,  device)   # (n,)
 
     # ---- Held-out cells (see src/data/splits.py) ----
-    # One mask for the random/stratified val_fraction slice and for CRISPR group
-    # holdout (fit_obs_key). KOT still evaluates φ on every cell; only the loss is
-    # restricted, so knockout transcriptomes can be scored out of sample.
+    # Training exclusion, checkpoint-selection validation, and OOD test membership are
+    # separate concepts. In particular, Papalexi KO protein is test-only and cannot enter
+    # validation_align_loss or select best_val_align.
     val_fraction   = float(cfg.get("val_fraction", 0.0))
     val_split_seed = resolve_split_seed(
         int(cfg.get("val_split_seed", 20260825)),
@@ -2358,51 +2376,52 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     )
     val_stratify_by = cfg.get("val_stratify_by") or None
     fit_obs_key = cfg.get("fit_obs_key") or None
-    # Two different questions, kept apart (src/data/splits.py). held_out_mask is what
-    # leaves the LOSS; reported_slice_mask is what val_foscttm is measured on, which with
-    # val_holdout_from_training=false is the same cells marked in-sample. Deciding the
-    # first from val_fraction and fit_obs_key here is what made fit_obs_key override the
-    # flag and pull the val slice out of training after the config had asked for it back.
+
     held_out_np = held_out_mask(rna_adata.obs, cfg, seed)
-    val_mask_np = reported_slice_mask(rna_adata.obs, cfg, seed)
+    val_mask_np = selection_validation_mask(rna_adata.obs, cfg, seed)
+    group_held_out_np = group_holdout_mask(rna_adata.obs, cfg)
     n_val = int(val_mask_np.sum())
-    val_holdout = bool(held_out_np.any())
+    n_group_held_out = int(group_held_out_np.sum())
+    val_holdout = bool(cfg.get("val_holdout_from_training", True)) and n_val > 0
     val_idx_t = (
         to_index_tensor(np.nonzero(val_mask_np)[0], device) if n_val > 0 else None
     )
     # None means "every cell": it keeps the full-batch alignment path from gathering the
     # whole (n, D_r) matrix once an epoch just to re-index it in the original order.
+    has_held_out = bool(held_out_np.any())
     train_idx_t = (
-        to_index_tensor(np.nonzero(~held_out_np)[0], device) if val_holdout else None
+        to_index_tensor(np.nonzero(~held_out_np)[0], device) if has_held_out else None
     )
     n_held_out = int(held_out_np.sum())
     n_train = n - n_held_out
 
     # Kinetics never reads observed protein, so it can run on held-out RNA.
-    # Without that, φ on held-out cells is only a distribution match and
+    # Without that, phi on held-out cells is only a distribution match and
     # predicted deltas collapse. Alignment stays on fitted cells: matching
-    # held-out RNA to control protein would train φ to erase the perturbation.
+    # held-out RNA to control protein would train phi to erase the perturbation.
     kinetics_on_held_out = bool(cfg.get("kot_kinetics_on_held_out", False))
     dyn_idx_t = None if kinetics_on_held_out else train_idx_t
     n_dyn = n if kinetics_on_held_out else n_train
-    if kinetics_on_held_out and val_holdout:
+    if kinetics_on_held_out and has_held_out:
         print(f"[kot] kinetics term on all {n} cells ({n_train} fitted + {n_held_out} "
               f"held out); alignment stays on the {n_train} fitted cells")
     if n_val > 0:
-        held = (f"{n_held_out} held out of training" if val_holdout
-                else "IN training (val is in-sample)")
+        held = ("held out of training" if val_holdout else "IN training (val is in-sample)")
         strat = f" | stratified by {val_stratify_by}" if val_stratify_by is not None else ""
-        group = (f" | fit_obs {fit_obs_key} in {list(cfg.get('fit_obs_values', []))}"
-                 if fit_obs_key is not None else "")
-        print(f"[kot] validation split: {n_val}/{n} cells ({100 * n_val / n:.1f}%) reported, "
-              f"{held} | split_seed={val_split_seed}{strat}{group} "
+        print(f"[kot] checkpoint-selection validation: {n_val}/{n - n_group_held_out} "
+              f"fit-eligible cells, {held} | split_seed={val_split_seed}{strat} "
               f"digest={split_digest(rna_adata.obs_names, val_mask_np)}")
     else:
-        print("[kot] validation split: off (val_fraction=0, no fit_obs restriction)")
-    if monitor_is_val and not val_holdout:
+        print("[kot] checkpoint-selection validation: off (val_fraction=0)")
+    if n_group_held_out > 0:
+        print(f"[kot] OOD test holdout: {n_group_held_out}/{n} cells excluded from "
+              "training and checkpoint selection"
+              f" | fit_obs {fit_obs_key} in {list(cfg.get('fit_obs_values', []))}")
+    if monitor_is_val and (n_val == 0 or not val_holdout):
         raise ValueError(
-            "early_stopping_monitor=val_align needs held-out cells to measure: set "
-            "val_fraction>0 and val_holdout_from_training=true, or monitor train_align."
+            "early_stopping_monitor=val_align needs fit-eligible validation cells held "
+            "out from training: set val_fraction>0 and val_holdout_from_training=true, "
+            "or monitor train_align. Group/OOD test cells cannot select a checkpoint."
         )
     # Optionally drop proteins whose linked gene has unusable RNA velocity: those
     # add noise to the JVP but no real dynamics signal. A protein stays active only
@@ -3107,6 +3126,10 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["val_split_digest"]  = (
         split_digest(rna_adata.obs_names, val_mask_np) if n_val > 0 else None
     )
+    diagnostics["group_holdout_digest"] = (
+        split_digest(rna_adata.obs_names, group_held_out_np)
+        if n_group_held_out > 0 else None
+    )
     # The RESOLVED seed, not the configured base: with val_split_per_seed on they
     # differ, and the resolved one is what the digest can be reproduced from.
     diagnostics["val_split_seed_resolved"] = int(val_split_seed) if n_val > 0 else None
@@ -3120,6 +3143,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     diagnostics["n_train_cells"]     = int(n_train)
     diagnostics["n_held_out_cells"]  = int(n_held_out)
     diagnostics["n_reported_cells"]  = int(n_val)
+    diagnostics["n_group_holdout_cells"] = int(n_group_held_out)
     # The alignment term saw n_train cells; the kinetics term saw n_dyn. They differ only
     # under kot_kinetics_on_held_out, and a run cannot be interpreted without knowing it.
     diagnostics["kot_kinetics_on_held_out"] = bool(kinetics_on_held_out)
@@ -3181,6 +3205,7 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
         write_run_artifacts(
             output_dir, diagnostics, best_align_full, velocity_diag, checkpoints,
             best_align_state, model, diag_inputs, model_name, seed, grad_interaction_rows,
+            protein_target_units(cfg, protein_layer),
         )
 
     # Benchmark FOSCTTM is computed on `aligned`. Restrict it to the alignment panel

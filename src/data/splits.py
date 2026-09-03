@@ -131,6 +131,26 @@ def random_slice_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
     return mask
 
 
+def selection_validation_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
+    """Validation cells that may select a checkpoint, drawn from fit-eligible rows only.
+
+    ``fit_obs_key`` describes an out-of-distribution test restriction, not a validation
+    split. In the Papalexi experiment the rows outside ``fit_obs_values=[NT]`` are KO
+    test cells, so their observed protein must never enter ``best_val_align`` or early
+    stopping. Draw the ordinary random/stratified validation slice *within* the allowed
+    group instead. With no group restriction this is exactly ``random_slice_mask``.
+    """
+    group_held_out = group_holdout_mask(rna_obs, cfg)
+    if not group_held_out.any():
+        return random_slice_mask(rna_obs, cfg, model_seed)
+
+    eligible = np.nonzero(~group_held_out)[0]
+    selected_eligible = random_slice_mask(rna_obs.iloc[eligible], cfg, model_seed)
+    selected = np.zeros(len(rna_obs.index), dtype=bool)
+    selected[eligible] = selected_eligible
+    return selected
+
+
 def random_holdout_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarray:
     """The part of the random slice that is actually removed from the loss.
 
@@ -141,7 +161,7 @@ def random_holdout_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarra
     """
     if not bool(cfg.get("val_holdout_from_training", True)):
         return np.zeros(len(rna_obs.index), dtype=bool)
-    return random_slice_mask(rna_obs, cfg, model_seed)
+    return selection_validation_mask(rna_obs, cfg, model_seed)
 
 
 def group_holdout_mask(rna_obs, cfg: dict) -> np.ndarray:
@@ -186,7 +206,7 @@ def reported_slice_mask(rna_obs, cfg: dict, model_seed: int | None) -> np.ndarra
     A superset of `held_out_mask`: it keeps the drawn random slice even when the config
     returned those cells to training, so in-sample val columns are still measured.
     """
-    return (random_slice_mask(rna_obs, cfg, model_seed)
+    return (selection_validation_mask(rna_obs, cfg, model_seed)
             | group_holdout_mask(rna_obs, cfg))
 
 

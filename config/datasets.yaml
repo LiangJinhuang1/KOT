@@ -57,6 +57,17 @@ datasets:
     protein_path: Datasets/Papalexi_GSE153056/papalexi_protein.h5ad
     protein_label: ADT
 
+  # Item 23: NT-only preprocessing. Fitted statistics (HVG, shared-count filter, PCA,
+  # scVelo kinetics, velocity confidence) come from NT. NT neighbours are NT-only;
+  # KO neighbours may include knockouts so moments do not collapse to a control profile.
+  # Built by `run_kot_crispr.py preprocess`; kept BESIDE papalexi_retained.
+  papalexi_nt_only:
+    name: Papalexi ECCITE-seq (NT-only preprocessing)
+    rna_path: cache/velocity/papalexi_nt_only/papalexi_scvelo_results_nt_only.h5ad
+    rna_raw_layer: counts
+    protein_path: Datasets/Papalexi_GSE153056/papalexi_protein.h5ad
+    protein_label: ADT
+
   # Same as papalexi_retained but RNA velocity from RegVelo — the velocity ablation.
   papalexi_regvelo:
     name: Papalexi ECCITE-seq (RegVelo velocity)

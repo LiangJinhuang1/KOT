@@ -47,7 +47,8 @@ DEFAULT_METRICS = [
     # fits the small tuning set (train_on_val_side), this is the score on exactly the
     # cells it fitted, and the large deployment side must stay out of selection.
     "train_foscttm", "train_n_cells",
-    "val_holdout", "val_split_digest", "runtime_seconds",
+    "val_holdout", "val_split_digest", "group_holdout_digest",
+    "n_group_holdout_cells", "runtime_seconds",
     "jvp_rhs_cos_median", "jvp_rhs_cos_mean", "rel_residual_median",
     # Branch accuracy is the v2b-branch stage's whole point: the A<->B swap is the
     # degeneracy static OT cannot resolve, so only the dynamics term can. loss_dyn is the

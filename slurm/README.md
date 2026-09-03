@@ -102,12 +102,71 @@ so the true field and the true map are the only references all arms share. The a
 ladder belongs in the same table because `anchored` is resolved per seed from each run's
 own `beta_anchor_subset_n`.
 
+**CRISPR competitor set** (supervised RNA→protein translators; GPU)
+
+The CRISPR benchmark's competitors are not the diagonal-integration baselines used for
+BMMC/PBMC. They are supervised translators fitted on the NT controls' PAIRED
+(RNA, protein), plus totalVI as the paired ceiling. `--models crispr` runs the set.
+
+```bash
+sbatch --job-name=papalexi_crispr --mem=64GB --time=04:00:00 \
+  --export=ALL,RUN_CMD='PYTHONPATH=. MPLBACKEND=Agg python -u main.py \
+  --datasets papalexi_retained,papalexi_regvelo --models crispr \
+  --set save_prediction_h5ad=true' slurm/train_slurm.sh
+```
+
+sciPENN and scButterfly need `pip install -e '.[protein_baselines]'`. They OOM on the
+login node; run them through slurm.
+
+**MultiPert on our pooled Papalexi** (GPU)
+
+MultiPert maps (control cell, GEARS perturbation embedding) → perturbed profile, so it
+CANNOT run under the NT-only restriction: with controls alone it has no perturbation to
+learn. It runs in its own published regime (per-perturbation 0.6/0.2/0.2 CELL split, so
+it trains on cells of every knockout it is scored on) and is reported as a NOT-RANKED
+`paired_all_cells` reference beside totalVI. Its paper used the ARRAYED Papalexi
+experiment; this runs it on our POOLED screen so the numbers sit on our data.
+
+```bash
+# once: write our data in MultiPert's convention (CPU, streams the 1.4GB RNA matrix)
+sbatch --partition=jobs-cpu --gres=none --mem=96GB --time=01:30:00 \
+  --job-name=multipert_inputs --export=ALL,RUN_CMD='PYTHONPATH=. python -u \
+  tools/multipert.py inputs' slurm/train_slurm.sh
+cp vendor/multipert/pert_embeddings.npz cache/multipert/data/
+
+# per seed — a SEPARATE --out-dir each time, or main() reloads the previous checkpoint
+sbatch --job-name=multipert_run --mem=96GB --time=03:00:00 \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -u tools/multipert.py run --seed 1' \
+  slurm/train_slurm.sh
+
+# per-(knockout, protein) deltas, calibrated onto benchmark ADT units on control cells
+sbatch --partition=jobs-cpu --gres=none --mem=48GB --time=00:30:00 \
+  --job-name=multipert_deltas --export=ALL,RUN_CMD='PYTHONPATH=. python -u \
+  tools/multipert.py deltas --run-dir cache/multipert/output/seed_1' slurm/train_slurm.sh
+```
+
+4 of our 25 knockouts have no GEARS embedding and fall back to one-hot (upstream's own
+behaviour); `cache/multipert/data/pert_embedding_coverage.csv` lists them. CUL3 is among
+them and is one of the two post-transcriptional pairs the benchmark exists to test.
+
 **CRISPR perturbation benchmark** (was `papalexi_benchmark.sh`; GPU)
+
+`--scoring-set sufficiency` (the default) scores every non-self pair whose knockout
+clears the frozen design thresholds. The older significance-filtered set is a SECONDARY
+analysis: selecting pairs on their own q-values defines the benchmark by its answers and
+drops exactly the small-effect pairs a cross-modal model has to prove itself on.
+
+`--perturbation-subset` adds a second ranking over one competitor's published knockout
+set, re-scored from the same predictions, so the two tables differ only in which pairs
+are scored. It does NOT make the training conditions comparable; every table carries a
+`supervision` column for that.
 
 ```bash
 sbatch --job-name=papalexi_bench --mem=64GB --time=03:00:00 \
-  --export=ALL,RUN_CMD='for cfg in cfgC cfgB; do PYTHONPATH=. MPLBACKEND=Agg python -u tools/papalexi_perturbation_benchmark.py \
-  --predictions data/predictions_papalexi_$cfg --out-dir cache/results/papalexi_perturbation_$cfg; done' \
+  --export=ALL,RUN_CMD='for cfg in cfgC cfgB; do PYTHONPATH=. MPLBACKEND=Agg python -u tools/papalexi.py benchmark \
+  --predictions data/predictions_papalexi_$cfg --out-dir cache/results/papalexi_perturbation_$cfg \
+  --perturbation-subset config/papalexi_multipert_subset.csv \
+  --external-predictions cache/results/multipert_pair_deltas.csv; done' \
   slurm/train_slurm.sh
 ```
 

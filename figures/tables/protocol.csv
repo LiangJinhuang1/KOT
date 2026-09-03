@@ -1,0 +1,18 @@
+model,out_of_sample_mode
+GLUE,holdout_second
+KOT (ours),native
+"KOT, α fixed",native
+"KOT, κ fixed",native
+"KOT, no β-anchor",native
+"KOT, no kinetics",native
+"KOT, oracle kinetics",native
+"KOT, oracle κ",native
+"KOT, oracle β",native
+kot_unbounded,native
+kot_unbounded_sn,native
+Linear ODE,holdout_second
+MaxFuse,holdout_second
+moscot,holdout_second
+SCOT,holdout_second
+totalVI (paired),paired
+uniPort,holdout_second

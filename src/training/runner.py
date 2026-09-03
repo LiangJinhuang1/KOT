@@ -174,6 +174,7 @@ SUMMARY_METRIC_KEYS = [
     "best_align", "best_align_epoch", "best_val_align", "best_val_align_epoch",
     "best_total", "stop_epoch",
     "n_train_cells", "n_held_out_cells", "n_reported_cells",
+    "n_group_holdout_cells", "group_holdout_digest", "val_split_digest",
     "protocol_oos_mode", "protocol_out_of_distribution", "protocol_paired_oracle",
     "protocol_predictor", "protocol_n_fit_cells",
 ]

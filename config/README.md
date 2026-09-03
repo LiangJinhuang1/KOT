@@ -28,6 +28,16 @@ Defined under `model_groups:` in `training.yaml`:
 | `kot`          | kot, kot_noanchor, kot_nodyn                                    |
 | `kot_ablation` | kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle    |
 | `all`          | kot, kot_nodyn, moscot, scot, linear_ode, uniport, glue, totalvi |
+| `nt_supervised`| ridge, mlp, scipenn, scbutterfly (fitted on the controls' PAIRED RNA+protein) |
+| `crispr`       | nt_supervised + totalvi — the CRISPR competitor set              |
+| `all_crispr`   | kot, kot_nodyn + the CRISPR competitor set                       |
+
+The CRISPR groups exist because that task is protein PREDICTION, not unpaired alignment,
+so its competitors are protein predictors. They honour the same fit restriction as KOT
+(no knockout cell's ADT is read) but are fitted on the control cells' RNA↔protein
+pairing, which KOT is never given. Every prediction is stamped `uses_fit_pairing` and
+`tools/papalexi.py` prints the two regimes in separate blocks. `scipenn` and
+`scbutterfly` need `pip install -e '.[protein_baselines]'`.
 
 ### Seeds
 

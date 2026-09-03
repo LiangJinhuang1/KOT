@@ -9,6 +9,19 @@ import torch
 from torch.func import jvp as torch_jvp
 
 
+def jacobian_vector_product(phi_theta, r: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
+    """J_phi(r) · direction, in one forward-mode pass.
+
+    Used for the CRISPR Jacobian prediction: evaluated at the control mean with
+    direction = mean(r_KO) - mean(r_NT), it is the LOCAL linear response of the learned
+    map to an actual intervention. Nothing about it is fitted to the knockout -- it is the
+    differential of a map trained on controls, read in the direction the data moved.
+
+    JVP needs autograd, so do not call this inside torch.no_grad().
+    """
+    return torch_jvp(phi_theta, (r,), (direction,))[1]
+
+
 def kinetics_loss(
     phi_theta,
     kappa_psi,

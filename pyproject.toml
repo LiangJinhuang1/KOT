@@ -38,6 +38,10 @@ baselines = [
     "scglue>=0.3",
     "scvi-tools>=1.1",
 ]
+protein_baselines = [
+    "sciPENN>=0.9.6",
+    "scButterfly>=0.0.9",
+]
 regvelo = [
     "decoupler>=2.0",
     "pysam>=0.22",

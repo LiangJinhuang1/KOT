@@ -5,6 +5,9 @@ import pandas as pd
 import torch
 
 from src.evaluation.perturbation import (
+    positive_scale,
+    replicate_effects,
+    sufficient_knockouts,
     affine_calibration,
     bootstrap_spearman_gap,
     build_scoring_set,
@@ -181,3 +184,136 @@ class NonFiniteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SufficiencyTests(unittest.TestCase):
+    """The frozen design threshold, shared by the response table and the scoring set."""
+
+    def design(self, per_knockout: dict) -> tuple[pd.Series, pd.Series]:
+        genes, replicates = ["NT"] * 60, ["rep1", "rep2", "rep3"] * 20
+        for knockout, counts in per_knockout.items():
+            for replicate, n in counts.items():
+                genes += [knockout] * n
+                replicates += [replicate] * n
+        return pd.Series(genes), pd.Series(replicates)
+
+    def test_needs_the_minimum_in_each_replicate_not_in_total(self):
+        """A knockout concentrated in one batch has ONE effect estimate, not two.
+
+        The looser reading -- enough cells overall, spread over enough replicates --
+        admits 200+2 cells, whose second replicate cannot carry an effect or contribute
+        a replicate correlation.
+        """
+        groups, replicates = self.design({
+            "SPREAD": {"rep1": 25, "rep2": 25},
+            "LOPSIDED": {"rep1": 200, "rep2": 2},
+        })
+        usable = sufficient_knockouts(groups, replicates, "NT", 20, 2)
+        self.assertIn("SPREAD", usable)
+        self.assertNotIn("LOPSIDED", usable)
+
+    def test_a_third_thin_replicate_does_not_disqualify(self):
+        groups, replicates = self.design({"OK": {"rep1": 30, "rep2": 30, "rep3": 3}})
+        self.assertEqual(sufficient_knockouts(groups, replicates, "NT", 20, 2), ["OK"])
+
+    def test_the_control_is_never_returned_as_a_knockout(self):
+        groups, replicates = self.design({"A": {"rep1": 30, "rep2": 30}})
+        self.assertNotIn("NT", sufficient_knockouts(groups, replicates, "NT", 20, 2))
+
+
+class ReplicateEffectTests(unittest.TestCase):
+    ADT = ["CD86", "PDL1"]
+    MAP = {"CD86": "CD86", "PDL1": "CD274"}
+
+    def frame(self):
+        groups = pd.Series(["NT"] * 8 + ["KO"] * 8)
+        replicates = pd.Series(["rep1"] * 4 + ["rep2"] * 4 + ["rep1"] * 4 + ["rep2"] * 4)
+        # rep2 carries a +10 batch shift in BOTH arms, so a within-replicate contrast
+        # must cancel it and a pooled-control contrast would not.
+        protein = np.zeros((16, 2), dtype=float)
+        protein[4:8] += 10.0
+        protein[12:16] += 10.0
+        protein[8:16, 0] += 2.0          # KO raises CD86 by 2 in both replicates
+        rna = pd.DataFrame({"CD86": np.zeros(16), "CD274": np.zeros(16)},
+                           index=range(16))
+        return protein, groups, replicates, rna
+
+    def test_the_control_is_taken_within_the_replicate(self):
+        protein, groups, replicates, rna = self.frame()
+        effects = replicate_effects(protein, self.ADT, rna, self.MAP, groups, replicates, "NT")
+        cd86 = effects[effects["protein"] == "CD86"]
+        self.assertEqual(len(cd86), 2)
+        np.testing.assert_allclose(cd86["delta_protein"].to_numpy(), [2.0, 2.0])
+
+    def test_cell_counts_and_standard_error_are_reported(self):
+        protein, groups, replicates, rna = self.frame()
+        effects = replicate_effects(protein, self.ADT, rna, self.MAP, groups, replicates, "NT")
+        self.assertTrue((effects["n_ko_cells"] == 4).all())
+        self.assertTrue((effects["n_nt_cells"] == 4).all())
+        # Both arms are constant within a replicate here, so the Welch SE is exactly zero.
+        np.testing.assert_allclose(effects["protein_effect_se"].to_numpy(), 0.0, atol=1e-12)
+
+    def test_cognate_transcript_effect_follows_the_protein_to_gene_map(self):
+        protein, groups, replicates, rna = self.frame()
+        rna["CD274"] = [0.0] * 8 + [5.0] * 8
+        effects = replicate_effects(protein, self.ADT, rna, self.MAP, groups, replicates, "NT")
+        pdl1 = effects[effects["protein"] == "PDL1"]
+        np.testing.assert_allclose(pdl1["delta_cognate_rna"].to_numpy(), [5.0, 5.0])
+        cd86 = effects[effects["protein"] == "CD86"]
+        np.testing.assert_allclose(cd86["delta_cognate_rna"].to_numpy(), [0.0, 0.0])
+
+
+class PositiveScaleTests(unittest.TestCase):
+    """A units correction must not be able to invert a prediction.
+
+    The signed least-squares slope could, and an ablation exploited it: the
+    reversed-velocity arm predicts protein backwards, the slope flipped it back, and its
+    Spearman went from -0.12 to +0.42 and beat the unablated model.
+    """
+
+    def test_a_backwards_prediction_is_not_flipped_the_right_way_round(self):
+        rows = np.arange(200)
+        observed = np.linspace(-1.0, 1.0, 200).reshape(-1, 1)
+        backwards = -observed
+        scale = positive_scale(backwards, observed, rows)
+        self.assertGreater(scale[0], 0.0)
+        corrected = backwards * scale
+        # Still anti-correlated with the truth, as an inverted prediction should be.
+        self.assertLess(float(np.corrcoef(corrected.ravel(), observed.ravel())[0, 1]), 0)
+
+    def test_a_pure_scale_difference_is_corrected(self):
+        rows = np.arange(200)
+        observed = np.random.default_rng(0).normal(size=(200, 3))
+        scale = positive_scale(observed * 0.25, observed, rows)
+        np.testing.assert_allclose(scale, 4.0, rtol=1e-6)
+
+    def test_a_constant_column_keeps_scale_one_rather_than_exploding(self):
+        rows = np.arange(50)
+        observed = np.random.default_rng(1).normal(size=(50, 2))
+        predicted = np.column_stack([observed[:, 0], np.zeros(50)])
+        scale = positive_scale(predicted, observed, rows)
+        self.assertAlmostEqual(scale[1], 1.0)
+        self.assertTrue(np.isfinite(scale).all())
+
+    def test_a_nearly_constant_column_is_dropped_not_amplified(self):
+        """The zeroVel arm: phi is not constant, only collapsed, so nothing catches it.
+
+        sd 0.002x the observed spread means the scale is ~500x, which turns numerical
+        dust into a ranked prediction. NaN drops the column from scoring instead.
+        """
+        rows = np.arange(200)
+        observed = np.random.default_rng(2).normal(size=(200, 2))
+        predicted = np.column_stack([observed[:, 0], observed[:, 1] * 0.002])
+        unguarded = positive_scale(predicted, observed, rows)
+        self.assertGreater(unguarded[1], 100.0)
+        self.assertTrue(np.isfinite(unguarded).all())
+
+        guarded = positive_scale(predicted, observed, rows, min_sd_ratio=0.01)
+        self.assertTrue(np.isnan(guarded[1]))
+        self.assertAlmostEqual(guarded[0], 1.0, places=6)
+
+    def test_the_floor_is_off_by_default(self):
+        rows = np.arange(200)
+        observed = np.random.default_rng(3).normal(size=(200, 1))
+        scale = positive_scale(observed * 1e-6, observed, rows)
+        self.assertTrue(np.isfinite(scale).all())

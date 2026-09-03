@@ -5,8 +5,11 @@ from src.evaluation.protocol import HOLDOUT_SECOND, NATIVE, PAIRED, resolve_oos_
 from src.training.registry import (
     BATCH_SPLIT_MODELS,
     COUNT_MODELS,
+    DIRECT,
+    LATENT,
     MODELS,
     MODEL_OVERRIDES,
+    PAIRED_FIT_MODELS,
     extra_for,
 )
 from src.utils.io import load_yaml
@@ -28,18 +31,23 @@ class RegistryTests(unittest.TestCase):
             self.assertIn("function", spec, name)
             self.assertIn(spec["oos"], allowed, name)
             self.assertEqual(resolve_oos_mode(name), spec["oos"], name)
+            if not name.startswith("kot"):
+                self.assertIn(spec.get("predictor"), {DIRECT, LATENT}, name)
 
     def test_overrides_only_exist_for_registered_models(self):
         self.assertTrue(set(MODEL_OVERRIDES).issubset(MODELS))
 
     def test_count_and_batch_split_sets_match_the_previous_hardcoded_lists(self):
-        self.assertEqual(COUNT_MODELS, {"glue", "totalvi"})
+        self.assertEqual(COUNT_MODELS, {"glue", "totalvi", "scipenn", "scbutterfly"})
         self.assertEqual(BATCH_SPLIT_MODELS, {"scot", "moscot", "linear_ode"})
+        self.assertEqual(PAIRED_FIT_MODELS, {"ridge", "mlp", "scipenn", "scbutterfly"})
 
     def test_optional_extras_match_the_previous_lookup(self):
         self.assertEqual(extra_for("kot"), "kot")
         self.assertEqual(extra_for("kot_nodyn"), "kot")
         self.assertEqual(extra_for("glue"), "baselines")
+        self.assertEqual(extra_for("scipenn"), "protein_baselines")
+        self.assertIsNone(extra_for("ridge"))
         self.assertIsNone(extra_for("scot"))
         self.assertIsNone(extra_for("linear_ode"))
 

@@ -4,12 +4,18 @@ model_groups:
   ot_baselines: [scot, moscot]
   baselines:    [scot, moscot, glue, uniport, maxfuse, linear_ode]
   upperbound:   [totalvi]          # paired-latent totalVI — performance ceiling
+  # CRISPR competitor set. Supervised RNA→protein translators fitted on the NT controls'
+  # PAIRED (RNA, protein); KOT is never given that pairing, so they are labelled
+  # `uses_fit_pairing` in the ranking rather than listed beside it as equals.
+  nt_supervised: [ridge, mlp, scipenn, scbutterfly]
+  crispr:        [ridge, mlp, scipenn, scbutterfly, totalvi]
   convex:       [linear_ode]       # convex ODE baseline
   kot_main:     [kot]              # single KOT model; avoids name clash with group `kot`
   kot:          [kot, kot_noanchor, kot_nodyn]
   kot_ablation: [kot, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle]
   kot_oracles:  [kot_oracle, kot_oracle_learnalpha, kot_oracle_learnalpha_kappa]
   all:          [kot, kot_nodyn, moscot, scot, linear_ode, uniport, maxfuse, glue, totalvi]
+  all_crispr:   [kot, kot_nodyn, ridge, mlp, scipenn, scbutterfly, totalvi]
 
 # Used when --models is not passed. Keep this narrow so an accidental run does
 # not launch every baseline and every stochastic seed.
@@ -34,10 +40,41 @@ defaults:
 
   # Stochastic models that should run across every seed. Deterministic baselines
   # (scot, moscot, linear_ode) are intentionally absent — they run once.
+  # ridge is deterministic, so one seed IS its answer; every other listed model is
+  # stochastic and needs the full seed list, or its error bar is not comparable to KOT's.
   seeded_models:
     [kot, kot_noanchor, kot_nodyn, kot_fixedkappa, kot_fixedalpha, kot_oracle,
      kot_oracle_learnalpha, kot_oracle_learnalpha_kappa,
-     uniport, glue, maxfuse, totalvi]
+     uniport, glue, maxfuse, totalvi,
+     mlp, scipenn, scbutterfly]
+
+  # Supervised RNA→protein translators. Declared here so --set accepts them: the runner
+  # builds its --set whitelist from the keys that appear in this config, so an undeclared
+  # knob is rejected as a typo however faithfully the trainer reads it.
+  mlp_hidden_dims: [256, 128]
+  mlp_epochs: 300
+  mlp_batch_size: 256
+  mlp_patience: 30
+  mlp_lr: 0.001
+  mlp_weight_decay: 0.0001
+  mlp_dropout: 0.1
+  mlp_val_fraction: 0.1
+  scipenn_epochs: 10000            # sciPENN early-stops well before this
+  scipenn_es_max: 12
+  scipenn_lr: 0.001
+  scipenn_batch_size: 128
+  scipenn_val_split: 0.1
+  scipenn_use_gpu: null            # null → torch.cuda.is_available()
+  scbutterfly_embed_dim: 128
+  scbutterfly_rna_pretrain_epoch: 100
+  scbutterfly_adt_pretrain_epoch: 100
+  scbutterfly_translator_epoch: 200
+  scbutterfly_patience: 50
+  scbutterfly_batch_size: 64
+  scbutterfly_dropout: 0.1
+  scbutterfly_rna_noise: 0.5
+  scbutterfly_val_fraction: 0.2
+  scbutterfly_loss_weight: [1.0, 2.0, 1.0, 1.0, 1.0, 1.0]
 
   # OT baselines
   proj_method: barycentric
@@ -431,18 +468,30 @@ datasets:
     kot_velocity_compare_label: scvelo
 
   # CRISPR perturbation-response, not an alignment benchmark (4-protein FOSCTTM
-  # is unidentifiable). Metric: tools/papalexi.py. Train φ on NT cells only.
+  # is unidentifiable). Metric: run_kot_crispr.py. Train φ on NT cells only.
   papalexi_retained: &papalexi_retained
     modality_pair: rna_protein
-    val_fraction: 0.0
+    # 20% of NT, same barcodes every seed. KO stay out because fit_obs_values=[NT]
+    # already makes them group-held-out; this slice is only among the 2326 controls.
+    val_fraction: 0.2
+    val_stratify_by: replicate
+    early_stopping_monitor: val_align
+    lambda_dyn: 1000
     fit_obs_key: gene
     fit_obs_values: [NT]
-    # ODE residual uses no protein, so knockout RNA can still train φ.
-    kot_kinetics_on_held_out: true
+    # Alignment uses NT protein only. The ODE residual must too: putting knockout RNA
+    # into L_dyn trains φ on the intervention Task A claims to hold out. The koDyn
+    # ablation turns this back on so the two regimes can be compared.
+    kot_kinetics_on_held_out: false
     # totalVI cannot honour NT-only protein; stamped in-distribution as a leakage ceiling.
     allow_paired_oracle: true
     save_prediction_cells: all
     preprocessing_cache_version: papalexi_gene_alias_v1
+    # Supervised translators predict ADT directly and are scored on rna_size deltas, so
+    # they train in those units. CLR is compositional over only 4 proteins and no
+    # per-protein rescale can undo it: it cost ridge +0.51 -> +0.20. KOT is unaffected --
+    # it keeps kot_protein_layer and is calibrated onto these units when scored.
+    protein_target_normalization: rna_size
     kot_use_feature_space: true
     kot_rna_layer: Ms
     velocity_layer: velocity
@@ -458,9 +507,21 @@ datasets:
     kot_kinetics_require_velocity_gene: false
     kot_kinetics_normalize: true
     kot_alpha_max: 3.0
-    kot_velocity_gauge_normalize: false
+    # Same as BMMC: scVelo |v| is not a clock. false left RegVelo 12× slower in the JVP.
+    kot_velocity_gauge_normalize: true
     sinkhorn_max_points: 8192            # ~20k cells: minibatch the align Sinkhorn
     seeds: [42, 123, 2026, 6, 9, 11, 17, 21, 33, 77, 88, 101]
+
+  # Item 23: the same CRISPR protocol on the NT-only preprocessing cache. Everything
+  # else is inherited, so the ONLY difference from papalexi_retained is which statistics
+  # the knockout cells were allowed to influence. No anchors (use_anchor is already false
+  # here), and the NT pairing is hidden by construction: KOT's Sinkhorn matches
+  # distributions, so it never reads which control RNA goes with which control protein.
+  papalexi_nt_only:
+    <<: *papalexi_retained
+    preprocessing_cache_version: papalexi_nt_only_v2
+    kot_velocity_compare_h5ad: null
+    kot_velocity_compare_label: null
 
   # Same CRISPR protocol, RegVelo velocity. Do not report: steady-state velocity collapses φ.
   papalexi_regvelo:

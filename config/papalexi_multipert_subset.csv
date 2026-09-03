@@ -1,0 +1,36 @@
+# Papalexi/THP-1 perturbations used by MultiPert, so its numbers and this project's can
+# be read on one common set of knockouts.
+#
+# MultiPert: Zhao et al., PLOS Comput Biol 21, e1014054 (2025).
+#   https://doi.org/10.1371/journal.pcbi.1014054   code: github.com/MengyuanZhaoo/MultiPert
+#
+# IT IS A DIFFERENT PAPALEXI EXPERIMENT. MultiPert's repo ships
+# `PapalexiSatija2021_eccite_arrayed_{RNA,protein}.h5ad` (scPerturb, Zenodo 7041849):
+# the ARRAYED experiment, 8,984 cells / 16,826 genes / 4 proteins / 10 knockouts, 9 after
+# its ">=10 cells" filter. This project uses the POOLED ECCITE-seq screen (GSE153056),
+# 20,729 cells / 25 knockouts. So this file is a set of shared GENE TARGETS across two
+# different experiments, not a subset of the same cells. Cell counts, depth and guide
+# composition all differ, and no re-scoring can remove that.
+#
+# SUPERVISION IS NOT THE SAME EITHER. `code/data_loader.py:split_dataset` shuffles the
+# CELLS of each perturbation into 0.6/0.2/0.2 train/val/test, so MultiPert trains on cells
+# of every knockout it is later scored on; nothing is held out at the perturbation level.
+# It also cannot be run under this project's NT-only restriction at all, because it maps
+# (control cell, GEARS perturbation embedding) -> perturbed profile and so needs perturbed
+# cells to train on. This project's runs never see a knockout cell's protein.
+# Sharing gene targets makes the SCORED PAIRS line up; it does not make the training
+# conditions comparable. Report the regime beside every number.
+#
+# status: confirmed  = named in the MultiPert paper AND present in this dataset
+#         unresolved = named in the paper but absent here; excluded until checked against
+#                      the MultiPert release, and the exclusion is printed, never silent
+knockout,status,note
+MARCH8,confirmed,
+ATF2,confirmed,
+STAT2,confirmed,
+CAV1,confirmed,
+ETV7,confirmed,
+IRF1,confirmed,
+IRF7,confirmed,
+IFNGR1,confirmed,
+CD274,unresolved,"no CD274 knockout arm in the POOLED screen this project uses; CD274 is a measured ADT (PDL1) here. The arrayed experiment MultiPert ships may well have one -- that is the arrayed/pooled difference, not a naming problem. Confirm against MultiPert's own perturbation list before scoring it."

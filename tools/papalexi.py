@@ -20,13 +20,20 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.evaluation.perturbation import (
     bootstrap_spearman_gap,
     build_scoring_set,
+    build_sufficiency_scoring_set,
     calibrate_direct,
     column_order_warning,
     group_deltas,
     predict_protein,
     score,
+    sufficient_knockouts,
 )
-from src.evaluation.protocol import read_protocol
+from src.data.transforms import rna_size_adt
+from src.evaluation.protocol import (
+    SUPERVISION_DESCRIPTION,
+    read_protocol,
+    supervision_regime,
+)
 
 
 # ============================================================================
@@ -44,7 +51,11 @@ ADT_GENE_MAP = {
 CONTROL_LABEL = "NT"
 
 
-MIN_CELLS = 40
+# Design-sufficiency thresholds, fixed before any model is scored. A knockout must be
+# sampled this well for its effect estimate to mean anything, whatever that effect is.
+MIN_CELLS = 20
+MIN_REPLICATES = 2
+REPLICATE_COLUMN = "replicate"
 
 
 def to_dense(x) -> np.ndarray:
@@ -113,8 +124,7 @@ def normalize_adt(counts: np.ndarray, rna_totals: np.ndarray) -> dict[str, np.nd
     """
     raw_log1p = np.log1p(counts)
 
-    size = np.maximum(rna_totals, 1.0)
-    rna_size = np.log1p(counts / size[:, None] * float(np.median(size)))
+    rna_size = rna_size_adt(counts, rna_totals)
 
     logged = np.log1p(counts)
     clr = logged - logged.mean(axis=1, keepdims=True)
@@ -141,7 +151,8 @@ def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
     return q
 
 
-def effect_table(values: np.ndarray, adt_names: list[str], groups: pd.Series) -> pd.DataFrame:
+def effect_table(values: np.ndarray, adt_names: list[str], groups: pd.Series,
+                 min_cells: int = MIN_CELLS) -> pd.DataFrame:
     """Per (knockout, protein) effect versus the non-targeting control."""
     is_control = (groups == CONTROL_LABEL).to_numpy()
     control = values[is_control]
@@ -150,7 +161,7 @@ def effect_table(values: np.ndarray, adt_names: list[str], groups: pd.Series) ->
     rows = []
     for target in targets:
         mask = (groups == target).to_numpy()
-        if mask.sum() < MIN_CELLS:
+        if mask.sum() < min_cells:
             continue
         ko = values[mask]
         for j, adt in enumerate(adt_names):
@@ -171,7 +182,8 @@ def effect_table(values: np.ndarray, adt_names: list[str], groups: pd.Series) ->
     return df
 
 
-def rna_effect_table(expr: pd.DataFrame, groups: pd.Series) -> pd.DataFrame:
+def rna_effect_table(expr: pd.DataFrame, groups: pd.Series,
+                    min_cells: int = MIN_CELLS) -> pd.DataFrame:
     """Same contrast on the ADT-target genes' mRNA, for the discordance analysis."""
     gene_to_adt = {gene: adt for adt, gene in ADT_GENE_MAP.items()}
     is_control = (groups == CONTROL_LABEL).to_numpy()
@@ -180,7 +192,7 @@ def rna_effect_table(expr: pd.DataFrame, groups: pd.Series) -> pd.DataFrame:
     rows = []
     for target in targets:
         mask = (groups == target).to_numpy()
-        if mask.sum() < MIN_CELLS:
+        if mask.sum() < min_cells:
             continue
         for gene in expr.columns:
             a = expr[gene].to_numpy()[mask]
@@ -374,13 +386,14 @@ def degenerate_result(run: dict) -> dict:
 
 
 def shuffled_null(predicted_values: np.ndarray, adt_names: list[str], groups: pd.Series,
-                  scoring: pd.DataFrame, n_perm: int, seed: int) -> tuple[float, float]:
+                  scoring: pd.DataFrame, n_perm: int, seed: int,
+                  min_cells: int) -> tuple[float, float]:
     """Chance level for this scoring set: keep the values, break the cell/knockout link."""
     rng = np.random.default_rng(seed)
     null_scores = []
     for _ in range(n_perm):
         shuffled = predicted_values[rng.permutation(len(predicted_values))]
-        null_pred = group_deltas(shuffled, adt_names, groups, CONTROL_LABEL, MIN_CELLS)
+        null_pred = group_deltas(shuffled, adt_names, groups, CONTROL_LABEL, min_cells)
         merged = scoring.merge(null_pred.rename(columns={"delta": "pred_delta"}),
                                on=["knockout", "adt"], how="left")
         null_scores.append(score(merged["pred_delta"].to_numpy(),
@@ -389,16 +402,17 @@ def shuffled_null(predicted_values: np.ndarray, adt_names: list[str], groups: pd
 
 
 def scored_deltas(values: np.ndarray, adt_names: list[str], groups: pd.Series,
-                  scoring: pd.DataFrame) -> pd.DataFrame:
+                  scoring: pd.DataFrame, min_cells: int) -> pd.DataFrame:
     """Scoring-set pairs with this predictor's delta attached."""
-    predicted = group_deltas(values, adt_names, groups, CONTROL_LABEL, MIN_CELLS)
+    predicted = group_deltas(values, adt_names, groups, CONTROL_LABEL, min_cells)
     return scoring.merge(predicted.rename(columns={"delta": "pred_delta"}),
                          on=["knockout", "adt"], how="left")
 
 
 def evaluate_run(run: dict, observed_adt: pd.DataFrame, groups_all: pd.Series,
                  adt_names: list[str], scoring: pd.DataFrame, k: int,
-                 device, n_perm: int, seed: int) -> tuple[dict, pd.DataFrame]:
+                 device, n_perm: int, seed: int,
+                 min_cells: int) -> tuple[dict, pd.DataFrame]:
     adata = ad.read_h5ad(run["path"])
     cells = pd.Index(adata.obs_names.astype(str))
     protein_key = next((key for key in adata.obsm if key.startswith("X_aligned_")
@@ -432,16 +446,16 @@ def evaluate_run(run: dict, observed_adt: pd.DataFrame, groups_all: pd.Series,
     # The direct prediction lives in the units KOT trained on, the target in the units
     # this script fixed. Calibrating per protein on NT cells is what makes the pooled
     # Spearman a statement about the map and not about the two normalisations.
-    raw_merged = scored_deltas(predicted_values, adt_names, groups, scoring)
+    raw_merged = scored_deltas(predicted_values, adt_names, groups, scoring, min_cells)
     if use_direct:
         predicted_values, scale = calibrate_direct(predicted_values, values, control_mask)
         predictor = "direct_calibrated"
         print(f"    calibration scale per ADT: "
               f"{dict(zip(adt_names, np.round(scale, 3).tolist()))}")
-    merged = scored_deltas(predicted_values, adt_names, groups, scoring)
+    merged = scored_deltas(predicted_values, adt_names, groups, scoring, min_cells)
 
     null_mean, null_sd = shuffled_null(predicted_values, adt_names, groups, scoring,
-                                       n_perm, seed)
+                                       n_perm, seed, min_cells)
     print(f"    predictor={predictor}")
     result = {
         **{key: run[key] for key in RESULT_KEYS},
@@ -461,6 +475,9 @@ def evaluate_run(run: dict, observed_adt: pd.DataFrame, groups_all: pd.Series,
     merged["seed"] = run["seed"]
     merged["predictor"] = predictor
     merged["ranked"] = is_ranked(run)
+    merged["uses_fit_pairing"] = run["protocol"]["uses_fit_pairing"]
+    merged["supervision"] = supervision_regime(run["protocol"])
+    merged["exclusion_reason"] = "" if is_ranked(run) else exclusion_reason(run)
     return result, merged
 
 
@@ -472,6 +489,8 @@ def protocol_columns(run: dict) -> dict:
         "oos_mode": protocol["oos_mode"],
         "out_of_distribution": protocol["out_of_distribution"],
         "paired_oracle": protocol["paired_oracle"],
+        "uses_fit_pairing": protocol["uses_fit_pairing"],
+        "supervision": supervision_regime(protocol),
         "n_fit_cells": protocol["n_fit_cells"],
         "exclusion_reason": "" if is_ranked(run) else exclusion_reason(run),
     }
@@ -480,7 +499,8 @@ def protocol_columns(run: dict) -> dict:
 def summarize(table: pd.DataFrame) -> pd.DataFrame:
     scored = table[~table["degenerate"]]
     return (scored
-            .groupby(["model", "dataset", "ranked", "exclusion_reason"], dropna=False)
+            .groupby(["model", "dataset", "ranked", "uses_fit_pairing", "supervision",
+                      "exclusion_reason"], dropna=False)
             .agg(spearman_mean=("spearman", "mean"), spearman_sd=("spearman", "std"),
                  sign_acc_mean=("sign_acc", "mean"), sign_acc_sd=("sign_acc", "std"),
                  gap_mean=("gap_vs_mrna_mean", "mean"), n_seeds=("spearman", "count"))
@@ -488,16 +508,132 @@ def summarize(table: pd.DataFrame) -> pd.DataFrame:
             .reset_index())
 
 
+SUBSET_GROUP_KEYS = ["model", "dataset", "ranked", "uses_fit_pairing", "supervision",
+                    "exclusion_reason"]
+
+
+def load_perturbation_subset(path: Path) -> tuple[list[str], list[str]]:
+    """Knockouts a competitor's published evaluation used, declared in a frozen CSV.
+
+    Rows marked `unresolved` are named in that paper but could not be matched to a
+    knockout arm here. They are returned separately and printed, never quietly dropped:
+    scoring 8 of 9 pairs while calling the set "the common subset" is the failure this
+    file exists to prevent.
+    """
+    table = pd.read_csv(path, comment="#")
+    confirmed = table.loc[table["status"] == "confirmed", "knockout"].astype(str).tolist()
+    unresolved = table.loc[table["status"] == "unresolved", "knockout"].astype(str).tolist()
+    return confirmed, unresolved
+
+
+def check_subset_present(confirmed: list[str], scoring: pd.DataFrame, label: str) -> None:
+    missing = sorted(set(confirmed) - set(scoring["knockout"].astype(str)))
+    if missing:
+        raise SystemExit(
+            f"the '{label}' subset declares knockouts {missing}, which are not in this "
+            f"run's scoring set. A subset evaluation that silently scores fewer "
+            "perturbations than it claims is not a common set. Either the declaration "
+            "or the scoring-set thresholds (--q-max/--d-min) need to change."
+        )
+
+
+def score_runs_from_pairs(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Re-score each run from the per-pair table, so a subset needs no model re-run.
+
+    The predictions are exactly the ones the full evaluation scored; only which pairs
+    enter the correlation changes. That is what makes the two tables comparable.
+    """
+    rows = []
+    for keys, group in pairs.groupby(SUBSET_GROUP_KEYS + ["seed"], dropna=False):
+        rows.append({
+            **dict(zip(SUBSET_GROUP_KEYS + ["seed"], keys)),
+            **score(group["pred_delta"].to_numpy(), group["obs_delta"].to_numpy()),
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize_subset(scored: pd.DataFrame) -> pd.DataFrame:
+    return (scored
+            .groupby(SUBSET_GROUP_KEYS, dropna=False)
+            .agg(spearman_mean=("spearman", "mean"), spearman_sd=("spearman", "std"),
+                 sign_acc_mean=("sign_acc", "mean"), sign_acc_sd=("sign_acc", "std"),
+                 n_seeds=("spearman", "count"))
+            .sort_values("spearman_mean", ascending=False)
+            .reset_index())
+
+
+EXTERNAL_COLUMNS = ["model", "knockout", "adt", "pred_delta"]
+
+
+def load_external_predictions(path: Path, dataset: str, supervision: str,
+                              scoring: pd.DataFrame) -> tuple[list[dict], pd.DataFrame]:
+    """Score a competitor that cannot be run through this repo's model interface.
+
+    MultiPert predicts (control cell, perturbation embedding) -> perturbed profile, so it
+    produces group-level deltas rather than a per-cell embedding, and it cannot honour the
+    NT-only restriction at all. It is scored here from its own delta table and reported as
+    a NOT-RANKED reference carrying its declared supervision regime, the same way totalVI
+    is. Ranking it beside KOT would compare a model that trained on every knockout against
+    one that saw none.
+    """
+    table = pd.read_csv(path)
+    missing = [column for column in EXTERNAL_COLUMNS if column not in table.columns]
+    if missing:
+        raise SystemExit(f"{path} is missing column(s) {missing}; expected {EXTERNAL_COLUMNS}")
+
+    results, frames = [], []
+    for model, group in table.groupby("model"):
+        merged = scoring.merge(group[["knockout", "adt", "pred_delta"]],
+                               on=["knockout", "adt"], how="left")
+        scored = score(merged["pred_delta"].to_numpy(), merged["obs_delta"].to_numpy())
+        covered = int(merged["pred_delta"].notna().sum())
+        print(f"[external] {model}: {covered}/{len(merged)} scoring pairs predicted, "
+              f"spearman={scored['spearman']:+.3f}  [{supervision}]")
+        results.append({
+            "model": str(model), "dataset": dataset, "seed": None, **scored,
+            "degenerate": False, "predictor": "external_delta",
+            "spearman_uncalibrated": np.nan,
+            "gap_vs_mrna_mean": np.nan, "gap_vs_mrna_lo": np.nan, "gap_vs_mrna_hi": np.nan,
+            "ranked": False, "oos_mode": "external",
+            "out_of_distribution": False, "paired_oracle": False,
+            "uses_fit_pairing": True, "supervision": supervision, "n_fit_cells": -1,
+            "exclusion_reason": f"{supervision}: trained on cells of every knockout it is "
+                                "scored on, so it is a reference, not a competitor",
+        })
+        merged = merged.assign(model=str(model), dataset=dataset, seed=None,
+                               predictor="external_delta", ranked=False,
+                               uses_fit_pairing=True, supervision=supervision,
+                               exclusion_reason=results[-1]["exclusion_reason"])
+        frames.append(merged)
+    return results, pd.concat(frames, ignore_index=True)
+
+
+def pairs_per_run(pairs: pd.DataFrame) -> int:
+    """How many scoring pairs one run contributes, for the two tables' headings."""
+    return int(pairs.groupby(["model", "dataset", "seed"], dropna=False).size().max())
+
+
+def print_supervision_legend(regimes: list[str]) -> None:
+    print("\nSUPERVISION REGIMES PRESENT (what each method was shown):")
+    for regime in regimes:
+        print(f"  {regime:<20} {SUPERVISION_DESCRIPTION[regime]}")
+
+
 def provenance_record(args, runs: list[dict]) -> dict:
     return {
         "predictions_dir": str(args.predictions),
         "normalization": args.normalization,
+        "scoring_set": args.scoring_set,
+        "min_ko_cells": args.min_ko_cells,
+        "min_replicates": args.min_replicates,
         "q_max": args.q_max,
         "d_min": args.d_min,
         "k": args.k,
         "files": sorted(run["path"].name for run in runs),
         "models": sorted({run["model"] for run in runs}),
         "ranked_models": sorted({run["model"] for run in runs if is_ranked(run)}),
+        "paired_fit_models": sorted({run["model"] for run in runs
+                                     if run["protocol"]["uses_fit_pairing"]}),
     }
 
 
@@ -512,7 +648,8 @@ def check_provenance(out_dir: Path, record: dict, force: bool) -> None:
     if force or not path.exists():
         return
     previous = json.loads(path.read_text())
-    changed = [key for key in ("predictions_dir", "normalization", "models")
+    changed = [key for key in ("predictions_dir", "normalization", "models",
+                               "scoring_set", "min_ko_cells", "min_replicates")
                if previous.get(key) != record[key]]
     if not changed:
         return
@@ -524,8 +661,22 @@ def check_provenance(out_dir: Path, record: dict, force: bool) -> None:
     )
 
 
+def print_method_rows(rows: pd.DataFrame) -> None:
+    for row in rows.itertuples():
+        sd = "" if np.isnan(row.spearman_sd) else f" +/- {row.spearman_sd:.3f}"
+        print(f"  {row.model + ' / ' + row.dataset:<32} {row.spearman_mean:+.3f}{sd}   "
+              f"sign_acc={row.sign_acc_mean:.3f}   n={row.n_seeds}")
+
+
 def print_ranking(title: str, rows: pd.DataFrame, mrna_score: dict,
                   label_null: list[float], n_pairs: int) -> None:
+    """Two blocks, because a supervised translator and KOT are not given the same data.
+
+    Both honour the same fit restriction -- neither reads a knockout's ADT -- but a
+    method fitted on the NT controls' (RNA, protein) PAIRING is answering an easier
+    question than one that only ever saw the two modalities as unpaired distributions.
+    Printing them in one sorted list invites reading the gap as a method result.
+    """
     print("\n" + "=" * 78)
     print(title)
     print("=" * 78)
@@ -534,10 +685,14 @@ def print_ranking(title: str, rows: pd.DataFrame, mrna_score: dict,
     print(f"  {'shuffled pairing (chance)':<32} {np.nanmean(label_null):+.3f} "
           f"+/- {np.nanstd(label_null):.3f}  ({n_pairs} pairs)")
     print("-" * 78)
-    for row in rows.itertuples():
-        sd = "" if np.isnan(row.spearman_sd) else f" +/- {row.spearman_sd:.3f}"
-        print(f"  {row.model + ' / ' + row.dataset:<32} {row.spearman_mean:+.3f}{sd}   "
-              f"sign_acc={row.sign_acc_mean:.3f}   n={row.n_seeds}")
+    unpaired = rows[~rows["uses_fit_pairing"]]
+    supervised = rows[rows["uses_fit_pairing"]]
+    print("  NO fit-time pairing (the setting KOT is designed for)")
+    print_method_rows(unpaired)
+    if not supervised.empty:
+        print("\n  PAIRED NT supervision — trained on which control RNA goes with which")
+        print("  control protein. KOT is not given that pairing.")
+        print_method_rows(supervised)
 
 
 def print_discriminating_pairs(pairs: pd.DataFrame) -> None:
@@ -556,6 +711,54 @@ def print_discriminating_pairs(pairs: pd.DataFrame) -> None:
             tag = "" if grp["ranked"].all() else "  [not ranked]"
             print(f"    {model + ' / ' + dataset:<34} predicted {mean:+.4f}  "
                   f"{'sign ok' if agrees else 'SIGN WRONG'}{tag}")
+
+
+def report_subset(pairs: pd.DataFrame, mrna_null: pd.DataFrame, args) -> None:
+    """The same predictions, scored over one competitor's perturbation set.
+
+    A published competitor evaluates on its own subset of knockouts, so its number and
+    this project's are not on the same pairs until the pairs are made the same. What
+    this does NOT make the same is the training condition: the supervision column stays
+    on every row, and the regimes are reprinted here, because a shared scoring set is
+    routinely misread as a shared protocol.
+    """
+    confirmed, unresolved = load_perturbation_subset(args.perturbation_subset)
+    label = args.subset_label
+    print("\n" + "=" * 78)
+    print(f"COMMON-SUBSET EVALUATION — {label} ({args.perturbation_subset})")
+    print("=" * 78)
+    print(f"  knockouts scored: {sorted(confirmed)}")
+    if unresolved:
+        print(f"  DECLARED BUT NOT SCORED: {sorted(unresolved)} — marked unresolved in "
+              "the subset CSV; see its notes before quoting this table")
+
+    check_subset_present(confirmed, pairs, label)
+    subset_pairs = pairs[pairs["knockout"].astype(str).isin(confirmed)].copy()
+    subset_mrna = mrna_null[mrna_null["knockout"].astype(str).isin(confirmed)]
+    obs = subset_mrna["obs_delta"].to_numpy()
+    mrna_score = score(subset_mrna["pred_delta"].to_numpy(), obs)
+    n_pairs = pairs_per_run(subset_pairs)
+    print(f"  {len(confirmed)} knockouts → {n_pairs} (knockout, protein) pairs per run "
+          f"(the full evaluation scored {pairs_per_run(pairs)})")
+
+    scored = score_runs_from_pairs(subset_pairs)
+    summary = summarize_subset(scored)
+    scored.to_csv(args.out_dir / f"perturbation_benchmark_runs_{label}.csv", index=False)
+    summary.to_csv(args.out_dir / f"perturbation_benchmark_summary_{label}.csv", index=False)
+    subset_pairs.to_csv(args.out_dir / f"perturbation_benchmark_per_pair_{label}.csv",
+                        index=False)
+
+    print("-" * 78)
+    print(f"  {'mRNA passthrough (null)':<32} {mrna_score['spearman']:+.3f}   "
+          f"sign_acc={mrna_score['sign_acc']:.3f}")
+    print("-" * 78)
+    for regime in sorted(set(summary["supervision"])):
+        rows = summary[summary["supervision"] == regime]
+        print(f"\n  [{regime}] {SUPERVISION_DESCRIPTION[regime]}")
+        print_method_rows(rows)
+    print("\n  A competitor scored on these same knockouts was NOT necessarily trained "
+          "under\n  any regime above. Read its own paper's split before placing it in "
+          "this table.")
 
 
 def benchmark_main() -> None:
@@ -577,8 +780,37 @@ def benchmark_main() -> None:
         help="Fallback only, for prediction files written before the protocol stamp "
              "existed: models whose aligned RNA embedding is in ADT coordinates. Stamped "
              "files carry their own predictor and ignore this.")
-    parser.add_argument("--q-max", type=float, default=0.05)
-    parser.add_argument("--d-min", type=float, default=0.1)
+    parser.add_argument(
+        "--perturbation-subset", type=Path, default=None,
+        help="CSV of knockouts a competitor's published evaluation used (see "
+             "config/papalexi_multipert_subset.csv). Adds a SECOND ranking over exactly "
+             "those perturbations, re-scored from the same predictions, so the two "
+             "tables differ only in which pairs are scored.")
+    parser.add_argument(
+        "--external-predictions", type=Path, default=None,
+        help="CSV of model,knockout,adt,pred_delta from a competitor that cannot run "
+             "through this repo's model interface (see tools/multipert.py deltas). "
+             "Scored as a NOT-RANKED reference under --external-supervision.")
+    parser.add_argument("--external-supervision", default="paired_all_cells",
+                        choices=sorted(SUPERVISION_DESCRIPTION),
+                        help="the regime the external competitor was trained under")
+    parser.add_argument("--external-dataset", default="papalexi_retained",
+                        help="dataset label to file the external rows under")
+    parser.add_argument("--subset-label", default="multipert_common",
+                        help="name for the subset tables and the printed heading")
+    parser.add_argument(
+        "--scoring-set", default="sufficiency", choices=["sufficiency", "significance"],
+        help="sufficiency (default): every non-self pair whose knockout clears "
+             "--min-ko-cells in --min-replicates, chosen from the design alone. "
+             "significance: the older q/|d|-filtered set, which defines the benchmark by "
+             "its own answers and drops the small-effect pairs; keep it as a SECONDARY "
+             "analysis, not the primary one.")
+    parser.add_argument("--min-ko-cells", type=int, default=MIN_CELLS)
+    parser.add_argument("--min-replicates", type=int, default=MIN_REPLICATES)
+    parser.add_argument("--q-max", type=float, default=0.05,
+                        help="significance scoring set only")
+    parser.add_argument("--d-min", type=float, default=0.1,
+                        help="significance scoring set only")
     parser.add_argument("--n-perm", type=int, default=10)
     parser.add_argument("--n-boot", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
@@ -603,10 +835,21 @@ def benchmark_main() -> None:
                              np.asarray(meta["nCount_RNA"], dtype=np.float64))
     observed_adt = pd.DataFrame(variants[args.normalization], index=cells, columns=adt_names)
 
-    observed_effects = effect_table(observed_adt.to_numpy(), adt_names, groups)
-    scoring = build_scoring_set(observed_effects, ADT_GENE_MAP, args.q_max, args.d_min)
+    observed_effects = effect_table(observed_adt.to_numpy(), adt_names, groups,
+                                    args.min_ko_cells)
+    if args.scoring_set == "sufficiency":
+        replicates = meta[REPLICATE_COLUMN].astype(str)
+        knockouts = sufficient_knockouts(groups, replicates, CONTROL_LABEL,
+                                         args.min_ko_cells, args.min_replicates)
+        print(f"\n[design] {len(knockouts)} knockouts with >={args.min_ko_cells} cells in "
+              f">={args.min_replicates} of {replicates.nunique()} replicates: "
+              f"{sorted(knockouts)}")
+        scoring = build_sufficiency_scoring_set(observed_effects, ADT_GENE_MAP, knockouts)
+    else:
+        scoring = build_scoring_set(observed_effects, ADT_GENE_MAP, args.q_max, args.d_min)
 
-    rna_effects = rna_effect_table(expr, groups).rename(columns={"rna_delta": "pred_delta"})
+    rna_effects = rna_effect_table(expr, groups, args.min_ko_cells).rename(
+        columns={"rna_delta": "pred_delta"})
     mrna_null = scoring.merge(rna_effects, on=["knockout", "adt"], how="left")
     obs = mrna_null["obs_delta"].to_numpy()
     mrna_pred = mrna_null["pred_delta"].to_numpy()
@@ -639,7 +882,8 @@ def benchmark_main() -> None:
         tag = f"{run['model']}/{run['dataset']}" + (f"/seed_{run['seed']}" if run["seed"] else "")
         print(f"\n[run] {tag}  [{run['protocol']['oos_mode']}]")
         result, merged = evaluate_run(run, observed_adt, groups, adt_names, scoring,
-                                      args.k, device, args.n_perm, args.seed)
+                                      args.k, device, args.n_perm, args.seed,
+                                      args.min_ko_cells)
         result.update(protocol_columns(run))
         if not result["degenerate"]:
             gap, lo, hi = bootstrap_spearman_gap(
@@ -651,6 +895,13 @@ def benchmark_main() -> None:
             print(f"    gap vs mRNA passthrough: {gap:+.3f}  95% CI [{lo:+.3f}, {hi:+.3f}]")
             per_pair.append(merged)
         results.append(result)
+
+    if args.external_predictions is not None:
+        external_results, external_pairs = load_external_predictions(
+            args.external_predictions, args.external_dataset, args.external_supervision,
+            scoring)
+        results.extend(external_results)
+        per_pair.append(external_pairs)
 
     table = pd.DataFrame(results)
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -671,10 +922,14 @@ def benchmark_main() -> None:
                   f"sign_acc={row.sign_acc_mean:.3f}   n={row.n_seeds}")
             print(f"  {'':<32} {row.exclusion_reason}")
 
+    print_supervision_legend(sorted(set(summary["supervision"]) - {""}))
+
     if per_pair:
         pairs = pd.concat(per_pair, ignore_index=True)
         pairs.to_csv(args.out_dir / "perturbation_benchmark_per_pair.csv", index=False)
         print_discriminating_pairs(pairs)
+        if args.perturbation_subset is not None:
+            report_subset(pairs, mrna_null, args)
 
     (args.out_dir / PROVENANCE_NAME).write_text(json.dumps(record, indent=2))
     print(f"\n[out] wrote tables and {PROVENANCE_NAME} to {args.out_dir}")

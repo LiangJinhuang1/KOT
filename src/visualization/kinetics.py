@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, MaxNLocator, NullFormatter
@@ -18,7 +19,7 @@ from scipy.stats import spearmanr
 from src.visualization import METHOD_COLORS, dataset_label
 from src.visualization.runs import curated_runs, read_diagnostics
 from src.visualization.style import (
-    apply_style, figsize, ink, panel_letter, save_figure,
+    STYLE_STATE, apply_style, figsize, ink, panel_letter, save_figure,
 )
 
 
@@ -134,7 +135,7 @@ def recovery_panel(ax, sub: pd.DataFrame, *, title: str, ylim: tuple[float, floa
     ax.xaxis.set_minor_locator(LogLocator(base=10, subs=(), numticks=1))
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
-    ax.set_xlabel("Literature degradation rate")
+    ax.set_xlabel("Literature rate")
     if show_ylabel:
         ax.set_ylabel("Fitted $\\beta$")
     ax.set_title(title)
@@ -149,8 +150,8 @@ def plot_beta_recovery(df: pd.DataFrame, save_path: str | Path,
                                       ("pbmc_retained", "pbmc_regvelo"))):
     """Three panels: recovery on two datasets, then the velocity-backend comparison."""
     apply_style()
-    fig, axes = plt.subplots(1, 3, figsize=figsize("full", 2.1), layout="constrained")
-    fig.get_layout_engine().set(w_pad=0.10, wspace=0.09)
+    fig, axes = plt.subplots(1, 4, figsize=figsize("full", 2.1), layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.08, wspace=0.07)
 
     ylim = beta_limits(df, datasets)
     notes = []
@@ -200,5 +201,55 @@ def plot_beta_recovery(df: pd.DataFrame, save_path: str | Path,
     ax.set_title("Velocity backend")
     panel_letter(ax, "c")
 
+    # d: the seed spread panels a-b cannot show. BMMC carries the larger marker panel,
+    # so it is the one worth resolving marker by marker.
+    ax = axes[3]
+    table = beta_spread_panel(ax, df, datasets[0])
+    ax.set_ylabel(r"$\beta$")
+    ax.set_title(f"{dataset_label(datasets[0])}, per marker")
+    ax.legend(loc="lower right", frameon=False)
+    panel_letter(ax, "d")
+    notes.append(f"{dataset_label(datasets[0])}: {len(table)} markers with "
+                 f"{int(table['seeds'].median())} seeds each")
+
     save_figure(fig, Path(save_path).with_suffix(""))
     return notes
+
+
+def beta_spread_panel(ax, df: pd.DataFrame, dataset: str, *, n_label: int = 0):
+    """Every marker's fitted beta and its across-seed range, against the target.
+
+    The recovery scatter in panels a-b shows one point per marker and so cannot say
+    whether a marker sits where it does reliably or only on average. Here each marker
+    keeps its seed range, sorted by the literature target, and the target itself is
+    drawn as a separate series -- the vertical gap between the two is the error the
+    rank correlation summarises into a single number.
+
+    No marker names by default. The claim is the COMPRESSION between the two series --
+    literature beta spans two orders of magnitude where fitted beta spans a factor of
+    two -- and panels a-b already name the markers worth naming.
+    """
+    grouped = df[df["dataset"] == dataset].groupby("marker")
+    table = grouped.agg(target=("target", "median"), fitted=("fitted", "median"),
+                        lo=("fitted", "min"), hi=("fitted", "max"),
+                        seeds=("fitted", "size"))
+    table = table.sort_values("target").reset_index()
+    x = np.arange(len(table))
+
+    ax.vlines(x, table["lo"], table["hi"], color=METHOD_COLORS["kot"], lw=0.7,
+              alpha=0.55, zorder=2)
+    ax.scatter(x, table["fitted"], s=4, color=METHOD_COLORS["kot"], linewidths=0,
+               zorder=3, label="fitted")
+    ax.scatter(x, table["target"], s=4, marker="_", color="#767676", linewidths=0.9,
+               zorder=3, label="literature")
+    # The ends of the range only: naming 52 markers needs a tick per marker, and the
+    # panel's claim is the compression between the two series, not any one marker.
+    ends = [(0, (2, -8), "left"), (len(table) - 1, (-2, 6), "right")][:n_label]
+    for i, offset, ha in ends:
+        ax.annotate(clean_marker(table["marker"][i]), (x[i], table["target"][i]),
+                    textcoords="offset points", xytext=offset, ha=ha,
+                    fontsize=STYLE_STATE["ladder"][2], color="0.35")
+    ax.set_xlim(-1, len(table))
+    ax.set_xlabel("Marker, by literature rate")
+    ax.set_yscale("log")
+    return table

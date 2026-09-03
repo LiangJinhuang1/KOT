@@ -83,6 +83,20 @@ def add_log_velocity_layers(adata, target_sum=1e4, velocity_scale=1.0):
         }
 
 
+def rna_size_adt(counts, rna_totals):
+    """ADT normalised by a size factor taken from OUTSIDE the panel: total RNA counts.
+
+    CLR divides each cell by its own 4-protein total, so a real drop in one protein
+    inflates the other three; on a 4-plex panel that compositional artefact is large. The
+    CRISPR benchmark therefore scores rna_size deltas, and anything trained to predict ADT
+    must be trained in these same units -- a per-protein affine rescale cannot undo CLR,
+    which is a per-cell row operation.
+    """
+    counts = np.asarray(counts, dtype=np.float64)
+    size = np.maximum(np.asarray(rna_totals, dtype=np.float64), 1.0)
+    return np.log1p(counts / size[:, None] * float(np.median(size)))
+
+
 def normalize_protein(adata):
     adata.layers["counts"] = adata.X.copy()
     adata.X = clr_transform(adata.X)

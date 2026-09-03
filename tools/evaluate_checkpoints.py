@@ -25,8 +25,9 @@ from src.data.preprocessing import load_and_preprocess_cached
 from src.data.synthetic_linked_ode import stage_output_paths
 from src.data.projection import projection_matrix_from_adatas
 from src.data.adt_gene_map import load_mapping_records
-from src.data.splits import held_out_mask
+from src.data.splits import selection_validation_mask
 from src.models.KOT import KOTModel
+from src.training.protein_supervised import adt_targets
 from src.training.registry import MODEL_OVERRIDES
 from src.training.kot import (
     FixedAlpha,
@@ -240,7 +241,11 @@ def build_model_and_tensors(
 
     if use_feature_space:
         x = matrix_from_adata(rna_adata, rna_layer, "RNA")
-        y = matrix_from_adata(protein_adata, protein_layer, "protein")
+        # Same contract run_kot trains against, so a re-evaluated checkpoint is scored
+        # in the units its phi actually learned. Reading protein_adata.X here while
+        # run_kot honoured protein_target_normalization would compare an rna_size phi
+        # against CLR observations and report a model that does not exist.
+        y = adt_targets({"rna_adata": rna_adata, "second_adata": protein_adata}, run_cfg)
     else:
         x = np.array(rna_adata.obsm["X_pca"])
         y = np.array(protein_adata.obsm["X_pca"])
@@ -401,11 +406,9 @@ def build_model_and_tensors(
     # on the run's SEED, and with val_stratify_by it is drawn per stratum, so passing
     # the bare val_split_seed here would silently rebuild a different set of cells.
     # diagnostics.json records val_split_digest; that is what this can be checked against.
-    # Through held_out_mask, the SAME function training uses. Rebuilding the rule here
-    # is what let this drift: it reproduced only the random/stratified slice, so a run
-    # with fit_obs_key (Papalexi trains on NT cells alone) had its knockout cells scored
-    # as if they had been fitted, and fit_tuning_subset's inversion was ignored outright.
-    val_mask = held_out_mask(rna_adata.obs, run_cfg, run_cfg.get("seed"))
+    # Only the fit-eligible random validation slice may populate val diagnostics.
+    # Group-held-out rows (Papalexi KO cells) are an OOD test set, not validation data.
+    val_mask = selection_validation_mask(rna_adata.obs, run_cfg, run_cfg.get("seed"))
     val_idx_t = (
         to_index_tensor(np.nonzero(val_mask)[0], device) if val_mask.any() else None
     )

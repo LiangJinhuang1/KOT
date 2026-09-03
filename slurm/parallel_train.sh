@@ -32,7 +32,9 @@
 # card. Slurm hands out the low indices first, so asking for 3 lands on the healthy
 # ones. Raise this back to 4+ once nvidia-fabricmanager has been restarted on the node.
 #SBATCH --gres=gpu:b200:3
-#SBATCH --cpus-per-gpu=32
+# 16, not 32: jobs-gpu-qos caps one user at 168 CPUs, and 32/GPU made two 3-GPU
+# jobs (96+96) hit QOSMaxCpuPerUserLimit. 16 matches the partition DefCpuPerGPU.
+#SBATCH --cpus-per-gpu=16
 #SBATCH --mem=512GB
 #SBATCH --time=07:00:00
 #SBATCH --job-name=kot_parallel
@@ -132,6 +134,11 @@ fi
 
 idx=0
 running=0
+worker_fail=0
+wait_one() {
+  wait -n || worker_fail=1
+  running=$((running-1))
+}
 while IFS= read -r job || [ -n "${job}" ]; do
   # A job line is a runner argument string and therefore starts with `--`. Matching on
   # that instead of skipping `#` lines is what catches a WRAPPED comment: only its first
@@ -161,8 +168,7 @@ while IFS= read -r job || [ -n "${job}" ]; do
 
   while true; do
     [ "${running}" -lt "${MAX_PARALLEL}" ] || {
-      wait -n
-      running=$((running-1))
+      wait_one
       continue
     }
 
@@ -171,8 +177,7 @@ while IFS= read -r job || [ -n "${job}" ]; do
       [ -n "${free_mb}" ] || free_mb=0
       if [ "${free_mb}" -lt "${MIN_FREE_GPU_MB}" ]; then
         if [ "${running}" -gt 0 ]; then
-          wait -n
-          running=$((running-1))
+          wait_one
         else
           echo "[throttle] gpu${gpu} free ${free_mb} MB < ${MIN_FREE_GPU_MB} MB; sleeping ${GPU_POLL_SEC}s" >&2
           sleep "${GPU_POLL_SEC}"
@@ -193,7 +198,11 @@ while IFS= read -r job || [ -n "${job}" ]; do
   ( CUDA_VISIBLE_DEVICES="${gpu}" ${jax_platforms} python -u -m src.training.runner ${job} ) > "${log}" 2>&1 &
   running=$((running+1))
 done < "${JOBS_FILE}"
-wait
+while [ "${running}" -gt 0 ]; do wait_one; done
+if [ "${worker_fail}" -ne 0 ]; then
+  echo "one or more workers failed; see logs/par_${SLURM_JOB_ID}_*.log" >&2
+  exit 1
+fi
 echo "all ${idx} jobs finished" >&2
 
 if [ "${ENABLE_MPS}" = "1" ]; then echo quit | nvidia-cuda-mps-control || true; fi
