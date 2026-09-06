@@ -204,6 +204,36 @@ def fitted_statistics_report(adata, fit_mask: np.ndarray) -> dict:
     }
 
 
+def normalize_per_cell_on_controls(adata, fit_mask: np.ndarray) -> None:
+    """Normalize each matrix per cell using a target scale fitted on NT cells only."""
+    targets = {}
+    for layer in ("X", "spliced", "unspliced"):
+        matrix = adata.X if layer == "X" else adata.layers.get(layer)
+        if matrix is None:
+            continue
+        counts = np.asarray(matrix.sum(axis=1)).ravel()
+        target = float(np.median(counts[fit_mask]))
+        target = target if target > 0 else 1.0
+        scale = np.divide(counts, target, out=np.ones_like(counts, dtype=float),
+                          where=counts != 0)
+        if sparse.issparse(matrix):
+            scaled = matrix.multiply((1.0 / scale)[:, None]).tocsr()
+        else:
+            scaled = np.asarray(matrix) / scale[:, None]
+        if layer == "X":
+            adata.X = scaled
+        else:
+            adata.layers[layer] = scaled
+        targets[layer] = target
+    adata.obs["n_counts"] = np.asarray(adata.X.sum(axis=1)).ravel()
+    adata.uns["nt_only_normalization"] = {
+        "targets_fitted_on": "NT cells",
+        "target_median_counts": targets,
+    }
+    print(f"[nt-only] per-cell normalization targets fitted on "
+          f"{int(fit_mask.sum())} controls: {targets}")
+
+
 def preprocess_nt_only(adata, fit_mask: np.ndarray, n_top_genes: int, hvg_flavor: str,
                        min_shared_counts: int, n_pcs: int, n_neighbors: int,
                        dynamics_n_jobs: int, retain_genes=None):
@@ -212,9 +242,9 @@ def preprocess_nt_only(adata, fit_mask: np.ndarray, n_top_genes: int, hvg_flavor
     keep = shared_count_mask(adata, fit_mask, min_shared_counts, retain_genes)
     adata = adata[:, keep].copy()
 
-    # Per cell, so no statistic crosses cells; scVelo's own filter step is skipped
-    # because its gene filter was already applied above, on controls.
-    scv.pp.normalize_per_cell(adata)
+    # Per cell, with each target scale fitted on controls only; scVelo's default median
+    # would include knockout cells in the target and leak their library-size distribution.
+    normalize_per_cell_on_controls(adata, fit_mask)
     sc.pp.log1p(adata)
 
     resolved_pcs = fit_pca_on_controls(adata, fit_mask, n_pcs)

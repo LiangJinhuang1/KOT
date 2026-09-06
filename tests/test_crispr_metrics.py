@@ -2,9 +2,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from src.evaluation.crispr_metrics import annotate_effect_sets, confirmed_knockouts
+from src.evaluation.crispr_metrics import (
+    annotate_effect_sets,
+    bootstrap_correlation_difference,
+    score_effect_subsets,
+    confirmed_knockouts,
+    response_cosine,
+)
 
 
 class EffectSetTests(unittest.TestCase):
@@ -73,5 +80,107 @@ class ConfirmedKnockoutTests(unittest.TestCase):
         self.assertEqual(skipped, ["CD274"])
 
 
+class PairedBootstrapTests(unittest.TestCase):
+    def table(self) -> pd.DataFrame:
+        rows = []
+        for perturbation in ("KO1", "KO2", "KO3", "KO4"):
+            for protein, observed in zip(("A", "B", "C"), (1.0, 2.0, 4.0)):
+                rows.append({
+                    "perturbation": perturbation,
+                    "protein": protein,
+                    "observed": observed,
+                    "full": observed,
+                    "ablation": -observed,
+                })
+        return pd.DataFrame(rows)
+
+    def test_same_draw_gives_full_minus_ablation_for_both_correlations(self):
+        for metric in ("spearman", "pearson"):
+            mean, lower, upper = bootstrap_correlation_difference(
+                self.table(), "perturbation", "full", "ablation", "observed",
+                metric, n_boot=100, seed=7,
+            )
+            self.assertAlmostEqual(mean, 2.0)
+            self.assertAlmostEqual(lower, 2.0)
+            self.assertAlmostEqual(upper, 2.0)
+
+    def test_complete_cases_are_shared_by_the_two_arms(self):
+        table = self.table()
+        table.loc[table["protein"] == "C", "ablation"] = np.nan
+        mean, lower, upper = bootstrap_correlation_difference(
+            table, "perturbation", "full", "ablation", "observed",
+            "spearman", n_boot=50, seed=3,
+        )
+        self.assertAlmostEqual(mean, 2.0)
+        self.assertAlmostEqual(lower, 2.0)
+        self.assertAlmostEqual(upper, 2.0)
+
+
+class ResponseCosineTests(unittest.TestCase):
+    def test_single_protein_response_is_not_scored(self):
+        frame = pd.DataFrame({
+            "perturbation": ["one", "two", "two"],
+            "predicted": [1.0, 1.0, 2.0],
+            "observed": [-1.0, 1.0, 2.0],
+        })
+        scores = response_cosine(frame, "predicted", "observed").set_index(
+            "perturbation"
+        )
+        self.assertTrue(np.isnan(scores.loc["one", "cosine"]))
+        self.assertEqual(scores.loc["one", "n_proteins"], 1)
+        self.assertAlmostEqual(scores.loc["two", "cosine"], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedEffectSubsetScorerTests(unittest.TestCase):
+    """One scorer for every Task B ISP.
+
+    The linear runner and the `task_b` adapter each grew their own and diverged: the
+    adapter scored all 100 (perturbation, protein) pairs while the linear runner scored
+    the four frozen subsets, so RegVelo and the linear baseline could not be tabled
+    together.
+    """
+
+    def frame(self):
+        rows = []
+        for i, pert in enumerate(f"KO{n}" for n in range(6)):
+            for protein in "ABCD":
+                observed = float(i) + ord(protein)
+                rows.append({
+                    "perturbation": pert, "replicate": "rep1", "protein": protein,
+                    "pred": observed * 2.0, "obs": observed,
+                    "in_primary": True, "in_significant": i < 3,
+                    "in_post_transcriptional": False, "in_self": False,
+                })
+        return pd.DataFrame(rows)
+
+    def test_only_flagged_rows_enter_each_subset(self):
+        scored = score_effect_subsets(self.frame(), "pred", "obs", 50, 0)
+        by_subset = scored.set_index("effect_subset")["n"]
+        self.assertEqual(int(by_subset["primary"]), 24)
+        self.assertEqual(int(by_subset["significant"]), 12)
+        # Empty subsets are dropped rather than reported as zero-effect rows.
+        self.assertNotIn("post_transcriptional", by_subset.index)
+        self.assertNotIn("self", by_subset.index)
+
+    def test_a_perfectly_ranked_prediction_scores_one(self):
+        scored = score_effect_subsets(self.frame(), "pred", "obs", 50, 0)
+        primary = scored[scored["effect_subset"] == "primary"].iloc[0]
+        self.assertAlmostEqual(primary["spearman"], 1.0)
+        self.assertAlmostEqual(primary["response_cosine_mean"], 1.0)
+
+    def test_confidence_intervals_are_produced_per_requested_unit(self):
+        scored = score_effect_subsets(self.frame(), "pred", "obs", 50, 0,
+                                      unit_columns=("perturbation", "replicate"))
+        for column in ("spearman_perturbation_lo", "spearman_replicate_hi",
+                       "pearson_perturbation_lo", "pearson_replicate_hi"):
+            self.assertIn(column, scored.columns)
+
+    def test_a_table_without_replicates_still_scores(self):
+        frame = self.frame().drop(columns=["replicate"])
+        scored = score_effect_subsets(frame, "pred", "obs", 50, 0)
+        self.assertAlmostEqual(
+            scored[scored["effect_subset"] == "primary"].iloc[0]["spearman"], 1.0)

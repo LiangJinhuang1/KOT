@@ -187,6 +187,79 @@ sbatch --partition=jobs-cpu --gres=none --mem=128GB --time=02:00:00 --job-name=v
   slurm/train_slurm.sh
 ```
 
+**Chromatin→RNA (`run_kot_chromatin.py`)** — the second modality pair. Stages run in this
+order; each writes into `cache/chromatin/` and the next one refuses to start without it.
+
+```bash
+# 1. build the paired object (CPU). hspc streams two 10x ARC matrices and does an LSI
+#    over ~197k union peaks, so give it memory; bmmc reuses the shipped gene activity.
+sbatch --partition=jobs-cpu --gres=none --mem=192GB --time=06:00:00 \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py prepare --dataset hspc' \
+  slurm/train_slurm.sh
+
+# 2. audit, split, chromatin velocity (CPU, minutes)
+PYTHONPATH=. python -u run_kot_chromatin.py audit    --dataset bmmc --law reduced
+PYTHONPATH=. python -u run_kot_chromatin.py split    --dataset bmmc --seed 0
+PYTHONPATH=. python -u run_kot_chromatin.py velocity --dataset bmmc
+
+# 3. the Task D reference: scVelo on the panel's own spliced/unspliced (CPU, hours)
+sbatch --partition=jobs-cpu --gres=none --mem=96GB --time=08:00:00 \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py reference --dataset hspc' \
+  slurm/train_slurm.sh
+
+# 4. train one condition (GPU)
+sbatch --job-name=chrom_r1 --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py \
+  train --dataset bmmc --law reduced --condition full --seed 0' slurm/train_slurm.sh
+
+# 5. score it: Tasks A-D, biological AND internal track (GPU)
+sbatch --job-name=chrom_eval --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py \
+  evaluate --run-dir cache/chromatin/runs/<run>' slurm/train_slurm.sh
+```
+
+Do not put chromatin lines in `parallel_train.sh`: that launcher hardcodes
+`python -m src.training.runner`. The phase submitter uses one `train_slurm.sh` job per
+condition, evaluates it, and refuses every later phase until all four pilot directories
+contain `preflight_passed.json`:
+
+```bash
+# exactly four jobs: HSPC/BMMC × R1 full/noDyn, one seed
+bash slurm/submit_chromatin_phase.sh pilot
+
+# only after all four pass: eight remaining R1 jobs, then six R2 jobs
+bash slurm/submit_chromatin_phase.sh r1-ablation
+bash slurm/submit_chromatin_phase.sh relay
+```
+
+Together those phases are the exact 18 one-seed conditions: per dataset, R1 has
+full/shuffle/reverse/zero/noDyn/permG and R2 has full/shuffle/noDyn. Development and final
+runs are separate explicit phases:
+
+```bash
+# 18 conditions × 3 frozen development seeds
+bash slurm/submit_chromatin_phase.sh development
+
+# 12 seeds: six central conditions per dataset (R1/R2 full, shuffle, noDyn)
+bash slurm/submit_chromatin_phase.sh final-central
+
+# optional frozen run of all 18 conditions × 12 seeds
+bash slurm/submit_chromatin_phase.sh final-all
+```
+
+The submitter passes `--lambda-dyn 1` explicitly; it never inherits the RNA→protein
+default of 1000, which collapses this 2,000-gene chromatin map.
+
+**BMMC spliced/unspliced over every batch** (CPU, long). The cached
+`bmmc_multiome_scvelo_results.h5ad` covers s1d1 and s2d4 only — 10,780 of 69,249 cells,
+451 of the 1,281 panel genes usable — because it was built from a two-row STARsolo report.
+The velocyto output for all 13 batches is on disk and matches 55,131 cells. This writes a
+SEPARATE label, so the existing cache and everything read off it stay untouched:
+
+```bash
+sbatch --partition=jobs-cpu --gres=none --mem=256GB --cpus-per-task=16 --time=08:00:00 \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -u -m src.data.velocity bmmc_multiome_full --dynamics-n-jobs 16' \
+  slurm/train_slurm.sh
+```
+
 ## Running many at once
 
 Independent runs go in a jobs file, one runner arg-string per line, and

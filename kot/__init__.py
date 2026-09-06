@@ -9,6 +9,6 @@ __all__ = ["__version__", "run_training"]
 
 def run_training(*args, **kwargs):
     """Run the training pipeline without importing heavy backends at package import."""
-    from src.training.runner import run_training as _run_training
+    from src.training.runner import run_training as training_entry
 
-    return _run_training(*args, **kwargs)
+    return training_entry(*args, **kwargs)

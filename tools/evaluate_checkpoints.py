@@ -235,7 +235,6 @@ def build_model_and_tensors(
     run_cfg = cfg_with_model_overrides(run_cfg, model_name)
     use_feature_space = bool(run_cfg.get("kot_use_feature_space", False))
     rna_layer = run_cfg.get("kot_rna_layer")
-    protein_layer = run_cfg.get("kot_protein_layer")
     velocity_layer = run_cfg.get("kot_velocity_layer") or run_cfg.get("velocity_layer")
     use_explicit_links = bool(run_cfg.get("kot_use_explicit_links", True))
 

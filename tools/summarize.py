@@ -9,7 +9,6 @@ from pathlib import Path
 import anndata as ad
 import argparse
 import csv
-import numpy as np
 import pandas as pd
 import sys
 

@@ -81,7 +81,6 @@ def train_validation_ids(fit_rows: np.ndarray, fraction: float, seed: int) -> tu
 def run_scbutterfly(context: dict, cfg: dict) -> tuple[list, None, dict]:
     """Fit the RNA↔ADT translator on the paired fitted cells; translate every cell."""
     rna_adata = context["rna_adata"]
-    second_adata = context["second_adata"]
     seed = int(cfg.get("seed", 42))
     output_path = str(context["output_dir"])
 

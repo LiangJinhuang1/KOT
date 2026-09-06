@@ -83,7 +83,7 @@ class StratifiedTests(unittest.TestCase):
 class PairingTests(unittest.TestCase):
     """What the sweep is actually read on: same seed -> same split, across configs."""
 
-    def _mask(self, model_seed, strata=None):
+    def masked_rows(self, model_seed, strata=None):
         return validation_mask(
             BARCODES, 0.1,
             resolve_split_seed(20260825, model_seed, True),
@@ -92,20 +92,20 @@ class PairingTests(unittest.TestCase):
 
     def test_same_seed_gives_the_same_split(self):
         # The config never enters the key, so two configs at one seed must agree.
-        np.testing.assert_array_equal(self._mask(42), self._mask(42))
+        np.testing.assert_array_equal(self.masked_rows(42), self.masked_rows(42))
 
     def test_different_seeds_give_different_splits(self):
         for other in (123, 2026, 6):
             self.assertNotEqual(
-                split_digest(BARCODES, self._mask(42)),
-                split_digest(BARCODES, self._mask(other)),
+                split_digest(BARCODES, self.masked_rows(42)),
+                split_digest(BARCODES, self.masked_rows(other)),
             )
 
     def test_seeds_differ_under_stratification_too(self):
         strata = np.array(["a"] * 2000 + ["b"] * 2000)
         self.assertNotEqual(
-            split_digest(BARCODES, self._mask(42, strata)),
-            split_digest(BARCODES, self._mask(123, strata)),
+            split_digest(BARCODES, self.masked_rows(42, strata)),
+            split_digest(BARCODES, self.masked_rows(123, strata)),
         )
 
 

@@ -75,7 +75,7 @@ class MissingScoreTests(unittest.TestCase):
     """
 
     @staticmethod
-    def _score(record, rank_by):
+    def score_record(record, rank_by):
         # The branch under test, mirrored from print_aggregate so the discrimination
         # is asserted rather than eyeballed in a printed table.
         mean, sd = record[f"{rank_by}_mean"], record[f"{rank_by}_sd"]
@@ -85,15 +85,15 @@ class MissingScoreTests(unittest.TestCase):
 
     def test_absent_metric_on_healthy_runs_is_not_crashed(self):
         record = {"train_foscttm_mean": None, "train_foscttm_sd": None, "n": 4}
-        self.assertEqual(self._score(record, "train_foscttm"), "not computed")
+        self.assertEqual(self.score_record(record, "train_foscttm"), "not computed")
 
     def test_no_seed_produced_a_score_is_crashed(self):
         record = {"train_foscttm_mean": None, "train_foscttm_sd": None, "n": 0}
-        self.assertEqual(self._score(record, "train_foscttm"), "CRASHED")
+        self.assertEqual(self.score_record(record, "train_foscttm"), "CRASHED")
 
     def test_present_metric_still_formats(self):
         record = {"mean_foscttm_mean": 0.1181, "mean_foscttm_sd": 0.0029, "n": 4}
-        self.assertEqual(self._score(record, "mean_foscttm"), "0.1181 ± 0.0029")
+        self.assertEqual(self.score_record(record, "mean_foscttm"), "0.1181 ± 0.0029")
 
 
 class CompanionMetricTests(unittest.TestCase):

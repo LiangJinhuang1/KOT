@@ -576,8 +576,8 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
         groups = [("Separation", "sep"), ("Identity", "raw")]
         arms = [("kot", "with kinetics", METHOD_COLORS["kot"]),
                 ("kot_nodyn", "alignment only", "#8C8C8C")]
-        for gi, (glabel, key) in enumerate(groups):
-            for ai, (model, alabel, color) in enumerate(arms):
+        for gi, (_, key) in enumerate(groups):
+            for ai, (model, _, color) in enumerate(arms):
                 vals = pairs[f"{model}_{key}"].to_numpy()
                 x = gi + (ai - 0.5) * 0.34
                 ax.scatter(np.full(len(vals), x) + rng.uniform(-.045, .045, len(vals)),

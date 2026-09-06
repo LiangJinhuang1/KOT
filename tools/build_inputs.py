@@ -29,7 +29,18 @@ from src.data.adt_gene_map import (
 from src.data.adt_gene_map import build_mapping_rows, gene_alias_set, normalize_gene_symbol
 from src.data.adt_gene_map import gene_alias_set, normalize_gene_symbol, validate_mapping_records
 from src.data.beta_anchor import resolve_beta_anchors
-from src.data.velocity import read_features, read_layer, validate_layer_shapes, write_h5ad_atomic
+from src.data.chromatin_map import load_chromatin_map
+from src.data.velocity import (
+    BARCODE_MAP_COLUMNS,
+    normalize_barcode,
+    observed_batch_suffix,
+    parse_sample,
+    read_features,
+    read_layer,
+    read_report,
+    validate_layer_shapes,
+    write_h5ad_atomic,
+)
 from src.data.preprocessing import load_and_preprocess_cached
 from src.utils.io import load_yaml
 
@@ -1046,6 +1057,112 @@ def preprocess_main() -> None:
 
 
 # ============================================================================
+# barcode_map
+# ============================================================================
+
+BARCODE_MAP_OUT_DIR = Path("cache/results/mapping")
+
+
+def barcode_map_rows(report_path: Path, original_h5ad: Path, assay: str) -> list[dict]:
+    """One row per STARsolo sample: which obs-name suffix its batch uses, and how many
+    of its barcodes that actually matches.
+
+    The suffix is not uniform across the BMMC multiome batches (`-1-s1d1`, `-s2d4`,
+    `-10-s3d3`, `-14-s3d10`), so guessing it drops whole batches without erroring. Writing
+    it down makes the correspondence reviewable before a merge is trusted — the same
+    reason the ADT panel has a mapping CSV instead of a lookup buried in the loader.
+    """
+    report = read_report(report_path)
+    original = sc.read_h5ad(original_h5ad, backed="r")
+    obs_names = original.obs_names
+    batches = original.obs["batch"].astype(str)
+
+    rows = []
+    for row in report.itertuples(index=False):
+        parsed = parse_sample(row.sample)
+        if parsed["assay"] != assay:
+            continue
+        batch = parsed["batch"]
+        barcodes = pd.read_csv(Path(row.velocyto_dir) / "barcodes.tsv", sep="\t",
+                               header=None)[0].astype(str)
+        suffix = observed_batch_suffix(batch, obs_names)
+        proposed = pd.Index([f"{normalize_barcode(code)}{suffix}" for code in barcodes]) \
+            if suffix else pd.Index([])
+        matched = int(proposed.intersection(obs_names).size)
+        n_processed = int((batches == batch).sum())
+        rows.append({
+            "sample": row.sample,
+            "batch": batch,
+            "obs_suffix": suffix if suffix else "",
+            "n_velocyto_barcodes": int(len(barcodes)),
+            "n_processed_cells": n_processed,
+            "n_matched": matched,
+            "matched_fraction": round(matched / n_processed, 4) if n_processed else 0.0,
+        })
+    return rows
+
+
+def barcode_map_main() -> None:
+    parser = argparse.ArgumentParser(description=barcode_map_rows.__doc__)
+    parser.add_argument("--config", type=Path, default=Path("config/velocity.yaml"))
+    parser.add_argument("--dataset", required=True, help="dataset key in velocity.yaml")
+    parser.add_argument("--out", type=Path, default=None)
+    args = parser.parse_args()
+
+    meta = load_yaml(args.config)["datasets"][args.dataset]
+    assay = "multiome_gex" if meta.get("assay") == "multiome" else meta.get("assay", "cite")
+    rows = barcode_map_rows(Path(meta["report"]), Path(meta["original_h5ad"]), assay)
+    out = args.out or BARCODE_MAP_OUT_DIR / f"barcode_map_{meta.get('label', args.dataset)}.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows, columns=BARCODE_MAP_COLUMNS).to_csv(out, index=False)
+
+    print(f"{'sample':<48} {'batch':>6} {'suffix':>12} {'matched':>8} {'of':>7}  frac")
+    for entry in rows:
+        print(f"{entry['sample']:<48} {entry['batch']:>6} {entry['obs_suffix']:>12} "
+              f"{entry['n_matched']:>8} {entry['n_processed_cells']:>7}  "
+              f"{entry['matched_fraction']:.3f}")
+    total = sum(entry["n_matched"] for entry in rows)
+    empty = [entry["batch"] for entry in rows if entry["n_matched"] == 0]
+    print(f"\ntotal matched cells: {total}")
+    if empty:
+        print(f"BATCHES THAT MATCH NOTHING: {empty} — these would be dropped from the merge")
+    print(f"wrote {out}")
+
+
+# ============================================================================
+# chromatin_gene_map
+# ============================================================================
+
+
+def chromatin_gene_map_main() -> None:
+    """Print the chromatin→RNA gene map for review, from the prepared dataset.
+
+    The file itself is written by `run_kot_chromatin.py prepare`, which is where the peak
+    counts and the panel decision are made. This regenerates the SUMMARY so the table can
+    be inspected without rebuilding, the same way the ADT mapping is reviewed.
+    """
+    parser = argparse.ArgumentParser(description=chromatin_gene_map_main.__doc__)
+    parser.add_argument("--dataset", required=True, choices=["hspc", "bmmc"])
+    args = parser.parse_args()
+
+    path = Path("cache/results/mapping") / f"chromatin_gene_map_{args.dataset}.csv"
+    frame = load_chromatin_map(path)
+    print(f"{path}: {len(frame)} candidate genes")
+    print(f"  use_for_alignment  {int(frame['use_for_alignment'].sum())}")
+    print(f"  use_for_kinetics   {int(frame['use_for_kinetics'].sum())}  (non-zero G rows)")
+    print(f"  has_usable_us      {int((frame['use_for_alignment'] & frame['has_usable_us']).sum())}"
+          "  (of the aligned genes — the relay law's panel)")
+    print(f"  peak_definition    {sorted(frame['peak_definition'].unique())}")
+    peaks = frame.loc[frame["use_for_kinetics"], "n_peaks"]
+    if (peaks >= 0).any():
+        print(f"  peaks per gene     median {int(peaks.median())}, "
+              f"IQR [{int(peaks.quantile(.25))}, {int(peaks.quantile(.75))}]")
+    print("\n  excluded_because:")
+    for reason, count in frame.loc[~frame["use_for_kinetics"], "excluded_because"].value_counts().items():
+        print(f"    {count:>6}  {reason or '(none)'}")
+
+
+# ============================================================================
 # dispatch
 # ============================================================================
 
@@ -1057,6 +1174,8 @@ COMMANDS = {
     "grn-prior": grn_main,
     "papalexi": papalexi_main,
     "preprocess": preprocess_main,
+    "barcode-map": barcode_map_main,
+    "chromatin-gene-map": chromatin_gene_map_main,
 }
 
 

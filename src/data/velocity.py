@@ -162,14 +162,56 @@ def infer_best_batch(sample_barcodes: pd.Series, parsed_batch: str, original: ad
     return best_batch
 
 
-def make_velocity_obs_names(barcodes: pd.Series, batch: str, original_obs_names: pd.Index) -> list[str]:
+def observed_batch_suffix(batch: str, original_obs_names: pd.Index) -> str | None:
+    """The suffix the processed object actually gives this batch's cells, or None.
+
+    The BMMC MULTIOME object does not use one suffix throughout: s1d1 cells are
+    `<16-mer>-1-s1d1`, s2d4 cells are `<16-mer>-s2d4`, s3d3 cells are `<16-mer>-10-s3d3`
+    and s3d10/s4d8 cells are `<16-mer>-14-s3d10`. A fixed candidate list can only guess
+    `-1-` and `-`, so it matched exactly two of the thirteen batches and the other eleven
+    were silently dropped from the merge — 10,780 cells kept out of 55,131 available. The
+    suffix is data, so it is read from the data rather than guessed. (The CITE object is
+    uniform `-1-<batch>` and is unaffected either way.)
+    """
+    tail = f"-{batch}"
+    names = [name for name in original_obs_names if str(name).endswith(tail)]
+    suffixes = {str(name)[len(normalize_barcode(name)):] for name in names}
+    return suffixes.pop() if len(suffixes) == 1 else None
+
+
+BARCODE_MAP_COLUMNS = ["sample", "batch", "obs_suffix", "n_velocyto_barcodes",
+                       "n_processed_cells", "n_matched", "matched_fraction"]
+
+
+def load_barcode_map(path: Path) -> dict[str, str]:
+    """The reviewed sample → obs-name-suffix table, as a lookup.
+
+    Same contract as the ADT mapping CSV: the correspondence is BUILT and inspected once
+    (`tools/build_inputs.py barcode-map`), then read here, so a merge that silently drops
+    eleven of thirteen batches shows up as a row saying `n_matched = 0` in a file a person
+    can read rather than as a smaller h5ad nobody questions.
+    """
+    frame = pd.read_csv(path)
+    missing = set(BARCODE_MAP_COLUMNS).difference(frame.columns)
+    if missing:
+        raise ValueError(f"{path} is missing columns {sorted(missing)}")
+    return {str(row.sample): str(row.obs_suffix) for row in frame.itertuples(index=False)}
+
+
+def make_velocity_obs_names(barcodes: pd.Series, batch: str, original_obs_names: pd.Index,
+                            suffix: str | None = None) -> list[str]:
+    if suffix is None:
+        suffix = observed_batch_suffix(batch, original_obs_names)
     candidates = []
     for barcode in barcodes.astype(str):
         core = normalize_barcode(barcode)
         if re.search(r"-\d+$", barcode):
-            candidates.append([f"{barcode}-{batch}", barcode, f"{core}-1-{batch}", f"{core}-{batch}"])
+            options = [f"{barcode}-{batch}", barcode, f"{core}-1-{batch}", f"{core}-{batch}"]
         else:
-            candidates.append([f"{barcode}-1-{batch}", f"{barcode}-{batch}", barcode])
+            options = [f"{barcode}-1-{batch}", f"{barcode}-{batch}", barcode]
+        # First, so it wins ties; the guesses stay as fallbacks and the best-match choice
+        # below means adding this can only ever increase the number of matched cells.
+        candidates.append(([f"{core}{suffix}"] if suffix else []) + options)
 
     best = [item[0] for item in candidates]
     best_matched = -1
@@ -208,8 +250,10 @@ def make_gene_index(var: pd.DataFrame) -> pd.Index:
     return pd.Index(var.index.astype(str))
 
 
-def build_integrated_h5ad(report_path: Path, original_h5ad: Path, output_path: Path, assay: str) -> None:
+def build_integrated_h5ad(report_path: Path, original_h5ad: Path, output_path: Path,
+                          assay: str, barcode_map_csv: Path | None = None) -> None:
     report = read_report(report_path)
+    barcode_map = load_barcode_map(Path(barcode_map_csv)) if barcode_map_csv else {}
     assay_rows = [(row, parse_sample(row.sample)) for row in report.itertuples(index=False)
                   if parse_sample(row.sample)["assay"] == assay]
 
@@ -235,6 +279,7 @@ def build_integrated_h5ad(report_path: Path, original_h5ad: Path, output_path: P
         batch = infer_best_batch(sample_velocity.obs["barcode"], batch, original_gex)
         sample_velocity.obs_names = make_velocity_obs_names(
             sample_velocity.obs["barcode"], batch, original_gex.obs_names,
+            suffix=barcode_map.get(row.sample),
         )
         sample_velocity.obs["batch"] = batch
         velocity_parts.append(sample_velocity)
@@ -663,6 +708,7 @@ def execute_run(run_config: dict) -> None:
             as_path(run_config, "original_h5ad", required=True),
             velocity_input_path,
             assay,
+            as_path(run_config, "barcode_map_csv"),
         )
         adata = load_h5ad(velocity_input_path, run_config.get("umap_key"))
     elif mode == "h5ad":

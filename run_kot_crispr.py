@@ -47,6 +47,8 @@ from src.data.adt_gene_map import load_mapping_records
 from src.evaluation.crispr_metrics import (
     EFFECT_SETS,
     annotate_effect_sets,
+    score_effect_subsets,
+    bootstrap_correlation_difference,
     bootstrap_over_units,
     confirmed_knockouts,
     metric_suite,
@@ -94,6 +96,11 @@ REPLICATE_COLUMN = "replicate"
 # phi -- came to post the highest primary Spearman of any ablation. Below the floor the
 # protein is dropped from scoring instead.
 MIN_CALIBRATION_SD_RATIO = 0.01
+
+# Stabilises the relative Jacobian linearisation error when the nonlinear response is
+# effectively zero. This is deliberately tiny: it prevents division by zero without
+# changing a response at the scale represented by the prediction table.
+LINEARIZATION_EPS = 1e-12
 
 # A self effect is a knockout of the gene the protein is read off. A CRISPR indel can
 # destroy the protein while leaving the transcript intact, so these say nothing about an
@@ -582,8 +589,13 @@ def perturbation_predictions(model, features: torch.Tensor, groups: pd.Series,
                 continue
             phi_shift = phi_values[ko_mask].mean(axis=0) - control_phi
             delta_r = group_means(features, ko_mask) - control_r
+            delta_r_norm = float(torch.linalg.vector_norm(delta_r).item())
             jacobian_shift = (jacobian_vector_product(model.phi, control_r, delta_r)
                               .squeeze(0).detach().cpu().numpy() * phi_slope)
+            jacobian_linearization_error = float(
+                np.linalg.norm(phi_shift - jacobian_shift)
+                / (np.linalg.norm(phi_shift) + LINEARIZATION_EPS)
+            )
             for j, adt in enumerate(adt_names):
                 rows.append({
                     "perturbation": target,
@@ -592,6 +604,8 @@ def perturbation_predictions(model, features: torch.Tensor, groups: pd.Series,
                     "n_ko_cells": int(ko_mask.sum()),
                     "delta_p_phi": float(phi_shift[j]),
                     "delta_p_jacobian": float(jacobian_shift[j]),
+                    "delta_r_norm": delta_r_norm,
+                    "jacobian_linearization_error": jacobian_linearization_error,
                 })
     return pd.DataFrame(rows)
 
@@ -807,7 +821,7 @@ def predict_main() -> None:
 
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available())
                           else ("cpu" if args.device == "auto" else args.device))
-    rna_adata, protein_adata, run_cfg, dataset_name = load_dataset_for_run(
+    rna_adata, protein_adata, run_cfg, _ = load_dataset_for_run(
         args.run_dir, args.dataset or found_dataset)
     model_name = found_model
     if not model_name:
@@ -887,6 +901,8 @@ def predict_main() -> None:
 
 BOOTSTRAP_METRIC = "spearman"
 ARM_PATTERN = "crisprabl_"
+CORRELATION_METRICS = ("spearman", "pearson")
+CRISPR_ABLATION_ARMS = ("shuffleVel", "revVel", "zeroVel", "noDyn")
 
 
 def arm_label(run_dir: str, model: str) -> str:
@@ -932,6 +948,12 @@ def score_arm_seeds(merged: pd.DataFrame, column: str, n_boot: int,
         cosines = response_cosine(pooled, column, "delta_protein")
         row["response_cosine_mean"] = float(cosines["cosine"].mean())
         row["response_cosine_median"] = float(cosines["cosine"].median())
+        if "jacobian_linearization_error" in block:
+            linearization = block.drop_duplicates(
+                ["perturbation", "replicate", "seed"]
+            )["jacobian_linearization_error"]
+            row["jacobian_linearization_error_mean"] = float(linearization.mean())
+            row["jacobian_linearization_error_median"] = float(linearization.median())
         consensus.append(row)
 
         # The three per-set tables item 27 asks to be SAVED rather than summarised: which
@@ -944,6 +966,102 @@ def score_arm_seeds(merged: pd.DataFrame, column: str, n_boot: int,
             agreed, "perturbation", column, "delta_protein")
         breakdown[f"{tag}_response_cosine"] = cosines
     return pd.DataFrame(per_seed), pd.DataFrame(consensus), breakdown
+
+
+def score_ablation_correlation_differences(
+    merged: pd.DataFrame,
+    predicted_columns: list[str],
+    n_boot: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Paired full-minus-ablation correlation differences over perturbations.
+
+    Predictions are first averaged over seeds and replicates exactly as in the arm-level
+    consensus. Full KOT and one ablation are then inner-joined on the same experimental
+    effects before their shared perturbation bootstrap is drawn.
+    """
+    result_columns = [
+        "full_arm", "ablation_arm", "effect_set", "predictor", "metric",
+        "n_effects", "n_perturbations", "full_correlation",
+        "ablation_correlation", "delta_correlation",
+        "delta_boot_mean", "delta_boot_lo", "delta_boot_hi",
+    ]
+    rows = []
+    keys = ["perturbation", "protein"]
+    replicate_keys = ["perturbation", "replicate", "protein"]
+
+    for effect_set in EFFECT_SETS:
+        set_block = merged[merged["effect_set"] == effect_set]
+        full_block = set_block[set_block["arm"] == "full"]
+        if full_block.empty:
+            continue
+        for column in predicted_columns:
+            full_agreed = (
+                full_block.groupby(replicate_keys, as_index=False)
+                [[column, "delta_protein"]].mean()
+            )
+            full = pooled_effects(full_agreed, [column, "delta_protein"]).rename(
+                columns={column: "full_prediction", "delta_protein": "observed_full"}
+            )
+            for ablation_arm in CRISPR_ABLATION_ARMS:
+                ablation_block = set_block[set_block["arm"] == ablation_arm]
+                if ablation_block.empty:
+                    continue
+                ablation_agreed = (
+                    ablation_block.groupby(replicate_keys, as_index=False)
+                    [[column, "delta_protein"]].mean()
+                )
+                ablation = pooled_effects(
+                    ablation_agreed, [column, "delta_protein"]
+                ).rename(columns={
+                    column: "ablation_prediction",
+                    "delta_protein": "observed_ablation",
+                })
+                paired = full.merge(ablation, on=keys, how="inner")
+                paired["observed"] = paired["observed_full"]
+                finite = (
+                    np.isfinite(paired["full_prediction"])
+                    & np.isfinite(paired["ablation_prediction"])
+                    & np.isfinite(paired["observed"])
+                )
+                scored = paired[finite]
+                full_scores = metric_suite(
+                    scored["full_prediction"].to_numpy(),
+                    scored["observed"].to_numpy(),
+                )
+                ablation_scores = metric_suite(
+                    scored["ablation_prediction"].to_numpy(),
+                    scored["observed"].to_numpy(),
+                )
+                for metric in CORRELATION_METRICS:
+                    boot_mean, boot_lo, boot_hi = bootstrap_correlation_difference(
+                        paired,
+                        "perturbation",
+                        "full_prediction",
+                        "ablation_prediction",
+                        "observed",
+                        metric,
+                        n_boot,
+                        seed,
+                    )
+                    full_correlation = full_scores[metric]
+                    ablation_correlation = ablation_scores[metric]
+                    rows.append({
+                        "full_arm": "full",
+                        "ablation_arm": ablation_arm,
+                        "effect_set": effect_set,
+                        "predictor": column,
+                        "metric": metric,
+                        "n_effects": int(len(scored)),
+                        "n_perturbations": int(scored["perturbation"].nunique()),
+                        "full_correlation": full_correlation,
+                        "ablation_correlation": ablation_correlation,
+                        "delta_correlation": full_correlation - ablation_correlation,
+                        "delta_boot_mean": boot_mean,
+                        "delta_boot_lo": boot_lo,
+                        "delta_boot_hi": boot_hi,
+                    })
+    return pd.DataFrame(rows, columns=result_columns)
 
 
 def print_arm_table(consensus: pd.DataFrame, per_seed: pd.DataFrame,
@@ -981,7 +1099,8 @@ def print_arm_table(consensus: pd.DataFrame, per_seed: pd.DataFrame,
 
 SPEC_EFFECT_COLUMNS = ["perturbation", "replicate", "protein", "model",
                        "velocity_ablation", "delta_p_observed", "delta_p_phi",
-                       "delta_p_jacobian", "delta_cognate_rna", "is_self",
+                       "delta_p_jacobian", "delta_r_norm",
+                       "jacobian_linearization_error", "delta_cognate_rna", "is_self",
                        "is_posttranscriptional", "n_cells"]
 
 SPEC_METRICS = ["spearman", "pearson", "mae", "nrmse", "sign_acc"]
@@ -1071,7 +1190,12 @@ def evaluate_main() -> None:
     predictions["arm"] = [arm_label(r, m) for r, m in
                           zip(predictions["run_dir"], predictions["model"])]
     keys = ["perturbation", "replicate", "protein"]
-    carried = ["arm", "seed", "model", "velocity_ablation"] + list(args.columns)
+    diagnostic_columns = [
+        column for column in ("delta_r_norm", "jacobian_linearization_error")
+        if column in predictions
+    ]
+    carried = (["arm", "seed", "model", "velocity_ablation"] + list(args.columns)
+               + diagnostic_columns)
     merged = observed.merge(predictions[keys + carried], on=keys, how="inner")
     per_effect = merged.copy()
     # One row per (effect set, arm, seed, effect); an arm is never pooled with another.
@@ -1101,6 +1225,13 @@ def evaluate_main() -> None:
     consensus = pd.concat(consensus_rows, ignore_index=True)
     per_seed.to_csv(args.out_dir / "crispr_metrics_per_seed.csv", index=False)
     consensus.to_csv(args.out_dir / "crispr_metrics_summary.csv", index=False)
+    ablation_differences = score_ablation_correlation_differences(
+        merged, list(args.columns), args.n_boot, args.seed
+    )
+    ablation_difference_path = (
+        args.out_dir / "crispr_ablation_correlation_differences.csv"
+    )
+    ablation_differences.to_csv(ablation_difference_path, index=False)
     if observational is not None:
         observational.to_csv(args.out_dir / "crispr_observational.csv", index=False)
     merged.to_csv(args.out_dir / "crispr_effects_scored.csv", index=False)
@@ -1115,6 +1246,7 @@ def evaluate_main() -> None:
     print(f"\n[out] {args.out_dir}/crispr_metrics_summary.csv (+ per_seed, observational)")
     print(f"[out] {effects_path}")
     print(f"[out] {summary_path}")
+    print(f"[out] {ablation_difference_path}")
     print(f"[out] {breakdown_dir}/ per-protein, per-perturbation and response-cosine tables")
 
 
@@ -1229,9 +1361,215 @@ def competitors_main() -> None:
     print(f"\n[out] {len(combined)} rows, arms {sorted(combined['arm'].unique())} -> {args.out}")
 
 
+def load_task_b_rna(path: Path, perturbation_column: str,
+                    matrix_key: str) -> pd.DataFrame:
+    """Load ISP-predicted KO RNA profiles in the frozen KOT input feature space.
+
+    CSV files contain one row per predicted cell (or one row per perturbation) and a
+    perturbation column; duplicate rows are averaged below. H5AD files use
+    obs[perturbation_column] and obsm[matrix_key] (falling back to X).
+    """
+    if path.suffix.lower() == ".h5ad":
+        predicted = ad.read_h5ad(path)
+        if perturbation_column not in predicted.obs:
+            raise ValueError(f"{path} has no obs column '{perturbation_column}'")
+        matrix = (predicted.obsm[matrix_key] if matrix_key in predicted.obsm
+                  else predicted.X)
+        values = to_dense(matrix).astype(np.float64)
+        names = [f"feature_{j}" for j in range(values.shape[1])]
+        table = pd.DataFrame(values, columns=names)
+        table.insert(0, "perturbation",
+                     predicted.obs[perturbation_column].astype(str).to_numpy())
+    else:
+        table = pd.read_csv(path)
+        if perturbation_column not in table:
+            raise ValueError(f"{path} has no column '{perturbation_column}'")
+        table = table.rename(columns={perturbation_column: "perturbation"})
+        feature_columns = [c for c in table.columns if c != "perturbation"]
+        numeric = table[feature_columns].apply(pd.to_numeric, errors="coerce")
+        numeric = numeric.dropna(axis=1, how="all")
+        if numeric.isna().all(axis=None):
+            raise ValueError(f"{path} contains no numeric predicted RNA features")
+        table = pd.concat([table[["perturbation"]].astype({"perturbation": str}),
+                           numeric], axis=1)
+    features = table.columns[1:]
+    if len(features) == 0:
+        raise ValueError(f"{path} has no predicted RNA feature columns")
+    if table[list(features)].isna().any(axis=1).any():
+        raise ValueError(f"{path} contains incomplete predicted RNA profiles")
+    return table.groupby("perturbation", as_index=False)[list(features)].mean()
+
+
+def task_b_metrics(predicted: np.ndarray, observed: np.ndarray) -> dict:
+    """Metric suite for one ISP's predicted perturbation delta."""
+    return metric_suite(np.asarray(predicted, dtype=float),
+                        np.asarray(observed, dtype=float))
+
+
+def task_b_main() -> None:
+    """Score predicted KO RNA profiles through a frozen NT-only KOT checkpoint.
+
+    The ISP output must already be represented in the exact feature coordinates consumed
+    by the checkpoint. This command does not fit or tune an ISP, so outputs from
+    RegVelo, GEARS, TxPert, scGPT, or a linear baseline use one common adapter.
+    """
+    parser = argparse.ArgumentParser(
+        description="Task B: predicted KO RNA -> frozen KOT -> predicted protein.")
+    parser.add_argument("--predicted-rna", type=Path, required=True,
+                        help="CSV or H5AD predicted KO RNA profiles in KOT feature space")
+    parser.add_argument("--isp-model", default="isp",
+                        help="label written to Task B outputs (e.g. gears, regvelo, scgpt)")
+    parser.add_argument("--run-dir", type=Path, required=True,
+                        help="KOT run root containing the frozen checkpoint")
+    parser.add_argument("--checkpoint", default="best_align")
+    parser.add_argument("--effects", type=Path, default=EFFECTS_CSV)
+    parser.add_argument("--protein", type=Path, default=PROTEIN_H5AD)
+    parser.add_argument("--metadata", type=Path, default=METADATA_TSV)
+    parser.add_argument("--dataset", default=None)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="checkpoint seed; required when the run has multiple seeds")
+    parser.add_argument("--perturbation-column", default="perturbation")
+    parser.add_argument("--matrix-key", default="X_predicted",
+                        help="H5AD obsm key; X is used when this key is absent")
+    parser.add_argument("--normalization", default="rna_size",
+                        choices=["rna_size", "raw_log1p", "clr"])
+    parser.add_argument("--allow-unstamped-checkpoints", action="store_true")
+    parser.add_argument("--n-boot", type=int, default=1000,
+                        help="resamples for the perturbation-level confidence intervals")
+    parser.add_argument("--out-dir", type=Path, default=CRISPR_DIR)
+    args = parser.parse_args()
+
+    checkpoints, found_dataset, found_model = discover_seed_checkpoints(
+        args.run_dir, args.checkpoint, dataset=args.dataset)
+    if args.seed is not None:
+        checkpoints = [(path, value) for path, value in checkpoints if value == args.seed]
+    if len(checkpoints) != 1:
+        raise SystemExit(
+            f"Task B needs exactly one checkpoint; found {len(checkpoints)}. "
+            "Pass --seed when the run contains multiple seeds.")
+    checkpoint, checkpoint_seed = checkpoints[0]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    rna_adata, protein_adata, run_cfg, _ = load_dataset_for_run(
+        args.run_dir, args.dataset or found_dataset)
+    check_checkpoint_units([(checkpoint, checkpoint_seed)], run_cfg,
+                           args.allow_unstamped_checkpoints)
+    # Real velocity and mapping, whatever the arm trained with. Task B reads only the
+    # frozen phi and the input features; velocity merely initialises tensors here. Without
+    # this the shuffle-velocity and permuted-mapping arms refuse to build at all, because
+    # their training-time velocity is per-seed and not reproducible outside training.
+    built = build_model_and_tensors(run_cfg, rna_adata, protein_adata,
+                                    found_model, device,
+                                    velocity_mode="real", mapping_mode="real")
+    model, features = built[0], built[1]
+    model.load_state_dict({
+        key: value.to(device)
+        for key, value in torch.load(checkpoint, map_location="cpu")["state_dict"].items()
+    })
+    model.eval()
+
+    groups = rna_adata.obs["gene"].astype(str)
+    control_mask = (groups == CONTROL_LABEL).to_numpy()
+    control_rows = features[torch.as_tensor(control_mask, device=device)]
+    control_mean = control_rows.mean(dim=0, keepdim=True)
+    predicted = load_task_b_rna(args.predicted_rna, args.perturbation_column,
+                                args.matrix_key)
+    if len(predicted.columns) - 1 != features.shape[1]:
+        raise ValueError(
+            f"{args.predicted_rna} has {len(predicted.columns) - 1} RNA features, "
+            f"but this checkpoint consumes {features.shape[1]}")
+
+    benchmark_adt = benchmark_units_adt(args.protein, args.metadata,
+                                        args.normalization, rna_adata.obs_names)
+    _, phi_slope = calibrated_phi(model, features, benchmark_adt, control_mask)
+    if not np.isfinite(phi_slope).all():
+        raise ValueError("Task B cannot score a checkpoint with collapsed calibrated phi")
+    predicted_profiles = predicted[predicted.columns[1:]].to_numpy(dtype=np.float32)
+    perturbations = predicted["perturbation"].to_numpy(dtype=str)
+    # mean phi(r_NT), not phi(mean r_NT): the same reference Task A and the linear ISP
+    # use. The two differ by a Jensen gap that is ~19% of the effect size on this
+    # checkpoint, which is invisible to a correlation and moves every MAE and NRMSE.
+    with torch.no_grad():
+        baseline = model.phi(control_rows).mean(dim=0, keepdim=True)
+        queries = torch.as_tensor(predicted_profiles, device=device)
+        predicted_protein = (
+            (model.phi(queries) - baseline).cpu().numpy() * phi_slope
+        )
+
+    # The frozen effect sets travel with the observation, so Task B is scored on the same
+    # 94 primary pairs Task A is. Pooling every (perturbation, protein) pair instead
+    # silently added the two self effects and four under-sampled pairs that item 26
+    # excludes, which is a different benchmark rather than a different format.
+    observed = annotate_effect_sets(pd.read_csv(args.effects))
+    subset_flags = [f"in_{name}" for name in EFFECT_SETS]
+    observed_protein = (
+        observed.groupby(["perturbation", "protein"], as_index=False)
+        .agg({"delta_protein": "mean", **{flag: "first" for flag in subset_flags}})
+    )
+    rows, summary = [], []
+    control_mean_np = control_mean.squeeze(0).cpu().numpy()
+    for perturbation, profile, protein_delta in zip(
+        perturbations, predicted_profiles, predicted_protein
+    ):
+        actual_rows = features[(groups == perturbation).to_numpy()]
+        if len(actual_rows) == 0:
+            continue
+        predicted_delta = profile - control_mean_np
+        actual_delta = actual_rows.mean(dim=0).cpu().numpy() - control_mean_np
+        rna_score = task_b_metrics(predicted_delta, actual_delta)
+        rows.append({
+            "model": args.isp_model, "seed": checkpoint_seed,
+            "perturbation": perturbation, "space": "rna",
+            "delta_norm_predicted": float(np.linalg.norm(predicted_delta)),
+            "delta_norm_observed": float(np.linalg.norm(actual_delta)),
+            **rna_score,
+        })
+        for protein_name, value in zip(protein_adata.var_names, protein_delta):
+            match = observed_protein[
+                (observed_protein["perturbation"] == perturbation)
+                & (observed_protein["protein"] == str(protein_name))
+            ]
+            if match.empty:
+                continue
+            rows.append({
+                "model": args.isp_model, "seed": checkpoint_seed,
+                "perturbation": perturbation, "space": "protein",
+                "protein": str(protein_name),
+                "predicted_delta": float(value),
+                "observed_delta": float(match["delta_protein"].iloc[0]),
+                **{flag: bool(match[flag].iloc[0]) for flag in subset_flags},
+            })
+
+    effects = pd.DataFrame(rows)
+    rna_block = effects[effects["space"] == "rna"]
+    scores = {key: float(rna_block[key].mean()) for key in
+              ("spearman", "pearson", "mae", "nrmse", "sign_acc") if key in rna_block}
+    summary.append({"model": args.isp_model, "seed": checkpoint_seed, "space": "rna",
+                    "effect_subset": "all_eligible", **scores, "n": int(len(rna_block))})
+    protein_block = effects[effects["space"] == "protein"]
+    # An ISP that emits one mean profile per perturbation cannot produce mean phi(r_KO),
+    # so this arm is stamped phi_of_mean and must not have its MAE or NRMSE compared with
+    # a cell-level ISP's without saying so. Correlations agree to r=0.99.
+    # checkpoint_seed, not args.seed: the latter defaults to None when the run has a
+    # single checkpoint, and default_rng(None) would draw a different interval each run.
+    for row in score_effect_subsets(protein_block, "predicted_delta", "observed_delta",
+                                    args.n_boot, checkpoint_seed).to_dict("records"):
+        summary.append({"model": args.isp_model, "seed": checkpoint_seed,
+                        "space": "protein", "phi_estimator": "phi_of_mean", **row})
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    effects_path = args.out_dir / "crispr_task_b_effects_predicted.csv"
+    summary_path = args.out_dir / "crispr_task_b_summary.csv"
+    effects.to_csv(effects_path, index=False)
+    pd.DataFrame(summary).to_csv(summary_path, index=False)
+    print(f"[task-b] {args.isp_model}, checkpoint seed {checkpoint_seed}: "
+          f"{len(predicted)} predicted perturbations")
+    print(f"[out] {effects_path}")
+    print(f"[out] {summary_path}")
+
+
 COMMANDS = {"effects": effects_main, "gate": gate_main, "preprocess": preprocess_main,
             "predict": predict_main, "competitors": competitors_main,
-            "evaluate": evaluate_main}
+            "evaluate": evaluate_main, "task_b": task_b_main}
 
 
 def main() -> int:
