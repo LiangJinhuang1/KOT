@@ -166,6 +166,46 @@ def response_cosine(frame: pd.DataFrame, predicted_column: str,
     return pd.DataFrame(rows)
 
 
+def delta_norm_calibration(frame: pd.DataFrame, predicted_column: str,
+                           observed_column: str, min_proteins: int = 2) -> pd.DataFrame:
+    """Predicted against observed response MAGNITUDE, one row per perturbation.
+
+    Correlation and cosine are both scale-free: a model that gets every direction right
+    while predicting effects an order of magnitude too small scores exactly like a
+    calibrated one. This is the size of the response those metrics cannot see.
+    """
+    rows = []
+    for perturbation, group in frame.groupby("perturbation"):
+        pred = group[predicted_column].to_numpy(dtype=float)
+        obs = group[observed_column].to_numpy(dtype=float)
+        finite = np.isfinite(pred) & np.isfinite(obs)
+        pred, obs = pred[finite], obs[finite]
+        enough = len(pred) >= min_proteins
+        norm_predicted = float(np.linalg.norm(pred)) if enough else np.nan
+        norm_observed = float(np.linalg.norm(obs)) if enough else np.nan
+        rows.append({"perturbation": perturbation, "n_proteins": int(len(pred)),
+                     "norm_predicted": norm_predicted, "norm_observed": norm_observed,
+                     "norm_ratio": (norm_predicted / norm_observed
+                                    if norm_observed > 0 else np.nan)})
+    return pd.DataFrame(rows)
+
+
+def delta_norm_slope(frame: pd.DataFrame, predicted_column: str,
+                     observed_column: str) -> float:
+    """Through-origin slope of predicted on observed effect, pooled over every effect.
+
+    One calibration number for a whole arm, where `delta_norm_calibration` gives a
+    distribution over perturbations: 1 is calibrated and below 1 is a shrunk response.
+    No intercept, because a perturbation with no effect must predict no effect.
+    """
+    pred = frame[predicted_column].to_numpy(dtype=float)
+    obs = frame[observed_column].to_numpy(dtype=float)
+    finite = np.isfinite(pred) & np.isfinite(obs)
+    pred, obs = pred[finite], obs[finite]
+    denominator = float(obs @ obs)
+    return float(pred @ obs / denominator) if denominator > 0 else np.nan
+
+
 def per_group_correlation(frame: pd.DataFrame, group_column: str, predicted_column: str,
                           observed_column: str) -> pd.DataFrame:
     """Spearman and Pearson within each protein, or within each perturbation."""

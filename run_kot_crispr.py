@@ -51,6 +51,8 @@ from src.evaluation.crispr_metrics import (
     bootstrap_correlation_difference,
     bootstrap_over_units,
     confirmed_knockouts,
+    delta_norm_calibration,
+    delta_norm_slope,
     metric_suite,
     per_group_correlation,
     response_cosine,
@@ -948,12 +950,19 @@ def score_arm_seeds(merged: pd.DataFrame, column: str, n_boot: int,
         cosines = response_cosine(pooled, column, "delta_protein")
         row["response_cosine_mean"] = float(cosines["cosine"].mean())
         row["response_cosine_median"] = float(cosines["cosine"].median())
-        if "jacobian_linearization_error" in block:
-            linearization = block.drop_duplicates(
-                ["perturbation", "replicate", "seed"]
-            )["jacobian_linearization_error"]
-            row["jacobian_linearization_error_mean"] = float(linearization.mean())
-            row["jacobian_linearization_error_median"] = float(linearization.median())
+        norms = delta_norm_calibration(pooled, column, "delta_protein")
+        row["delta_norm_predicted_mean"] = float(norms["norm_predicted"].mean())
+        row["delta_norm_observed_mean"] = float(norms["norm_observed"].mean())
+        row["delta_norm_ratio_mean"] = float(norms["norm_ratio"].mean())
+        row["delta_norm_ratio_median"] = float(norms["norm_ratio"].median())
+        row["delta_norm_slope"] = delta_norm_slope(pooled, column, "delta_protein")
+        # Both diagnostics are per (perturbation, replicate, seed), so they are de-duplicated
+        # once: repeating the drop for each one counted every experiment four times over.
+        per_experiment = block.drop_duplicates(["perturbation", "replicate", "seed"])
+        for diagnostic in ("delta_r_norm", "jacobian_linearization_error"):
+            if diagnostic in per_experiment:
+                row[f"{diagnostic}_mean"] = float(per_experiment[diagnostic].mean())
+                row[f"{diagnostic}_median"] = float(per_experiment[diagnostic].median())
         consensus.append(row)
 
         # The three per-set tables item 27 asks to be SAVED rather than summarised: which
@@ -965,6 +974,7 @@ def score_arm_seeds(merged: pd.DataFrame, column: str, n_boot: int,
         breakdown[f"{tag}_per_perturbation"] = per_group_correlation(
             agreed, "perturbation", column, "delta_protein")
         breakdown[f"{tag}_response_cosine"] = cosines
+        breakdown[f"{tag}_delta_norm"] = norms
     return pd.DataFrame(per_seed), pd.DataFrame(consensus), breakdown
 
 
@@ -1077,7 +1087,7 @@ def print_arm_table(consensus: pd.DataFrame, per_seed: pd.DataFrame,
         print("=" * 96)
         print(f"  {'arm':<12}{'predictor':<18}{'NT energy':>10}{'corr gap':>9}{'sd_ratio':>9}"
               f"{'spearman':>10}{'+/- seed':>10}{'95% CI (pert)':>18}{'NRMSE':>8}"
-              f"{'sign':>7}{'cos':>7}")
+              f"{'sign':>7}{'cos':>7}{'|d|':>7}")
         for row in block.sort_values(["predictor", "arm"]).itertuples():
             spread = per_seed[(per_seed["arm"] == row.arm)
                               & (per_seed["effect_set"] == effect_set)
@@ -1094,7 +1104,8 @@ def print_arm_table(consensus: pd.DataFrame, per_seed: pd.DataFrame,
             spearman = "     n/a" if not np.isfinite(row.spearman) else f"{row.spearman:+.3f}"
             print(f"  {row.arm:<12}{row.predictor:<18}{energy:>10}{corr_gap:>9}{sd_ratio:>9}"
                   f"{spearman:>10}{spread:>10.3f}{ci:>18}{row.nrmse:>8.3f}"
-                  f"{row.sign_acc:>7.3f}{row.response_cosine_mean:>7.3f}")
+                  f"{row.sign_acc:>7.3f}{row.response_cosine_mean:>7.3f}"
+                  f"{row.delta_norm_ratio_median:>7.3f}")
 
 
 SPEC_EFFECT_COLUMNS = ["perturbation", "replicate", "protein", "model",
