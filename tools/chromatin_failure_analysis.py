@@ -181,6 +181,11 @@ def main() -> int:
     results = {
         "run_dir": args.run_dir,
         "checkpoint": args.checkpoint,
+        "method": "KOT",
+        "dataset": payload["dataset"],
+        "law": payload["law"],
+        "condition": config["condition"],
+        "seed": config["seed"],
         "align_dims_trained": config["align_dims"],
         "sinkhorn_max_points_trained": config["sinkhorn_max_points"],
         "sinkhorn_blur": blur,

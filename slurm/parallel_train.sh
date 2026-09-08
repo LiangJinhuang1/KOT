@@ -157,15 +157,6 @@ while IFS= read -r job || [ -n "${job}" ]; do
   # into the USABLE list, so a device the preflight rejected is never scheduled onto.
   gpu="${GPU_ARRAY[$(( idx % N_GPUS ))]}"
 
-  # moscot is the only JAX consumer here, and JAX RAISES when its CUDA plugin is
-  # present but cannot initialize -- which is what a wedged GPU looks like, and it
-  # killed the moscot arms of job 4206192 while torch was failing on the same node.
-  # Pinning it to CPU costs moscot its (unverified) GPU path and buys immunity to
-  # every GPU-side failure, which is the trade the baselines want: they are
-  # deterministic, run once per config, and are not the method under test.
-  jax_platforms=""
-  case "${job}" in *"--models moscot"*) jax_platforms="JAX_PLATFORMS=cpu" ;; esac
-
   while true; do
     [ "${running}" -lt "${MAX_PARALLEL}" ] || {
       wait_one
@@ -195,7 +186,13 @@ while IFS= read -r job || [ -n "${job}" ]; do
   else
     echo "[launch ${idx}] gpu${gpu} ${job} -> ${log}" >&2
   fi
-  ( CUDA_VISIBLE_DEVICES="${gpu}" ${jax_platforms} python -u -m src.training.runner ${job} ) > "${log}" 2>&1 &
+  # moscot is the only JAX consumer here. JAX raises if its CUDA plugin is present
+  # but cannot initialize, which is what a wedged GPU looks like. Export inside the
+  # subshell: a VAR=value word after CUDA_VISIBLE_DEVICES=... is parsed as a command.
+  ( export CUDA_VISIBLE_DEVICES="${gpu}"
+    case "${job}" in *"--models moscot"*) export JAX_PLATFORMS=cpu ;; esac
+    python -u -m src.training.runner ${job}
+  ) > "${log}" 2>&1 &
   running=$((running+1))
 done < "${JOBS_FILE}"
 while [ "${running}" -gt 0 ]; do wait_one; done
