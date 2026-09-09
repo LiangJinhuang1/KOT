@@ -1,11 +1,8 @@
 #!/bin/bash
 #
-# Run velocyto on SHARE-seq BAM files to produce spliced/unspliced loom files.
-# Output loom files are written to Datasets/SHARE_seq/velocyto/.
-#
 # Usage:
-#   sbatch --array=0-2 velocyto_slurm.sh         # tissue samples (skin, brain, lung)
-#   sbatch --array=0-5 velocyto_slurm.sh         # all samples
+#   sbatch --array=0-2 velocyto_slurm.sh
+#   sbatch --array=0-5 velocyto_slurm.sh
 #
 #SBATCH --account=core-med1-telem
 #SBATCH --partition=jobs-cpu
@@ -22,7 +19,6 @@ mkdir -p logs Datasets/SHARE_seq/velocyto
 
 CONTAINER="/data/common/images/codedev_v1.0.5.sif"
 
-# Paths — update GTF paths if they differ on the cluster.
 MM10_GTF="/data/common/references/mm10/Mus_musculus.GRCm38.99.gtf"
 HG19_GTF="/data/common/references/hg19/Homo_sapiens.GRCh37.87.gtf"
 
@@ -30,7 +26,6 @@ BAM_DIR="Datasets/SHARE_seq/bam"
 RAW_DIR="Datasets/SHARE_seq/Raw_Files"
 OUT_DIR="Datasets/SHARE_seq/velocyto"
 
-# Each entry: "bam_stem  rna_counts_gz  gtf_var"
 SAMPLES=(
     "skin.late.anagen.rna.norg     GSM4156608_skin.late.anagen.rna.counts.txt.gz    MM10_GTF"
     "brain.rna.norg                GSM4156610_brain.rna.counts.txt.gz               MM10_GTF"
@@ -51,7 +46,6 @@ echo "Counts : ${COUNTS}"
 echo "Node   : $(hostname)"
 echo "Start  : $(date)"
 
-# Extract cell barcodes from the counts file header (tab-separated, first field = "gene").
 BARCODES_FILE="${OUT_DIR}/${BAM_STEM}.barcodes.txt"
 zcat "${COUNTS}" | head -1 | cut -f2- | tr '\t' '\n' > "${BARCODES_FILE}"
 echo "Barcodes written: $(wc -l < "${BARCODES_FILE}")"
@@ -63,7 +57,6 @@ set -euo pipefail
 GTF="${!GTF_VAR}"
 echo "GTF: ${GTF}"
 
-# Sort and index if not already done.
 SORTED_BAM="${BAM%.bam}.sorted.bam"
 if [ ! -f "${SORTED_BAM}" ]; then
     echo "Sorting BAM..."

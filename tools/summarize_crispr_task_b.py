@@ -1,14 +1,8 @@
 #!/usr/bin/env python
 """Consolidate every Task B ISP run into three comparable tables.
 
-Each ISP writes its own per-seed summaries, but they are not comparable as written: the
-linear runner scores at REPLICATE level (n=282) while `run_kot_crispr.py task_b` pools over
-replicates (n~90), which alone is worth about 0.07 of Spearman. Everything here is pooled,
-so the ISPs sit on the same footing.
-
-Also reports the between-perturbation ratio, which the correlation cannot substitute for:
-an ISP that returns the same profile for every knockout scores near zero for a reason
-completely different from one that predicts a wrong response, and only this separates them.
+Linear ISP scores at replicate level while the others pool; everything here is pooled so they sit on the same footing.
+The between-perturbation ratio separates a collapsed ISP from a merely wrong response.
 """
 from __future__ import annotations
 
@@ -53,10 +47,9 @@ SOURCES = {
 
 
 def between_perturbation_ratio(path: Path) -> tuple[float, float, int]:
-    """How much a predicted profile varies BETWEEN knockouts, against its own spread.
+    """How much a predicted profile varies between knockouts, against its own spread.
 
-    A collapsed ISP returns one profile for every knockout; its ratio goes to zero while
-    its correlation merely goes to zero as well, which looks like ordinary poor accuracy.
+    A collapsed ISP returns one profile for every knockout; correlation alone cannot tell that from ordinary error.
     """
     if not path.exists():
         return float("nan"), float("nan"), 0
@@ -91,11 +84,9 @@ def pooled_linear(arm: str, n_boot: int, seed: int) -> pd.Series | None:
 
 
 def flat_summary(n_boot: int, seed: int) -> pd.DataFrame:
-    """Every ISP x KOT arm x effect subset in one table, item 32's column names.
+    """Every ISP x KOT arm x effect subset in one table.
 
-    Task B has no Jacobian arm: an ISP hands over predicted RNA, which goes through phi,
-    so there is a `_phi` block and nothing to put in a `_jacobian` one. The columns are
-    named to match `crispr_summary.csv` so the two tasks can be read side by side.
+    Task B has no Jacobian arm: an ISP hands over predicted RNA, which goes through phi.
     """
     rows = []
     for label, (summary_glob, _, profile_glob) in SOURCES.items():
@@ -186,8 +177,7 @@ def main() -> None:
             if arm == "full":
                 comparison.append(row)
 
-    # The linear rows above are replicate-level; add the pooled re-score so the headline
-    # table compares like with like.
+    # Linear rows above are replicate-level; add the pooled re-score so the headline table compares like with like.
     for arm in ("full", "noDyn", "shuffleVel"):
         primary = pooled_linear(arm, args.n_boot, args.seed)
         if primary is None:

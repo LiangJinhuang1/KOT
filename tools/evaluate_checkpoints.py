@@ -48,8 +48,7 @@ from src.training.kot import (
 )
 
 
-# Shared across run folders: keyed by the full preprocess args, never by dataset
-# name (two runs can differ in rna_n_top_genes). Downstream only reads these objects.
+# Shared across run folders: keyed by the full preprocess args, never by dataset name.
 PREPROCESSED_CACHE: dict = {}
 
 DATASETS_CONFIG = Path("config/datasets.yaml")
@@ -72,10 +71,6 @@ SCALE_LAYERS = {
     },
 }
 
-
-# ---------------------------------------------------------------------------
-# Loading per-run data + reproducing model architecture
-# ---------------------------------------------------------------------------
 
 def config_path_for_run(run_folder: Path) -> Path:
     """Config snapshot for a run: training.yaml, or the latest training_resume_*.yaml.
@@ -240,10 +235,7 @@ def build_model_and_tensors(
 
     if use_feature_space:
         x = matrix_from_adata(rna_adata, rna_layer, "RNA")
-        # Same contract run_kot trains against, so a re-evaluated checkpoint is scored
-        # in the units its phi actually learned. Reading protein_adata.X here while
-        # run_kot honoured protein_target_normalization would compare an rna_size phi
-        # against CLR observations and report a model that does not exist.
+        # Score in the units phi learned.
         y = adt_targets({"rna_adata": rna_adata, "second_adata": protein_adata}, run_cfg)
     else:
         x = np.array(rna_adata.obsm["X_pca"])
@@ -270,14 +262,9 @@ def build_model_and_tensors(
         use_explicit_links=use_explicit_links,
         require_full_panel=require_full_panel,
     )
-    # The RNA->protein map is its own control axis, independent of the velocity: run_kot
-    # applies the permutation in exactly this position, before the PC projection, and
-    # mapping_mode="real" asks for the TRUE map whatever the run trained on. Everything
-    # that follows from S -- S_model, the velocity-gene kinetic filter, the RNA-side
-    # velocity weight -- follows this one choice.
+    # Permutation applied before PC projection, matching training.
     if mapping_mode == "as-trained" and run_cfg.get("kot_s_permute", False):
-        # Seeded off the model seed, but these tensors are built once per (run, model)
-        # outside the seed loop, so the run's own permutation cannot be rebuilt here.
+        # Seeded off the model seed, but these tensors are built once per (run, model).
         raise ValueError(
             "This run trained with kot_s_permute=true; its S is per-seed and cannot be "
             "reproduced here. Use --mapping real to score it against the true mapping "
@@ -327,21 +314,11 @@ def build_model_and_tensors(
     P_t = to_tensor(y, device)
     S_t = to_tensor(S_model, device)
     mask_t = to_tensor(kin_mask_np, device) if kin_mask_np is not None else None
-    # Effective velocity, built the same way run_kot builds it (RNA-side weight, then gauge
-    # normalisation). The diagnostics take this single vector — re-evaluating a checkpoint
-    # on a raw or differently-scaled velocity would report physics numbers that do not match
-    # the run that produced the checkpoint.
-    # Reproduce the run's own velocity by default: a control arm trained against a broken
-    # field, so re-evaluating it on the real one would overwrite its physics numbers with
-    # a different quantity under the same name. velocity_mode="real" deliberately asks for
-    # that comparison and is written under its own checkpoint name.
+    # Effective velocity as run_kot built it, so physics numbers match the checkpoint.
+    # as-trained reproduces a control arm's broken field; --velocity real is written under its own name.
     if velocity_mode == "as-trained":
         if resolve_velocity_ablation(run_cfg) == "shuffle":
-            # The permutation is drawn per model seed, but these tensors are built once
-            # per (run, model) outside the seed loop, so the run's own field cannot be
-            # rebuilt here. Refuse rather than evaluate against a different permutation
-            # and write the result under the run's own diagnostics name. reverse and zero
-            # carry no seed, so they reproduce exactly and fall through.
+            # Per-seed permutation cannot be rebuilt here; refuse rather than write a different field under the same name.
             raise ValueError(
                 "This run trained with the velocity shuffle control; its velocity is "
                 "per-seed and cannot be reproduced here. Use --velocity real to score it "
@@ -351,10 +328,7 @@ def build_model_and_tensors(
         V, _ = apply_velocity_ablation(V, None, run_cfg)
     velocity_weight_np = build_velocity_weight(rna_adata, S_np, run_cfg, use_feature_space)
     V_eff_t = to_tensor(build_effective_velocity(V, velocity_weight_np, run_cfg), device)
-    # This tool overwrites each run's diagnostics_<ckpt>.json, so it has to reproduce the
-    # cross-backend velocity cosine too — otherwise re-evaluating a run silently strips it.
-    # Checkpoint-independent (the velocity is fixed input), so it is computed once here.
-    # Reads the comparison h5ad once here; other tools discard it.
+    # Overwrite diagnostics so re-eval does not strip the cross-backend cosine.
     velocity_backend = (
         compute_velocity_backend_agreement(rna_adata, V, run_cfg, velocity_weight_np)
         if with_velocity_backend else {}
@@ -399,14 +373,7 @@ def build_model_and_tensors(
     if fixed_beta_value is not None:
         set_fixed_beta(model, fixed_beta_value, D_p, device)
 
-    # The same validation slice the run itself used, so a re-evaluation scores the
-    # cells the run held out and not a fresh sample. Every input to the draw has to be
-    # read back from the run's own config: with val_split_per_seed the split is keyed
-    # on the run's SEED, and with val_stratify_by it is drawn per stratum, so passing
-    # the bare val_split_seed here would silently rebuild a different set of cells.
-    # diagnostics.json records val_split_digest; that is what this can be checked against.
-    # Only the fit-eligible random validation slice may populate val diagnostics.
-    # Group-held-out rows (Papalexi KO cells) are an OOD test set, not validation data.
+    # Same validation slice as the run. Group-held-out rows are OOD, not validation.
     val_mask = selection_validation_mask(rna_adata.obs, run_cfg, run_cfg.get("seed"))
     val_idx_t = (
         to_index_tensor(np.nonzero(val_mask)[0], device) if val_mask.any() else None
@@ -415,10 +382,6 @@ def build_model_and_tensors(
     return (model, R_t, V_eff_t, P_t, S_t, rna_adata.obs, mask_t, align_cols,
             velocity_backend, val_idx_t)
 
-
-# ---------------------------------------------------------------------------
-# Per-checkpoint evaluation
-# ---------------------------------------------------------------------------
 
 def evaluate_one_checkpoint(
     model,
@@ -436,7 +399,6 @@ def evaluate_one_checkpoint(
     """Load checkpoint into model, recompute diagnostics + per-cell arrays."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # Move state_dict to the model's device.
     target_device = R_t.device
     state_dict = {k: v.to(target_device) for k, v in ckpt["state_dict"].items()}
     model.load_state_dict(state_dict)
@@ -454,10 +416,6 @@ def evaluate_one_checkpoint(
     diagnostics["mean_foscttm"]      = mean_foscttm
     return diagnostics, per_cell
 
-
-# ---------------------------------------------------------------------------
-# Walk and evaluate
-# ---------------------------------------------------------------------------
 
 def artifact_suffix(velocity_mode: str, mapping_mode: str) -> str:
     """Name the diagnostics file after the inputs it was scored against.
@@ -520,7 +478,6 @@ def evaluate_run(run_folder: Path, device, save_percell: bool,
                         val_idx_t,
                     )
 
-                    # Per-checkpoint artifacts
                     suffix = artifact_suffix(velocity_mode, mapping_mode)
                     diag_out  = seed_dir / f"diagnostics_{ckpt_name}{suffix}.json"
                     with open(diag_out, "w") as f:
@@ -530,7 +487,6 @@ def evaluate_run(run_folder: Path, device, save_percell: bool,
                             seed_dir / f"foscttm_{ckpt_name}.csv", index=False,
                         )
 
-                    # Summary row
                     row = {
                         "run":                run_folder.name,
                         "model":              model_name,
@@ -554,7 +510,6 @@ def evaluate_run(run_folder: Path, device, save_percell: bool,
                         "beta_mean":          diagnostics["beta_mean"],
                         "beta_std":           diagnostics["beta_std"],
                     }
-                    # Include training-time losses if present (align, dyn, anchor, total)
                     losses = diagnostics.get("checkpoint_losses", {})
                     if isinstance(losses, dict):
                         for k, v in losses.items():
@@ -570,25 +525,18 @@ def evaluate_run(run_folder: Path, device, save_percell: bool,
     return rows
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def collect_run_folders(args) -> list[Path]:
     if not args.runs:
         return sorted(DEFAULT_RUN_DIR.glob("run_*"))
 
     folders: list[Path] = []
     for pattern in args.runs:
-        # Direct path?
         p = Path(pattern)
         if p.exists() and p.is_dir():
             folders.append(p)
             continue
-        # Glob pattern
         matches = sorted(Path(m) for m in glob(pattern))
         folders.extend([m for m in matches if m.is_dir()])
-    # Deduplicate while preserving order
     seen = set()
     unique = []
     for f in folders:

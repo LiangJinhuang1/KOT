@@ -1,38 +1,19 @@
 #!/bin/bash
 #
-# Submit a jobs file on however many GPUs are actually free, and step DOWN on a
+# Submit a jobs file on however many GPUs are actually free, and step down on a
 # preflight failure instead of retrying the same size.
-#
-# WHY THIS EXISTS. slurm/parallel_train.sh requeues itself when the CUDA preflight
-# fails, which is right when the allocation was unlucky -- but it asks for the SAME
-# number of GPUs every time. On 2026-08-28 that lost a whole night: srvcore3 has one
-# card stuck in fabric init (error 802), and while exactly 3 of 8 were free, a 3-GPU
-# request was FORCED onto it. All 12 requeues drew the same broken card and the job
-# died 8 h later having trained nothing. Asking for 2 succeeded on the first try.
-#
-# The rule this encodes: the request size is not a constant, it is whatever is free
-# right now, capped at what you are allowed to ask for -- and a preflight failure is
-# evidence to ask for LESS, not to ask again.
+# parallel_train.sh requeues at the same GPU count; a preflight failure is evidence to ask for less.
 #
 # Usage:
-#   bash slurm/submit_adaptive.sh jobs/archive/jobs_sweep_D.txt
-#   bash slurm/submit_adaptive.sh jobs/jobs_sweep_DH.txt --dependency afterok:12345
+#   bash slurm/submit_adaptive.sh jobs.txt
+#   bash slurm/submit_adaptive.sh jobs.txt --dependency afterok:12345
 #   bash slurm/submit_adaptive.sh jobs.txt --max-gpus 4 --min-gpus 1 --max-parallel 16
-#   bash slurm/submit_adaptive.sh jobs.txt --gpu-order b200,a100     # try b200, fall back
+#   bash slurm/submit_adaptive.sh jobs.txt --gpu-order b200,a100
 #
-# GPU TYPE FALLBACK. b200 (srvcore3, 8) and a100 (srvdgx1 8 + srvdrai2 2) are separate
-# pools with separate QOS caps, so one can be saturated while the other is idle. The
-# script now walks --gpu-order in sequence and submits to the first type with a free card,
-# instead of queueing behind a full pool while another sits empty.
+# b200 and a100 are separate pools; walk --gpu-order so a full pool does not hide an idle one.
+# Only b200, a100 and a100_10gb pass the submit filter; a100_10gb matches no real gres.
 #
-# Only b200, a100 and a100_10gb pass the cluster submit filter, and a100_10gb matches no
-# real gres on any node -- srvdrai2's MIG slices are `nvidia_a100_80gb_pcie_1g.10gb` and
-# its two RTX Pro 6000 Blackwells are `nvidia_rtx_pro_6000_blackwell_server_edition`.
-# Those 9 cards are therefore idle but unreachable; ask the admins to add the filter
-# aliases if they are ever needed.
-#
-# Run it in the background -- it polls until the job clears its preflight:
-#   nohup bash slurm/submit_adaptive.sh jobs/archive/jobs_sweep_D.txt > logs/adaptive_D.log 2>&1 &
+#   nohup bash slurm/submit_adaptive.sh jobs.txt > logs/adaptive.log 2>&1 &
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -61,10 +42,7 @@ while [ $# -gt 0 ]; do
 done
 [ -f "${JOBS_FILE}" ] || { echo "no such jobs file: ${JOBS_FILE}" >&2; exit 1; }
 
-# Free GPUs of this type on this node: configured minus allocated. A node with nothing
-# allocated has no gres entry in AllocTRES at all, hence the :-0 defaults.
-# Free cards of one type, summed over EVERY node that has them: a100 lives on two nodes,
-# so counting a single node would report a pool as full while the other one is idle.
+# Configured minus allocated, summed over every node of this type. A node with nothing allocated has no AllocTRES gres entry, hence :-0.
 free_of_type() {
   local type="$1" total=0 node cfg alloc
   for node in $(sinfo -h -N -o "%N" | sort -u); do
@@ -80,7 +58,7 @@ free_of_type() {
 
 free_gpus() { free_of_type "${GRES}"; }
 
-# First type in --gpu-order with at least MIN_GPUS free; empty when every pool is full.
+# First type in --gpu-order with at least MIN_GPUS free.
 pick_gpu_type() {
   local type
   for type in $(echo "${GPU_ORDER}" | tr ',' ' '); do
@@ -89,8 +67,7 @@ pick_gpu_type() {
   echo ""
 }
 
-# Wait for at least MIN_GPUS to be free, so the first request is sized to reality
-# rather than to a number picked before anyone else's job finished.
+# Wait for at least MIN_GPUS so the first request is sized to what is free now.
 waited=0
 while :; do
   chosen=$(pick_gpu_type)
@@ -112,15 +89,13 @@ echo "[adaptive] chose ${GRES} from [${GPU_ORDER}]: ${free} free; starting at ${
 
 while [ "${n}" -ge "${MIN_GPUS}" ]; do
   dep_flag=(); [ -n "${DEPENDENCY}" ] && dep_flag=(--dependency="${DEPENDENCY}")
-  # CUDA_PREFLIGHT_REQUEUE=0 so a bad allocation EXITS (code 44) instead of requeueing
-  # at the same size -- stepping down is this script's job, not the batch script's.
+  # CUDA_PREFLIGHT_REQUEUE=0 so this script owns the step-down instead of retrying the same size.
   jid=$(sbatch --parsable "${dep_flag[@]}" \
         --gres="gpu:${GRES}:${n}" \
         --export=ALL,JOBS_FILE="${JOBS_FILE}",MAX_PARALLEL="${MAX_PARALLEL}",CUDA_PREFLIGHT_REQUEUE=0 \
         slurm/parallel_train.sh)
   echo "[adaptive] submitted ${jid} with ${n} GPU(s) for ${JOBS_FILE}"
 
-  # Poll until the job either clears its preflight (success: it is training) or exits.
   while true; do
     state=$(sacct -j "${jid}" --format=State -X -n -P 2>/dev/null | head -1 | tr -d ' ')
     case "${state}" in

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""One row per anchor-count rung. Alignment and scale lived in three files;
-unanchored β error lived in none — that group decides whether the prior
-calibrates the model or only the proteins it names. Split on lr_beta: the
-two rates are not the same experiment.
+"""One row per anchor-count rung. Unanchored β error decides whether the prior
+calibrates the model or only the proteins it names. Split on lr_beta: the two rates are not the same experiment.
 """
 from __future__ import annotations
 
@@ -50,8 +48,7 @@ def measured_targets(run_cfg: dict, protein_names: list, d_protein: int):
     return dict(keep)
 
 
-# Read straight out of the run's diagnostics: alignment on the left of the claim, the
-# kinetic scale on the right, and the anchored-side error anchor_diagnostics already scored.
+# Alignment, kinetic scale, and the anchored-side error already scored.
 RUN_METRICS = ["mean_foscttm", "val_foscttm", "kappa_median", "beta_median", "alpha_median",
                "jvp_rhs_cos_median", "beta_anchor_mean_abs_err"]
 
@@ -76,9 +73,7 @@ def rows_for_run(run_folder: Path, device, diagnostics_name: str):
                 run_folder, dataset_dir.name)
             if not run_cfg.get("beta_anchor_csv"):
                 continue
-            # Only for the kinetic mask: beta enters the ODE there, so that is where the
-            # prior can act at all, and anchored_protein_mask needs it to reproduce the
-            # run's own anchor set.
+            # Only for the kinetic mask: that is where the prior can act.
             built = build_model_and_tensors(
                 run_cfg, rna_adata, protein_adata, model_dir.name, device,
                 velocity_mode="real", mapping_mode="real", with_velocity_backend=False)
@@ -126,18 +121,9 @@ def rows_for_run(run_folder: Path, device, diagnostics_name: str):
 
 
 def claim_table(proteins: pd.DataFrame, seeds: pd.DataFrame) -> pd.DataFrame:
-    """One row per (dataset, lr_beta, rung): the alignment side and the scale side together.
+    """One row per (dataset, lr_beta, rung): alignment and scale together.
 
-    Columns are ordered as the claim reads. `foscttm` and `spearman`-like accuracy belong to
-    ALIGNMENT and should not move down the ladder; `kappa_median`, `beta_median` and
-    `beta_err_anchored` belong to the KINETIC SCALE and should. The deltas against rung 0 are
-    the comparison the claim actually rests on, so they are materialised rather than left for
-    the reader to subtract: a scale that moves while alignment does not is a direction the
-    data does not constrain.
-
-    kappa_beta is reported because it is what the ODE right-hand side depends on: kappa and
-    beta moving in opposite directions with a near-constant product is the degeneracy itself,
-    not two independent drifts.
+    Deltas against rung 0 are the comparison the claim rests on. kappa_beta is what the ODE sees.
     """
     per_seed = seeds.copy()
     per_seed["kappa_beta"] = per_seed["kappa_median"] * per_seed["beta_median"]
@@ -158,7 +144,7 @@ def claim_table(proteins: pd.DataFrame, seeds: pd.DataFrame) -> pd.DataFrame:
                   beta_err_anchored=("beta_anchor_mean_abs_err", "mean"))
              .join(err).reset_index())
 
-    # Everything is read against the prior-off rung, which is the run the claim compares to.
+    # Everything is read against the prior-off rung.
     table["rung"] = pd.to_numeric(table["beta_anchor_subset_n"], errors="coerce")
     base = table[table["rung"] == 0].set_index(["dataset", "lr_beta"])
     for column in ("foscttm", "kappa_median", "beta_median", "kappa_beta"):
@@ -168,12 +154,9 @@ def claim_table(proteins: pd.DataFrame, seeds: pd.DataFrame) -> pd.DataFrame:
 
 
 def paired_by_protein(frame: pd.DataFrame) -> pd.DataFrame:
-    """Each protein compared against ITSELF at rungs where it was not anchored.
+    """Each protein compared against itself at rungs where it was not anchored.
 
-    The ladder is nested, so a protein is anchored at the high rungs and not at the low
-    ones. Differencing within (dataset, lr_beta, seed, protein) removes the confound that
-    proteins with measured half-lives are not a random sample -- without it the anchored
-    group looks better simply because it is a different, better-characterised set.
+    Differencing within protein removes the confound that anchored proteins are not a random sample.
     """
     keys = ["dataset", "lr_beta", "seed", "protein"]
     wide = frame.groupby(keys + ["anchored"])["abs_err"].mean().unstack("anchored")

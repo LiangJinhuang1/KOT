@@ -17,12 +17,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-
-
-# ============================================================================
-# runs
-# ============================================================================
-
 KEY_COLUMNS = ["dataset", "fitted_side", "lr_phi", "lr_alpha_kappa", "lr_beta",
                "lambda_dyn", "lr_warmup_epochs", "sinkhorn_reg"]
 
@@ -83,9 +77,7 @@ def summarize(rows: list[dict], extra: list[str]) -> list[dict]:
         record["seeds"] = len(seeds[key])
         for name in RUNS_METRICS:
             values = groups[key][name]
-            # Blank, not zero, when a metric was never written: summary.csv leaves
-            # foscttm_test empty for runs with no held-out complement, and a 0.0
-            # there would read as a perfect score.
+            # A missing score must not look like a perfect zero.
             mean, sd = runs_mean_sd(values) if values else ("", "")
             record[f"{name}_mean"] = round(mean, 4) if values else ""
             record[f"{name}_sd"] = round(sd, 4) if values else ""
@@ -111,8 +103,6 @@ def runs_main() -> None:
     fieldnames = KEY_COLUMNS + extra + ["seeds"]
     for name in RUNS_METRICS:
         fieldnames += [f"{name}_mean", f"{name}_sd"]
-    # summary.csv orders the metric block as fitted, test, cos, relresid, anchor —
-    # already the RUNS_METRICS insertion order — but ranks rows by the fitted FOSCTTM.
     records.sort(key=lambda r: (r["dataset"], r["fitted_side"],
                                 r["foscttm_fitted_mean"] if r["foscttm_fitted_mean"] != "" else 9.9))
     with open(args.out_csv, "w", newline="") as handle:
@@ -121,10 +111,6 @@ def runs_main() -> None:
         writer.writerows(records)
     print(f"Wrote {args.out_csv}: {len(records)} config rows, {len(fieldnames)} columns")
 
-
-# ============================================================================
-# ablations
-# ============================================================================
 
 ABLATIONS_METRICS = ["mean_foscttm", "val_foscttm", "branch_accuracy", "branch_accuracy_branched",
            "jvp_rhs_cos_median", "rel_residual_median", "loss_dyn", "loss_align",
@@ -185,8 +171,7 @@ def ablations_main():
     rows = []
     for config, group in frame.groupby(keys, dropna=False):
         config = config if isinstance(config, tuple) else (config,)
-        # Every arm is reported against the real arm of its OWN config, so a delta never
-        # crosses a dataset or a learning rate.
+        # Every arm vs the real arm of its own config, so a delta never crosses a dataset or learning rate.
         real = group[group["arm"] == "real"]
         for arm in sorted(group["arm"].unique(),
                           key=lambda a: (ARM_ORDER.index(a) if a in ARM_ORDER else 99, a)):
@@ -213,10 +198,6 @@ def ablations_main():
     print(out[[c for c in show if c in out.columns]].to_string(
         index=False, float_format=lambda v: f"{v:.4f}"))
 
-
-# ============================================================================
-# winner
-# ============================================================================
 
 def read_csv(path):
     with open(path, newline="") as handle:
@@ -318,11 +299,6 @@ def winner_main() -> int:
     return 0
 
 
-
-# ============================================================================
-# predictions
-# ============================================================================
-
 PREDICTIONS_DIR = Path("data/predictions")
 
 
@@ -361,10 +337,6 @@ def predictions_main() -> int:
     print(f"\nSaved: {out}")
     return 0
 
-
-# ============================================================================
-# dispatch
-# ============================================================================
 
 COMMANDS = {"runs": runs_main, "ablations": ablations_main, "winner": winner_main,
             "predictions": predictions_main}

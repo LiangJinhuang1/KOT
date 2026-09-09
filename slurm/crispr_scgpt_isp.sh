@@ -9,14 +9,8 @@
 #SBATCH --output=logs/crispr_scgpt_isp_%A_%a.log
 #SBATCH --array=0-2%3
 # Submit: sbatch slurm/crispr_scgpt_isp.sh FROZEN_KOT_RUN NEW_OUTPUT_ROOT
-# scGPT lives in cache/.scgpt_venv, a --system-site-packages venv over
-# codedev_v1.0.5.sif. Never install it into the container: it pins scvi-tools 0.20.3
-# against the container's 1.2.0 and would break RegVelo.
-# Weights are the scGPT_human release (33M cells) mirrored on HuggingFace, fetched to
-# cache/scgpt: args.json, vocab.json, best_model.pt (208 MB) from
-#   https://huggingface.co/MohamedMabrouk/scGPT/resolve/main/<file>
-# scGPT reuses the GEARS PertData path, so the same three Dataverse assets must be
-# staged in the per-seed cache; see slurm/crispr_gears_isp.sh for the curl commands.
+# Never install scGPT into the container: it pins scvi-tools 0.20.3 against the container's 1.2.0 and would break RegVelo.
+# scGPT reuses the GEARS PertData path; stage the same Dataverse assets per seed (see crispr_gears_isp.sh).
 set -euo pipefail
 if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then cd "$SLURM_SUBMIT_DIR"; else cd "$(dirname "$0")/.."; fi
 run_dir="${1:?Provide frozen NT-only KOT run directory}"

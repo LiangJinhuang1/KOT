@@ -9,12 +9,8 @@
 #SBATCH --output=logs/crispr_regvelo_isp_%A_%a.log
 #SBATCH --array=0-2%3
 # Submit: sbatch slurm/crispr_regvelo_isp.sh FROZEN_KOT_RUN NEW_OUTPUT_ROOT
-# Uses /data/common/images/codedev_v1.0.5.sif, where RegVelo is already installed.
 # RegVelo and every learned preprocessing statistic see NT cells only.
-# Its published regulon-KO definition silences outgoing TF edges; non-TF knockouts
-# without learned outgoing edges are excluded and written to coverage.csv.
-# Counterfactual RNA is converted back into frozen KOT Ms coordinates, then scored at
-# RNA level and through the unchanged NT-only KOT checkpoint.
+# Non-TF knockouts without learned outgoing edges are excluded and written to coverage.csv.
 set -euo pipefail
 if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then cd "$SLURM_SUBMIT_DIR"; else cd "$(dirname "$0")/.."; fi
 run_dir="${1:?Provide frozen NT-only KOT run directory}"

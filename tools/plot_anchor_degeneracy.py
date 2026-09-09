@@ -66,13 +66,11 @@ for row, (cfg, _) in enumerate(CFGS):
                 fontsize=mpl.rcParams["legend.fontsize"], color="0.35")
         panel_letter(ax, next(letters), dx=-0.085, dy=1.03)
 
-# Row-band headers (§7.4) on the right, where nothing else lives.
 for row, (_, cfg_label) in enumerate(CFGS):
     box = axes[row, 1].get_position()
     fig.text(box.x1 + 0.018, (box.y0 + box.y1) / 2, cfg_label, rotation=270,
              va="center", ha="left", fontsize=mpl.rcParams["axes.titlesize"])
 
-# Series identity: one frameless legend in panel (a)'s upper whitespace (§7.3, §4.6).
 handles = [mpl.lines.Line2D([], [], color=c, lw=lw, marker="o", ms=3.2,
                             mec="white", mew=0.6, label=lab)
            for _, lab, c, lw in SERIES]

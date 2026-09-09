@@ -194,6 +194,53 @@ def peak_to_gene_rows(features: pd.DataFrame, annotation: pd.DataFrame,
     return rows
 
 
+CHROMATIN_TRANSFORMS = ["as_is", "cp10k_log1p", "tfidf_lsi"]
+TFIDF_LSI_COMPONENTS = 50
+
+
+def tfidf_lsi(counts, n_components: int = TFIDF_LSI_COMPONENTS, seed: int = 0) -> np.ndarray:
+    """TF-IDF then an LSI reconstruction, still one column per gene.
+
+    The LSI COMPONENTS would be the usual ATAC representation, but G maps gene columns to
+    gene columns and phi's affine path is `c @ G.T`, so the reconstruction in gene space is
+    what can be fed through the same fixed projection. Truncating to `n_components` is what
+    removes the depth axis: measured on the run panels, PC1 of the untransformed gene
+    activity correlates r = +0.994 (bmmc) / +0.997 (hspc) with per-cell read depth, while
+    the RNA target's PC1 correlates only +0.24 / +0.30 with its own.
+    """
+    binary = sparse.csr_matrix(counts, dtype=np.float32)
+    binary.data = np.ones_like(binary.data)
+    depth = np.asarray(binary.sum(axis=1)).ravel()
+    depth[depth == 0] = 1.0
+    detected = np.asarray(binary.sum(axis=0)).ravel()
+    idf = np.log1p(binary.shape[0] / np.maximum(detected, 1.0))
+    weighted = sparse.diags(1.0 / depth) @ binary @ sparse.diags(idf)
+    dense = np.log1p(weighted.toarray() * 1e4).astype(np.float32)
+    centre = dense.mean(axis=0, keepdims=True)
+    left, singular, right = randomized_svd(dense - centre, n_components=n_components,
+                                           random_state=seed)
+    return ((left * singular) @ right + centre).astype(np.float32)
+
+
+def chromatin_features(adata: ad.AnnData, transform: str = "as_is") -> np.ndarray:
+    """phi's input c, under a named normalisation of the gene-activity matrix.
+
+    v_c is a DISPLACEMENT in this space, not an independent field, so the `velocity` stage
+    and the `train` stage must be given the same transform or the JVP is read along a
+    direction from a different coordinate system. The velocity cache records which one it
+    was built with and training refuses to proceed against a mismatch.
+    """
+    if transform not in CHROMATIN_TRANSFORMS:
+        raise ValueError(f"unknown chromatin transform {transform!r}; "
+                         f"expected one of {CHROMATIN_TRANSFORMS}")
+    if transform == "as_is":
+        return np.asarray(adata.obsm["gene_activity"], dtype=np.float32)
+    counts = adata.obsm["gene_activity_counts"]
+    if transform == "cp10k_log1p":
+        return normalize_log(counts)
+    return tfidf_lsi(counts)
+
+
 def normalize_log(matrix, target_sum: float = 1e4) -> np.ndarray:
     """Per-cell library-size normalisation then log1p, as a dense float32 matrix.
 
@@ -205,6 +252,22 @@ def normalize_log(matrix, target_sum: float = 1e4) -> np.ndarray:
     totals[totals == 0] = 1.0
     scaled = sparse.diags(target_sum / totals) @ counts
     return np.log1p(scaled.toarray()).astype(np.float32)
+
+
+def splicing_norm_ratio(adata) -> np.ndarray:
+    """a_s / a_u per cell — the factor the relay law's beta*u term picks up.
+
+    `normalize_log` scales every layer to `target_sum` INDEPENDENTLY, so the model's
+    coordinates are x_u = a_u u_raw and x_s = a_s s_raw with two different per-cell
+    factors, and a_s/a_u = sum_u/sum_s. Computed here exactly as normalize_log computes
+    the factors it inverts, zero rows floored the same way.
+    """
+    totals = {}
+    for name in ("unspliced", "spliced"):
+        total = np.asarray(sparse.csr_matrix(adata.layers[name]).sum(axis=1)).ravel()
+        total[total == 0] = 1.0
+        totals[name] = total
+    return (totals["unspliced"] / totals["spliced"]).astype(np.float32)
 
 
 def lsi_embedding(peaks: sparse.csr_matrix, n_components: int, seed: int) -> np.ndarray:

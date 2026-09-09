@@ -44,8 +44,7 @@ def stamp_from_run(run_dir: Path, model: str, n_cells: int) -> dict:
     run_cfg = load_yaml(run_dir / "run_config.yaml")["run_cfg"]
     fit_key = str(run_cfg.get("fit_obs_key") or "")
     diagnostics = json.loads((run_dir / "diagnostics.json").read_text())
-    # n_train_cells is the split's own count, written by run_kot. Baselines do not write
-    # it, so a restricted baseline reports its fitted count as unknown rather than wrong.
+    # n_train_cells is the split's own count. Baselines do not write it, so unknown rather than wrong.
     n_fit = diagnostics.get("n_train_cells", -1) if fit_key else n_cells
     mode = resolve_oos_mode(model)
     return {

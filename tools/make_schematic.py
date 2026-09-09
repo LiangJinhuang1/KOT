@@ -11,12 +11,11 @@ from sklearn.decomposition import PCA
 
 from src.data.synthetic_linked_ode import stage_output_paths
 
-# 100 user units = 1 inch, so the file is authored at final printed size.
 W, H = 550, 232
 RNA, PROT, KOT = "#5D3A9B", "#9C6500", "#0072B2"
 GREY, RULE, INK = "#767676", "#CFCFCF", "#1A1A1A"
 FONT = "Liberation Sans, Arial, Helvetica, sans-serif"
-BASE, SMALL, TINY = 11, 9.5, 8.5     # 8pt / 7pt / 6pt at 100 units per inch
+BASE, SMALL, TINY = 11, 9.5, 8.5
 
 
 # Asymmetric on purpose (RNA under cache/velocity/, protein under cache/) — taken
@@ -113,7 +112,6 @@ def build() -> str:
     out.append('  </defs>')
     out.append(f'  <rect width="{W}" height="{H}" fill="white"/>')
 
-    # ---------------------------------------------------------------- inputs
     out.append('  <g id="inputs">')
     out.append(text(14, 24, "RNA cells", size=BASE, color=RNA, weight="600"))
     out.append(text(14, 36, "state r  +  velocity v", size=SMALL, color=GREY))
@@ -155,7 +153,6 @@ def build() -> str:
             out.append(dots(px, py, PROT))
     out.append('  </g>')
 
-    # ------------------------------------------------------------------- phi
     out.append('  <g id="phi">')
     out.append(f'    <rect x="150" y="96" width="54" height="30" rx="3" '
                f'fill="none" stroke="{KOT}" stroke-width="1.3"/>')
@@ -167,7 +164,6 @@ def build() -> str:
                     style="italic"))
     out.append('  </g>')
 
-    # ------------------------------------------------- shared protein space
     out.append('  <g id="shared">')
     out.append(f'    <rect x="248" y="42" width="152" height="166" rx="3" '
                f'fill="none" stroke="{RULE}" stroke-width="0.8"/>')
@@ -189,13 +185,13 @@ def build() -> str:
             out.append(dots(base_x, base_y, PROT, r=1.5, opacity=0.5))
             out.append(dots(base_x, base_y, RNA, r=1.4, opacity=0.5))
 
-    # Constraint 1 — Sinkhorn acts on the whole cloud.
+    # Sinkhorn acts on the whole cloud.
     out.append(f'    <ellipse cx="326" cy="128" rx="70" ry="48" fill="none" '
                f'stroke="{GREY}" stroke-width="0.9" stroke-dasharray="4 2.5"/>')
     out.append(text(324, 200, "Sinkhorn matches the cloud", size=TINY, color=GREY,
                     anchor="middle"))
 
-    # Constraint 2 — the kinetics term acts on the direction of one cell's arrow.
+    # Kinetics term acts on one cell's arrow.
     cx, cy = 340, 74
     out.append(f'    <circle cx="{cx}" cy="{cy}" r="16" fill="white" '
                f'fill-opacity="0.9" stroke="{KOT}" stroke-width="1" '
@@ -210,7 +206,6 @@ def build() -> str:
                     anchor="end"))
     out.append('  </g>')
 
-    # ---------------------------------------------------- right-hand column
     out.append('  <g id="constraint">')
     out.append(arrow(432, 72, 406, 72, INK, 1.0))
     out.append(text(436, 62, "the kinetics term", size=SMALL, color=INK, weight="600"))
@@ -219,7 +214,7 @@ def build() -> str:
 
     out.append(f'    <line x1="436" y1="108" x2="540" y2="108" stroke="{RULE}" '
                f'stroke-width="0.8"/>')
-    # Compact form: the full expression does not fit the column at a legible size.
+    # Compact form: the full expression does not fit at a legible size.
     out.append(text(436, 126, "J&#966;&#183;v = &#954;(&#945;&#183;Sr &#8722; &#946;&#183;&#966;)",
                     size=BASE, color=INK))
     out.append(text(436, 144, "&#954;  time-scale", size=TINY, color=GREY))

@@ -45,10 +45,6 @@ from src.data.preprocessing import load_and_preprocess_cached
 from src.utils.io import load_yaml
 
 
-# ============================================================================
-# adt_mapping
-# ============================================================================
-
 ADT_MAPPING_DATASETS_CONFIG = Path("config/datasets.yaml")
 
 
@@ -99,8 +95,7 @@ def adt_mapping_write_mapping(name: str, meta: dict, kinetic_complex_allow=None)
         print(f"[{name}] WARNING: dropped {len(dropped)} duplicate ADT name(s): "
               f"{sorted(set(dropped))}")
 
-    # complex_curated markers (representative-chain approximations, e.g. CD3→CD3E)
-    # are kinetics-eligible only if named here; one_to_one are eligible automatically.
+    # complex_curated markers are kinetics-eligible only if named here; one_to_one are eligible automatically.
     allow = kinetic_complex_allow or meta.get("kinetic_complex_allow")
     rows = build_mapping_rows(unique_names, rna_var_names(meta), kinetic_complex_allow=allow)
     df = pd.DataFrame(rows)
@@ -111,7 +106,6 @@ def adt_mapping_write_mapping(name: str, meta: dict, kinetic_complex_allow=None)
     out = ADT_MAPPING_OUT_DIR / f"adt_mapping_{name}.csv"
     df.to_csv(out, index=False)
 
-    # Short summary for a manual double-check.
     n        = len(df)
     align    = int(df["use_for_alignment"].sum())
     kin      = int(df["use_for_kinetics"].sum())
@@ -146,10 +140,6 @@ def adt_mapping_main() -> None:
             continue
         adt_mapping_write_mapping(name, meta, kinetic_complex_allow=allow)
 
-
-# ============================================================================
-# anchors
-# ============================================================================
 
 ANCHORS_LN2 = math.log(2.0)
 
@@ -197,10 +187,6 @@ def anchors_main() -> None:
     if len(out):
         print(out[["protein_name", "gene_symbol", "half_life_hours", "beta_per_hour"]].to_string(index=False))
 
-
-# ============================================================================
-# halflife
-# ============================================================================
 
 HALFLIFE_LN2 = math.log(2)
 
@@ -259,15 +245,12 @@ def load_mathieson(path: Path) -> pd.DataFrame:
 
 
 def mathieson_rows_for_gene(math_df: pd.DataFrame, gene: str, cell_types: list[str]) -> list[dict]:
-    """One row per (gene, cell_type). Multiple gene_name hits are resolved, not
-    silently taken as iloc[0]: several rows for one gene can be the same protein
-    measured repeatedly (keep and aggregate) or distinct accessions (ambiguous →
-    skip). One row per cell_type is produced by aggregating across the kept rows."""
+    """One row per (gene, cell_type). Duplicate gene_name hits are resolved, not taken as iloc[0]."""
     key = gene.upper()
     hits = math_df.loc[math_df["gene_name"].astype(str).str.upper() == key]
     if hits.empty:
         return []
-    # Distinct protein accessions for the same gene → ambiguous; do not guess.
+    # Distinct protein accessions for the same gene: do not guess.
     if "uniprot_id" in hits.columns:
         acc = hits["uniprot_id"].dropna().astype(str).str.strip()
         acc = acc[acc != ""]
@@ -278,7 +261,6 @@ def mathieson_rows_for_gene(math_df: pd.DataFrame, gene: str, cell_types: list[s
     out = []
     for ct in cell_types:
         hl_cols, r2_cols = MATHIESON_CELL_TYPES[ct]
-        # aggregate across ALL matching rows × replicate columns → one value per cell type
         t_half = mean_positive([hits.iloc[k][c] for k in range(len(hits)) for c in hl_cols])
         if t_half is None:
             continue
@@ -316,8 +298,7 @@ def load_tcell_table(
             f"T-cell table needs columns '{gene_col}' and '{half_life_col}'. "
             f"Got: {list(df.columns)}"
         )
-    # Group by gene so duplicate rows for one gene do NOT overwrite each other
-    # (a dict assignment would keep only the last). Aggregate to one T-cell row/gene.
+    # Do not silently overwrite duplicate genes; aggregate to one T-cell row per gene.
     groups: dict[str, list[tuple[float, float | None]]] = {}
     for _, row in df.iterrows():
         gene = str(row[gene_col]).strip().upper()
@@ -488,10 +469,6 @@ def halflife_main() -> None:
     print(f"[anchors] rows by cell_type: {by_ct}")
 
 
-# ============================================================================
-# coverage
-# ============================================================================
-
 COVERAGE_DATASETS_CONFIG = Path("config/datasets.yaml")
 
 
@@ -520,8 +497,7 @@ SUMMARY_COLS = [
 
 
 def mapping_path_for(dataset: str, meta: dict, train_cfg: dict) -> Path:
-    # Use exactly the mapping CSV training uses: prefer the training.yaml dataset
-    # block, then datasets.yaml, then a dataset-specific file, then the base panel.
+    # Use exactly the mapping CSV training uses.
     for block in ((train_cfg.get("datasets") or {}).get(dataset), meta):
         if block and block.get("adt_mapping_csv"):
             return Path(block["adt_mapping_csv"])
@@ -533,9 +509,7 @@ def mapping_path_for(dataset: str, meta: dict, train_cfg: dict) -> Path:
 
 def anchor_proteins(dataset: str, override: str | None, train_cfg: dict,
                     panel_names: list[str]) -> tuple[set[str], str | None]:
-    """ADT names the run ACTUALLY anchors — via the same resolver training uses
-    (resolve_beta_anchors: name-normalization, quality/stability filters, aggregation),
-    so the count matches diagnostics beta_anchor_n, not a raw CSV membership."""
+    """ADT names the run actually anchors, via the same resolver training uses."""
     block = (train_cfg.get("datasets") or {}).get(dataset) or {}
     path = override or block.get("beta_anchor_csv")
     if path is None:
@@ -597,9 +571,7 @@ def dynamical_fit_set(rna) -> set[str]:
 
 
 def quality_pass_set(rna, min_quality: float) -> set[str]:
-    """Genes whose velocity fit R² clears a threshold. Use an explicit R² column only
-    (velocity_r2 / fit_r2 / r2), NOT fit_likelihood — a likelihood is not an R² and is
-    not comparable to a --velocity-min-r2 threshold."""
+    """Genes whose velocity fit R² clears a threshold. Likelihood is not an R²."""
     q = var_column(rna, ("velocity_r2", "fit_r2", "r2"))
     if q is None:
         return set()
@@ -642,8 +614,7 @@ def build_detail_rows(records, rna, anchored, min_quality: float, require_veloci
     spliced, unspliced, vel_est = pres["spliced"], pres["unspliced"], pres["velocity"]
     vgene = var_bool_set(rna, "velocity_genes")
     backend = velocity_backend_name(rna)
-    # scVelo's dynamical model has a per-gene fit/fail mode; RegVelo is one joint
-    # GRN-ODE backend, so finite non-zero velocity is the usable backend-specific signal.
+    # scVelo has a per-gene fit/fail mode; RegVelo is one joint GRN-ODE, so finite non-zero velocity is the usable signal.
     has_dynamical = backend.startswith("scvelo")
     fit_ok = dynamical_fit_set(rna) if has_dynamical else set()
     qual_ok = quality_pass_set(rna, min_quality) if has_dynamical else set()
@@ -663,12 +634,8 @@ def build_detail_rows(records, rna, anchored, min_quality: float, require_veloci
             dyn_fit = velocity_estimated
             velocity_quality = velocity_estimated
         if has_dynamical:
-            # scVelo: keep the stricter report that separates its velocity filter,
-            # per-gene dynamical fit, and fit-quality threshold.
             velocity_usable = bool(velocity_gene and dyn_fit and velocity_quality)
         else:
-            # Joint ODE backends such as RegVelo have no per-gene fit columns; a
-            # finite non-zero velocity is the backend-specific usable signal.
             velocity_usable = bool(velocity_estimated)
         runtime_mask = bool(eligible and retained and (velocity_gene or not require_velocity_gene))
         strict_mask = bool(eligible and retained and velocity_usable)
@@ -677,16 +644,16 @@ def build_detail_rows(records, rna, anchored, min_quality: float, require_veloci
             "gene_symbol":                gene,
             "mapping_type":               r["mapping_type"],
             "velocity_backend":           backend,
-            "curated_kinetic_eligible":   eligible,               # use_for_kinetics (curation)
+            "curated_kinetic_eligible":   eligible,
             "present_in_rna":             r["present_in_rna"] is True,
             "spliced_present":            gu in spliced,
             "unspliced_present":          gu in unspliced,
-            "retained":                   retained,               # in the final velocity matrix
-            "velocity_estimated":         velocity_estimated,     # a velocity value exists
-            "velocity_gene":              velocity_gene,          # scVelo velocity_genes flag
-            "dynamical_fit_success":      dyn_fit,                # recover_dynamics fit this gene
-            "velocity_quality":           velocity_quality,       # fit quality >= threshold
-            "velocity_usable":            velocity_usable,        # derived: all three above
+            "retained":                   retained,
+            "velocity_estimated":         velocity_estimated,
+            "velocity_gene":              velocity_gene,
+            "dynamical_fit_success":      dyn_fit,
+            "velocity_quality":           velocity_quality,
+            "velocity_usable":            velocity_usable,
             "require_velocity_gene":       require_velocity_gene,
             "alignment_active":           r["use_for_alignment"],
             "final_runtime_kinetic_mask":  runtime_mask,
@@ -797,14 +764,8 @@ def coverage_main() -> None:
         run_one(name, meta, train_cfg, args.anchor_csv, args.velocity_min_r2)
 
 
-# ============================================================================
-# grn
-# ============================================================================
-
 def build_dorothea(organism: str, levels: list[str]) -> pd.DataFrame:
-    # decoupler 2.x: network getters live under dc.op; DoRothEA columns are
-    # source (TF), target (gene), weight (signed), confidence (A–E). Filter on
-    # the confidence column so this works regardless of the getter's signature.
+    # decoupler 2.x: network getters live under dc.op; filter on the confidence column.
     net = dc.op.dorothea(organism=organism)
     net = net[net["confidence"].isin(levels)]
     out = pd.DataFrame({
@@ -831,20 +792,16 @@ def grn_main() -> None:
           f"{net['target'].nunique()} targets → {args.out}")
 
 
-# ============================================================================
-# papalexi
-# ============================================================================
-
 ADT_GENE_MAP = {
-    "CD86": "CD86",       # CD86 costimulatory ligand
-    "PDL1": "CD274",      # PD-L1
-    "PDL2": "PDCD1LG2",   # PD-L2
-    "CD366": "HAVCR2",    # TIM-3
+    "CD86": "CD86",
+    "PDL1": "CD274",
+    "PDL2": "PDCD1LG2",
+    "CD366": "HAVCR2",
 }
 
 
 def normalize_core(barcode: str) -> str:
-    """Core 16bp cell barcode: drop a lane prefix (l1_) and a 10x suffix (-1)."""
+    """Drop a lane prefix and a 10x suffix so cores can be compared across lanes."""
     return str(barcode).split("_")[-1].split("-")[0]
 
 
@@ -947,7 +904,7 @@ def add_umap(rna: ad.AnnData) -> None:
 
 
 def build_protein(adt: pd.DataFrame, cell_ids) -> ad.AnnData:
-    """Protein h5ad: 4 ADTs x matched cells, tagged feature_types=ADT for the loader."""
+    """Protein h5ad tagged feature_types=ADT for the loader."""
     cols = [c for c in cell_ids if c in adt.columns]
     sub = adt[cols].T  # cells x proteins
     protein = ad.AnnData(X=sparse.csr_matrix(sub.to_numpy().astype("float32")))
@@ -1027,12 +984,6 @@ def papalexi_main() -> None:
     papalexi_write_mapping(args.mapping_out, gene_alias_set(rna.var_names, rna.var))
 
 
-
-# ============================================================================
-# preprocess
-# ============================================================================
-
-
 def preprocess_main() -> None:
     """Build the preprocessed cache for every configured dataset."""
     parser = argparse.ArgumentParser(
@@ -1056,21 +1007,13 @@ def preprocess_main() -> None:
         )
 
 
-# ============================================================================
-# barcode_map
-# ============================================================================
-
 BARCODE_MAP_OUT_DIR = Path("cache/results/mapping")
 
 
 def barcode_map_rows(report_path: Path, original_h5ad: Path, assay: str) -> list[dict]:
-    """One row per STARsolo sample: which obs-name suffix its batch uses, and how many
-    of its barcodes that actually matches.
+    """One row per STARsolo sample: which obs-name suffix its batch uses.
 
-    The suffix is not uniform across the BMMC multiome batches (`-1-s1d1`, `-s2d4`,
-    `-10-s3d3`, `-14-s3d10`), so guessing it drops whole batches without erroring. Writing
-    it down makes the correspondence reviewable before a merge is trusted — the same
-    reason the ADT panel has a mapping CSV instead of a lookup buried in the loader.
+    The suffix is not uniform across batches, so guessing it drops whole batches without erroring.
     """
     report = read_report(report_path)
     original = sc.read_h5ad(original_h5ad, backed="r")
@@ -1129,11 +1072,6 @@ def barcode_map_main() -> None:
     print(f"wrote {out}")
 
 
-# ============================================================================
-# chromatin_gene_map
-# ============================================================================
-
-
 def chromatin_gene_map_main() -> None:
     """Print the chromatin→RNA gene map for review, from the prepared dataset.
 
@@ -1161,10 +1099,6 @@ def chromatin_gene_map_main() -> None:
     for reason, count in frame.loc[~frame["use_for_kinetics"], "excluded_because"].value_counts().items():
         print(f"    {count:>6}  {reason or '(none)'}")
 
-
-# ============================================================================
-# dispatch
-# ============================================================================
 
 COMMANDS = {
     "adt-mapping": adt_mapping_main,

@@ -1,25 +1,13 @@
 #!/bin/bash
 #
-# Run the whole hyperparameter search end to end, freezing each round's winner into the
-# next one's job lines. Four rounds:
-#
-#   k0  lr warmup x run length                        12 jobs
-#   k   joint lr_phi x lr_alpha_kappa x lr_beta x lambda_dyn   162 jobs
-#   i   the fine 1..1000 lambda ladder, on round k's top TWO lr triples   28 jobs
-#   fin the winner and the incumbent on the 8 seeds the search never saw   4 jobs
-#
-# Each round is its own sbatch, so the 7 h wall limit applies per round rather than to
-# the chain. Between rounds this collects the round, applies tools/pick_sweep_winner.py,
-# and generates the next jobs file from what it picked -- so a round's job lines carry
-# the whole resolved config and nothing is inherited implicitly.
-#
-# The chain STOPS rather than guessing if a round dies, produces no usable cell, or
-# comes back with every cell flagged. Restart it from a later round with --from.
+# Run the hyperparameter search end to end, freezing each round's winner into the next.
+# Each round is its own sbatch so the wall limit applies per round.
+# Stops rather than guessing if a round dies. Restart with --from.
 #
 # Usage:
 #   nohup setsid bash slurm/run_sweep_chain.sh > logs/chain.log 2>&1 &
-#   bash slurm/run_sweep_chain.sh --adopt-k0 4206208     # reuse an in-flight round 0
-#   bash slurm/run_sweep_chain.sh --from k               # skip ahead
+#   bash slurm/run_sweep_chain.sh --adopt-k0 <jobid>
+#   bash slurm/run_sweep_chain.sh --from k
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,7 +15,7 @@ CONTAINER="${CONTAINER:-/data/common/images/codedev_v1.0.5.sif}"
 MAX_PARALLEL="${MAX_PARALLEL:-32}"
 POLL_SEC="${POLL_SEC:-60}"
 SEARCH_SEEDS="42,123,2026,6"
-HOLDOUT_SEEDS="9,11,17,21,33,77,88,101"   # the 8 in config/training.yaml the search never sees
+HOLDOUT_SEEDS="9,11,17,21,33,77,88,101"   # held-out seeds, not the ones the search ranked on
 STATE="cache/results/chain_state.env"
 ADOPT_K0=""
 FROM="k0"
@@ -37,27 +25,23 @@ while [ $# -gt 0 ]; do
     --adopt-k0) ADOPT_K0="$2"; shift 2 ;;
     --from)     FROM="$2";     shift 2 ;;
     --max-parallel) MAX_PARALLEL="$2"; shift 2 ;;
-    -h|--help)  sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
 done
 
 mkdir -p cache/results logs
-# stderr, not stdout: submit() and stamp_of() return their value on stdout via $( ),
-# and a progress line printed there would be captured as part of that value.
+# Progress on stderr because stdout is captured by $( ).
 say() { echo "[chain $(date +%H:%M:%S)] $*" >&2; }
 die() { echo "[chain $(date +%H:%M:%S)] STOP: $*" >&2; exit 1; }
 
-# Persist each frozen setting as it is decided, so --from can resume without re-running
-# the round that decided it.
+# Persist frozen settings so --from can resume without re-running the round that decided them.
 remember() { printf '%s=%q\n' "$1" "$2" >> "${STATE}"; }
 [ -f "${STATE}" ] && . "${STATE}"
 
 py() { singularity exec --bind /data2 --pwd "$(pwd)" "${CONTAINER}" /bin/bash -lc "$1"; }
 
-# Wait for a job to leave the queue, then insist it actually succeeded. A requeue (the
-# CUDA-802 path) keeps the id, so polling the id rather than sleeping a fixed time is
-# what makes this survive a bad allocation.
+# Poll the job id: a requeue keeps it, so a fixed sleep would miss recovery.
 wait_for() {
   local jobid="$1" state
   say "waiting on job ${jobid}"
@@ -75,7 +59,7 @@ wait_for() {
 submit() {
   local file="$1" jobid
   local n; n=$(grep -ce '^--' "${file}")
-  # The generator checks this per file; the chain concatenates files, so check again.
+  # The generator checks per file; the chain concatenates, so check again.
   local u; u=$(grep '^--' "${file}" | grep -o '\-\-run-dir [^ ]*$' | sort -u | wc -l)
   [ "${n}" -eq "${u}" ] || die "${file}: ${n} jobs but ${u} unique run-dirs (collision)"
   say "submitting ${file} (${n} jobs, MAX_PARALLEL=${MAX_PARALLEL})"
@@ -84,8 +68,7 @@ submit() {
   echo "${jobid}"
 }
 
-# The stamp the launcher chose, so the collect glob finds this round's dirs and not an
-# earlier round's. Appended logs can hold several; the last one is this attempt's.
+# The stamp this attempt chose, so collect does not pick up an earlier round. Last match wins in appended logs.
 stamp_of() {
   local jobid="$1" stamp
   stamp=$(grep -h "^Run stamp:" "logs/slurm${jobid}.log" 2>/dev/null | tail -1 | awk '{print $3}')
@@ -131,9 +114,7 @@ for round in ${order}; do
   k0)
     say "===== ROUND k0: lr warmup x run length ====="
     if [ -n "${ADOPT_K0}" ]; then
-      # Do NOT regenerate the jobs file here: parallel_train.sh streams it with an open
-      # fd for the whole run (`done < ${JOBS_FILE}`), so truncating it under a live job
-      # would corrupt what is left to read.
+      # Do not regenerate jobs.txt under a live `done < file`; truncating it would corrupt the remaining read.
       say "adopting in-flight job ${ADOPT_K0} for round k0 (leaving its jobs file alone)"
       wait_for "${ADOPT_K0}"
       STAMP_K0=$(stamp_of "${ADOPT_K0}")
@@ -201,18 +182,15 @@ for round in ${order}; do
   fin)
     say "===== ROUND fin: winner vs incumbent on the 8 unseen seeds ====="
     : "${FINAL_lr_phi:?round fin needs the pick from round i -- run --from i}"
-    # The headline number must not come from seeds the search chose on. These 8 are the
-    # rest of config/training.yaml's 12; the search only ever saw the first 4.
+    # Confirmation seeds must not be the ones the search ranked on.
     bash slurm/make_sweep_jobs.sh --tier i --seeds "${HOLDOUT_SEEDS}" \
          --warmup "${WARMUP}" --n-epochs "${EPOCHS}" \
          --lr-phi "${FINAL_lr_phi}" --lr-alpha-kappa "${FINAL_lr_alpha_kappa}" \
          --lr-beta "${FINAL_lr_beta}" --lambda-dyn "${FINAL_lambda_dyn}" \
          --tag-suffix "_final" --out jobs_sweep_fin_raw.txt
-    # tier i emits its whole ladder; the confirmation only wants the chosen lambda and
-    # the incumbent (config default: warmup 0, lr 1e-3 across heads, lambda_dyn 100).
+    # tier i emits its whole ladder; confirmation only wants the chosen lambda and the incumbent.
     {
-      echo "# Confirmation round: the frozen winner and the incumbent, on the 8 seeds"
-      echo "# the search never saw. Read as an absolute number, not a paired delta."
+      echo "# Confirmation: frozen winner and incumbent on held-out seeds. Read as an absolute number, not a paired delta."
       grep '^--' jobs_sweep_fin_raw.txt | grep -- "--set lambda_dyn=${FINAL_lambda_dyn} "
       for ds in pbmc_retained bmmc_cite_retained; do
         short=${ds/_retained/_scv}; short=${short/bmmc_cite/bmmc}

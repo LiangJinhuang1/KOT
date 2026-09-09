@@ -37,10 +37,6 @@ from src.training.kot import (
 from src.utils.io import load_yaml
 
 
-# ============================================================================
-# backend_cosine
-# ============================================================================
-
 DATASETS_CONFIG = Path("config/datasets.yaml")
 
 
@@ -233,8 +229,7 @@ def rows_for_pair(name: str, compare_name: str) -> list[dict]:
             "cos_mean": out["velocity_backend_cos_kot_mean"],
             "cos_q25": out["velocity_backend_cos_kot_q25"],
             "cos_q75": out["velocity_backend_cos_kot_q75"],
-            # Magnitude: cosine is scale-invariant, so the two together are the whole
-            # difference between the fields. >1 means scVelo's vectors are the longer.
+            # Magnitude: cosine is scale-invariant, so the two together are the whole difference between the fields.
             "norm_ratio_median": out["velocity_backend_norm_ratio_kot_median"],
             "norm_ratio_q25": out["velocity_backend_norm_ratio_kot_q25"],
             "norm_ratio_q75": out["velocity_backend_norm_ratio_kot_q75"],
@@ -281,10 +276,6 @@ def backend_cosine_main():
               f"cos={cos_med:+.3f} [{cos_q25:+.3f},{cos_q75:+.3f}]  "
               f"|v_sc|/|v_reg|={rmed:.2f} [{r25:.2f},{r75:.2f}]")
 
-
-# ============================================================================
-# genes
-# ============================================================================
 
 def col(var, names):
     """First matching var column as a float array, else None."""
@@ -373,10 +364,6 @@ def genes_main() -> None:
         print("  unknown (missing r2; inspect fit columns before relaxing thresholds) -> " + ", ".join(unknown))
 
 
-# ============================================================================
-# regeneration
-# ============================================================================
-
 def index_names(group) -> np.ndarray:
     """The obs/var index of an h5ad group, as plain strings."""
     key = group.attrs.get("_index", "_index")
@@ -426,12 +413,6 @@ def regeneration_main() -> int:
     return 1
 
 
-
-# ============================================================================
-# shuffle_strength
-# ============================================================================
-
-
 def unit_rows(matrix: np.ndarray) -> np.ndarray:
     """Rows rescaled to unit length, dropping the cells that carry no velocity."""
     norms = np.linalg.norm(matrix, axis=1)
@@ -477,10 +458,6 @@ def shuffle_strength_main() -> None:
     report_space("PC (model)", in_pc_space, seeds)
     report_space("gene", velocity, seeds)
 
-
-# ============================================================================
-# dispatch
-# ============================================================================
 
 COMMANDS = {
     "backend-cosine": backend_cosine_main,

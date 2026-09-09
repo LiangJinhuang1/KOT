@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Callable
 
 import numpy as np
+import torch
 import pandas as pd
 from scipy import sparse
 from scipy.sparse.csgraph import connected_components
@@ -29,7 +30,7 @@ from scipy.stats import rankdata
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
 from sklearn.neighbors import NearestNeighbors
 
-from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
+from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM, permuted_pairing_floor
 from src.evaluation.knn_alignment import alignment_curve
 from src.losses.entropic_ot import sinkhorn_plan
 
@@ -61,6 +62,66 @@ def row_cosine(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def row_pearson(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return row_cosine(a - a.mean(axis=1, keepdims=True), b - b.mean(axis=1, keepdims=True))
+
+
+def neighbour_mean(field: np.ndarray, state: np.ndarray, n_neighbors: int) -> np.ndarray:
+    """Mean field of each cell's nearest others, in whichever space `state` is given."""
+    points = torch.as_tensor(state)
+    index = torch.cdist(points, points).topk(n_neighbors + 1, largest=False).indices[:, 1:]
+    return field[index.numpy()].mean(axis=1)
+
+
+def field_coherence(field: np.ndarray, state: np.ndarray, n_neighbors: int = 15,
+                    seed: int = 0) -> dict:
+    """Does a cell's direction agree with its neighbours' — beyond the population mean?
+
+    A real flow is locally smooth; a difference quotient over a noisy graph is not. The
+    centred value is the one that matters, because every field shares its population mean
+    direction, and it is read against the same statistic over randomly chosen cells.
+    """
+    local = neighbour_mean(field, state, n_neighbors)
+    rng = np.random.default_rng(seed)
+    distant = field[rng.integers(0, len(field), size=(len(field), n_neighbors))].mean(axis=1)
+    centred = field - field.mean(axis=0)
+    return {
+        "neighbour_cosine_median": float(np.median(row_cosine(field, local))),
+        "neighbour_cosine_centred_median": float(
+            np.median(row_cosine(centred, local - local.mean(axis=0)))),
+        "random_cosine_centred_median": float(
+            np.median(row_cosine(centred, distant - distant.mean(axis=0)))),
+    }
+
+
+def centred_cosine(pushforward: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Per-cell cosine with each side's POPULATION mean direction removed.
+
+    A phi that has collapsed produces a near-constant push-forward, and a constant field
+    correlates with any other field's mean direction — so the raw cosine can rank a
+    destroyed control above the real one while measuring nothing per cell.
+    """
+    return row_cosine(pushforward - pushforward.mean(axis=0),
+                      reference - reference.mean(axis=0))
+
+
+def centred_cosine_null(pushforward: np.ndarray, reference: np.ndarray,
+                        n_permutations: int = 20, seed: int = 0) -> dict:
+    """The centred cosine's chance level, from random cell pairings.
+
+    Zero is not the chance level for this statistic. Measured on 2026-09-08
+    (`tools/chromatin_velocity_diagnostics.py ceiling`), a ridge fitted on deliberately shuffled pairs
+    still scored a raw cosine of +0.39 and a centred one of +0.006 against BMMC's scVelo
+    reference — both comfortably "positive". Repairing the same two fields at random says
+    what this many cells over this many genes gives for nothing, and an observed value is
+    only evidence once it clears that.
+    """
+    rng = np.random.default_rng(seed)
+    draws = [float(np.median(centred_cosine(pushforward, reference[rng.permutation(len(reference))])))
+             for _ in range(n_permutations)]
+    return {
+        "cell_cosine_centred_null_median": float(np.median(draws)),
+        "cell_cosine_centred_null_p95": float(np.quantile(draws, 0.95)),
+        "cell_cosine_centred_null_permutations": int(n_permutations),
+    }
 
 
 def column_nrmse(predicted: np.ndarray, observed: np.ndarray) -> np.ndarray:
@@ -132,6 +193,11 @@ def retrieval_metrics(predicted: np.ndarray, observed: np.ndarray, seed: int = 0
     metrics["partner_diversity"] = float(len(np.unique(partners)) / len(predicted))
     metrics["top_partner_share"] = float(counts.max() / len(predicted))
     metrics["foscttm"] = float(np.mean(calc_domainAveraged_FOSCTTM(predicted, observed)))
+    # The permuted floor is the one a verdict may be read off. The constant floor is
+    # (0.5 + 0)/2 = 0.25 for any data, because a collapsed reference ties every distance in
+    # one of the two averaged directions; it stays only so pre-2026-09-09 runs remain
+    # comparable.
+    metrics["foscttm_permuted_floor"] = permuted_pairing_floor(predicted, observed, seed)
     constant = np.tile(predicted.mean(axis=0), (len(predicted), 1)).astype(predicted.dtype)
     metrics["foscttm_constant_floor"] = float(
         np.mean(calc_domainAveraged_FOSCTTM(constant, observed)))
@@ -343,13 +409,7 @@ def task_d_kinetics(pushforward: np.ndarray, reference: np.ndarray) -> dict:
     without letting that contaminate the cosine.
     """
     cosine = row_cosine(pushforward, reference)
-    # The same cosine with each side's population mean removed. A phi that has collapsed
-    # produces a near-constant push-forward, and a constant field correlates with ANY
-    # other field's mean direction — so the raw cosine can rank a destroyed control above
-    # the real one while measuring nothing per-cell. The centred value is what says
-    # whether the agreement is about individual cells.
-    centred = row_cosine(pushforward - pushforward.mean(axis=0),
-                         reference - reference.mean(axis=0))
+    centred = centred_cosine(pushforward, reference)
     predicted_norm = np.linalg.norm(pushforward, axis=1)
     reference_norm = np.linalg.norm(reference, axis=1)
     usable = reference_norm > 0
@@ -378,6 +438,7 @@ def task_d_kinetics(pushforward: np.ndarray, reference: np.ndarray) -> dict:
         "normalized_residual_is_informative": bool(0.1 < ratio < 10.0) if np.isfinite(ratio) else False,
         "norm_ratio_median": float(ratio) if np.isfinite(ratio) else float("nan"),
         "n_cells": int(len(cosine)),
+        **centred_cosine_null(pushforward, reference),
     }
 
 

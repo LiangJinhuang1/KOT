@@ -8,17 +8,9 @@
 #SBATCH --output=logs/crispr_linear_isp_%A_%a.log
 #SBATCH --array=0-2%3
 # Submit: sbatch slurm/crispr_linear_isp.sh FROZEN_KOT_RUN OUTPUT_ROOT
-# Uses the existing Singularity image. No extra pip installs or PYTHONPATH overlays.
-# Linear ISP uses KO RNA from OTHER replicates; test inference uses NT RNA + identity.
-# This evaluates seen knockouts in held-out replicates, not unseen knockout genes.
-# KOT and its NT-fitted preprocessing stay frozen (shared NT cells across ISP folds).
-# RegVelo perturbation generation remains a separate adapter to implement; its cached
-# velocity H5AD is not a KO prediction. GEARS/TxPert/scGPT compatibility remains untested:
-# previous pip resolution alone did NOT establish that another image is required.
-# Use isolated, pinned dependencies if adding those models; do not replace this image.
-# MultiPert direct protein outputs require their own explicitly labelled supervision.
+# Evaluates seen knockouts in held-out replicates, not unseen knockout genes.
 set -euo pipefail
-# SLURM executes a spool copy, so use submission directory in a batch allocation.
+# SLURM executes a spool copy, so use the submission directory in a batch allocation.
 if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     cd "$SLURM_SUBMIT_DIR"
 else

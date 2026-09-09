@@ -1,33 +1,9 @@
 #!/usr/bin/env python3
 """Every chromatin→RNA metric on disk, in one long table plus a per-run and a per-seed view.
 
-`tools/summarize_chromatin.py` is the console diagnostic: it hand-picks about thirty short
-columns so the ablation gaps fit on a terminal. That hand-picked list is not the metric
-set — the evaluator writes roughly four times as many numbers, including the two §13
-tracks, the per-lineage breakdowns, the FOSKNN curve and the norm ratios. This exports all
-of them.
+The console summary is a hand-picked view; this flattens the evaluation JSON generically so a new metric appears without editing this file.
 
-Nothing here names an individual metric. The evaluation JSON is flattened generically, so
-a metric added to `src/evaluation/chromatin_eval.py` appears in the export without this
-file being edited, and a metric this file knows about can never drift from what was
-actually computed.
-
-Three outputs, under cache/results/chromatin:
-
-  chromatin_metrics_long.csv   one row per (run, task, track, reference, block, group,
-                               metric). This is the complete record and the one to
-                               re-aggregate from.
-  chromatin_run_summary.csv    one row per run: the §19 gate quantities beside the
-                               headline Task A-D numbers, for reading a failure.
-  chromatin_seed_summary.csv   mean/sd/n across seeds per (dataset, method, law,
-                               condition, lambda_dyn), which is the only form the
-                               conditions can be compared in.
-
-§19's gate is recomputed here rather than read from `preflight_passed.json`: that marker
-was written by whichever version of the training script produced the run, and several of
-these runs predate the constant-map FOSCTTM floor being recorded at all. The evaluation
-JSON always carries the floor, so the verdict is derived from it and is comparable across
-every run.
+The launch gate is recomputed from the evaluation JSON rather than from `preflight_passed.json`, so verdicts stay comparable across training-script versions.
 """
 
 from __future__ import annotations
@@ -44,21 +20,16 @@ RUNS_ROOT = Path("cache/chromatin/runs")
 CACHE_ROOT = Path("cache/chromatin")
 OUTPUT_ROOT = Path("cache/results/chromatin")
 
-# §19's launch gate. `full` and `noDyn` must clear all of it before the corruption arms
-# mean anything; a corruption arm is only required to be finite.
+# full/noDyn must clear the launch gate before corruption arms mean anything; a corruption arm only needs to be finite.
 SPREAD_FLOOR = 0.05
 
-# Enough of the checkpoint to tell two trained models apart. Several run directories hold
-# the SAME model under two names — the lam1/lam1000 pair of every noDyn arm is one run,
-# because noDyn forces lambda_dyn to 0 — and counting those twice inflates the seed count.
+# Identity key so lam1/lam1000 noDyn (same run, lambda forced to 0) is not counted twice.
 CHECKPOINT_PROBE_BYTES = 4_000_000
 
 IDENTITY = ["run", "dataset", "method", "law", "condition", "lambda_dyn", "seed",
             "checkpoint", "n_test_cells", "checkpoint_sha"]
 
-# Task D key names encode three things at once, e.g.
-# `biological_vs_velocity_scvelo_unspliced_by_group`. Longest suffix first, so
-# `velocity_scvelo_unspliced` is not read as `velocity_scvelo`.
+# Longest suffix first so a key is not parsed as a shorter reference name.
 TASK_D_BLOCKS = ["joint_us", "unspliced"]
 
 
@@ -108,10 +79,9 @@ def emit(records: list[dict], identity: dict, task: str, metrics: dict,
 
 
 def task_d_records(records: list[dict], identity: dict, task_d: dict) -> None:
-    """§13 keeps two tracks apart, and §17 scores each against several references."""
+    """Keep tracks apart and score each against its references."""
     for key, value in task_d.items():
-        # `<track>_vs_<reference>_n_genes` is how many genes that reference covers, not a
-        # reference of its own — scVelo fits a subset of the panel and the rest is zeroed.
+        # `_n_genes` is coverage of that reference, not a reference of its own.
         scalar_metric = "n_genes" if key.endswith("_n_genes") else None
         parsed = parse_task_d_key(key.removesuffix("_n_genes") if scalar_metric else key)
         if parsed is None:
@@ -181,15 +151,13 @@ def pick(frame: pd.DataFrame, task: str, metric: str, **filters) -> pd.Series:
 
 
 def gate_verdict(summary: pd.DataFrame) -> pd.DataFrame:
-    """§19's four launch criteria, recomputed per run from the evaluation's own numbers.
+    """Launch criteria recomputed per run from the evaluation's own numbers.
 
-    `full` and `noDyn` are the runs the gate is about: until they pass, §19 says the other
-    conditions have nothing to be read against. The corruption arms are scored too, but
-    their verdict is reported as `not_gated` rather than as a pass or a failure.
+    Corruption arms are scored too, but reported as `not_gated` rather than pass or fail.
     """
     spread_ok = summary["gate_prediction_spread_ratio"] >= SPREAD_FLOOR
     state_ok = summary["A_gene_pearson_median"] > 0
-    pairing_ok = summary["B_knn_foscttm"] < summary["B_knn_foscttm_constant_floor"]
+    pairing_ok = summary["B_knn_foscttm"] < summary["B_knn_foscttm_permuted_floor"]
     kinetics_ok = summary["D_bio_scvelo_cell_cosine_median"] > 0
     summary = summary.assign(
         gate_spread_pass=spread_ok, gate_state_pass=state_ok,
@@ -208,13 +176,7 @@ def gate_verdict(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_summary(frame: pd.DataFrame) -> pd.DataFrame:
-    """The wide per-run view: the gate quantities beside what each task actually scored.
-
-    Chosen so a failure can be read left to right — did phi vary at all, did it order
-    cells, did it predict expression, did its Jacobian point anywhere. FOSCTTM is always
-    exported next to the constant-map floor measured on the same cells, because 0.5 is a
-    destroyed pairing and ~0.25 is what a zero-information map scores.
-    """
+    """Gate quantities beside what each task scored; FOSCTTM lives next to the per-run pairing floor."""
     summary = frame.drop_duplicates("run").set_index("run")[IDENTITY[1:]].copy()
     columns = {
         "gate_prediction_spread_ratio": ("gate", "prediction_spread_ratio", {}),
@@ -225,6 +187,7 @@ def run_summary(frame: pd.DataFrame) -> pd.DataFrame:
         "A_cell_cosine_median": ("a", "cell_cosine_median", {}),
         "A_cell_pearson_median": ("a", "cell_pearson_median", {}),
         "B_knn_foscttm": ("b", "knn_foscttm", {}),
+        "B_knn_foscttm_permuted_floor": ("b", "knn_foscttm_permuted_floor", {}),
         "B_knn_foscttm_constant_floor": ("b", "knn_foscttm_constant_floor", {}),
         "B_knn_partner_diversity": ("b", "knn_partner_diversity", {}),
         "B_knn_top_partner_share": ("b", "knn_top_partner_share", {}),
@@ -297,7 +260,7 @@ def seed_summary(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def ceilings_frame() -> pd.DataFrame:
-    """§14's Task A reference points, which the KOT numbers are meaningless without."""
+    """Task A reference points, which the KOT numbers are meaningless without."""
     rows = []
     for path in sorted(CACHE_ROOT.glob("*_baselines.json")):
         dataset = path.name.removesuffix("_baselines.json")

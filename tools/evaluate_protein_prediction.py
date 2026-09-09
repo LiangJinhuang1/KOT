@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Score φ(r) on held-out cells. FOSCTTM is rank-only and can win while every
-value is the wrong scale. Subsets differ by one ingredient (alignment vs
-kinetics vs anchor) so a median over the whole panel cannot hide the gap.
-
-  python tools/evaluate_protein_prediction.py --runs 'cache/training/run_*'
+"""Score φ(r) on held-out cells. FOSCTTM is rank-only and can win while every value is the wrong scale.
 """
 from __future__ import annotations
 
@@ -35,8 +31,7 @@ from tools.evaluate_checkpoints import (
 )
 from tools.summarize import KEY_COLUMNS, fitted_side
 
-# summary.csv's config keys, then the ablation axes that would otherwise collapse
-# two arms into one row (see tools/summarize.py runs --extra).
+# summary.csv's config keys, then the ablation axes that would otherwise collapse two arms into one row.
 IDENTITY_COLUMNS = KEY_COLUMNS + ["kot_velocity_ablation", "kot_s_permute",
                                   "beta_anchor_subset_n"]
 EVAL_COLUMNS = ["seed", "checkpoint", "dyn_velocity", "dyn_mapping", "n_eval_cells",
@@ -70,8 +65,7 @@ def config_identity(run_cfg: dict, dataset: str) -> dict:
         "sinkhorn_reg": format_hparam(run_cfg.get("sinkhorn_reg")),
         "kot_velocity_ablation": resolve_velocity_ablation(run_cfg),
         "kot_s_permute": format_hparam(bool(run_cfg.get("kot_s_permute", False))),
-        # The anchor-count ladder differs ONLY in this key, so without it every rung
-        # collapses into one group and the ablation compares itself.
+        # Without this key every rung collapses into one group.
         "beta_anchor_subset_n": format_hparam(run_cfg.get("beta_anchor_subset_n")),
     }
 

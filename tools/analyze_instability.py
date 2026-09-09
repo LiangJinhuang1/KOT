@@ -18,10 +18,6 @@ from src.visualization.style import apply_style
 import yaml
 
 
-# ---------------------------------------------------------------------------
-# Defaults / style
-# ---------------------------------------------------------------------------
-
 DEFAULT_BASE   = Path("cache/training")
 DEFAULT_OUTPUT = Path("analysis")
 THRESHOLD_GOOD = 0.1   # FOSCTTM < this counts as a "good" seed
@@ -105,10 +101,6 @@ def models_for_plot(df: pd.DataFrame) -> list[str]:
     return ordered + extras
 
 
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
 def active_dataset_block(datasets: dict) -> dict:
     """Return the first active dataset block from training.yaml."""
     if not datasets:
@@ -123,12 +115,7 @@ def active_dataset_block(datasets: dict) -> dict:
 
 
 def iter_model_outputs(model_dir: Path):
-    """
-    Yield (dataset, output_dir, summary_path) for each finished model output.
-
-    output_dir is the seed_* folder when present, else the dataset folder for
-    single-run baselines (scot, moscot, linear_ode).
-    """
+    """Yield finished model outputs, including baselines that have no seed_* folder."""
     for ds_dir in sorted(p for p in model_dir.iterdir() if p.is_dir() and p.name != "cache"):
         seed_dirs = sorted(
             p for p in ds_dir.iterdir() if p.is_dir() and p.name.startswith("seed_")
@@ -550,10 +537,6 @@ def collect_all_results(
     return dedupe_metric_rows(df)
 
 
-# ---------------------------------------------------------------------------
-# Plots
-# ---------------------------------------------------------------------------
-
 def plot_per_seed_reliability(df: pd.DataFrame, out: Path):
     kot_models = kot_loss_models(df)
     seed_model = kot_models[0] if kot_models else (models_for_plot(df)[0] if models_for_plot(df) else None)
@@ -582,13 +565,12 @@ def plot_per_seed_reliability(df: pd.DataFrame, out: Path):
 
 
 def plot_model_comparison(df: pd.DataFrame, out: Path):
-    """Side-by-side FOSCTTM distribution for the 3 models, both overall and per-seed."""
+    """FOSCTTM by model, overall and per seed."""
     sub = df.dropna(subset=["mean_foscttm"])
     if sub.empty:
         return
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    # Left: overall violin per model
     models = models_for_plot(sub)
     data = [sub[sub.model == m]["mean_foscttm"].dropna().values for m in models]
     nonempty = [(model, values) for model, values in zip(models, data) if len(values) > 0]
@@ -607,7 +589,6 @@ def plot_model_comparison(df: pd.DataFrame, out: Path):
     axes[0].axhline(THRESHOLD_GOOD, color="green", linestyle="--", linewidth=1)
     axes[0].set_title("Overall FOSCTTM distribution by model\n(all runs × all seeds combined)")
 
-    # Right: per-seed mean FOSCTTM for each model
     per_seed = sub.groupby(["model", "seed"])["mean_foscttm"].mean().reset_index()
     seeds = sorted(per_seed.seed.unique())
     width = 0.25
@@ -634,14 +615,7 @@ def plot_model_comparison(df: pd.DataFrame, out: Path):
 
 
 def plot_time_alignment(df: pd.DataFrame, out: Path):
-    """FOSCTTM vs time_mae (top) and FOSCTTM vs time_spearman (bottom).
-
-    Distinguishes failure modes:
-      - high FOSCTTM + low time_spearman  → fully scrambled
-      - high FOSCTTM + high time_spearman → wrong neighborhood but right time order
-                                            (likely branch swap)
-      - low FOSCTTM + high time_spearman  → normal convergence
-    """
+    """FOSCTTM against temporal error, so a scramble is not confused with a branch swap."""
     sub = df.dropna(subset=["mean_foscttm", "time_mae", "time_spearman"])
     if sub.empty:
         fig, ax = plt.subplots(figsize=(8, 4))
@@ -681,7 +655,7 @@ def plot_time_alignment(df: pd.DataFrame, out: Path):
 
 
 def plot_time_model_comparison(df: pd.DataFrame, out: Path):
-    """Violin plots of time_mae and time_spearman per model."""
+    """time_mae and time_spearman by model."""
     sub = df.copy()
     models = models_for_plot(sub)
     if not models:
@@ -755,7 +729,7 @@ def plot_time_per_seed(df: pd.DataFrame, out: Path, metric: str = "time_spearman
 
 
 def plot_foscttm_distribution(df: pd.DataFrame, out: Path):
-    """Histogram + ECDF of FOSCTTM showing bimodal pattern."""
+    """Histogram and ECDF of FOSCTTM."""
     sub = df.dropna(subset=["mean_foscttm"])
     if sub.empty:
         return
@@ -789,23 +763,8 @@ def plot_foscttm_distribution(df: pd.DataFrame, out: Path):
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Local-minimum diagnostics (loaded from per-epoch training_loss.csv)
-# ---------------------------------------------------------------------------
-
 def compute_stuck_signature(loss_df: pd.DataFrame, tail_window: int = 100) -> dict:
-    """Quantify whether a single training trajectory is stuck.
-
-    Returns a dict of metrics:
-      plateau_value    — mean align loss over the last `tail_window` epochs
-      plateau_cv       — std / mean over the same window (low CV = flat)
-      escape_range     — max - min of align in the second half (low = no escape)
-      descent_epoch    — epoch at which 95% of total descent was achieved
-      flat_share       — fraction of epochs (in the second half) where
-                         |align[t] - align[t-1]| < 1% of plateau value
-      align_plateau    — best (min) align value reached
-      stop_epoch       — last epoch trained
-    """
+    """Whether a trajectory is stuck, from the align-loss tail."""
     align = loss_df["align"].values
     n = len(align)
     if n < tail_window:
@@ -887,11 +846,7 @@ def build_stuck_signatures(df: pd.DataFrame, trajectories: dict) -> pd.DataFrame
 
 
 def classify_stuck(sig: pd.Series, foscttm_threshold: float = 0.3) -> str:
-    """Categorize the trajectory:
-       'converged_good' — finished low (FOSCTTM < threshold) and stable
-       'stuck_bad'      — finished high (FOSCTTM > threshold), flat tail, no escape
-       'transient'      — high FOSCTTM but tail still moving
-    """
+    """Label a trajectory from its FOSCTTM and tail flatness."""
     foscttm = sig.get("foscttm", np.nan)
     plateau_cv = sig.get("plateau_cv", np.nan)
     if pd.isna(foscttm):
@@ -904,10 +859,6 @@ def classify_stuck(sig: pd.Series, foscttm_threshold: float = 0.3) -> str:
         return "transient"
     return "intermediate"
 
-
-# ---------------------------------------------------------------------------
-# Local-minimum plots
-# ---------------------------------------------------------------------------
 
 def plot_align_trajectory(ax, loss_df: pd.DataFrame, color: str, alpha: float = 0.35):
     align = np.clip(loss_df["align"].values.astype(float), 1e-12, None)
@@ -1018,10 +969,6 @@ def analyze_local_minima(
     return sig_df
 
 
-# ---------------------------------------------------------------------------
-# Tables
-# ---------------------------------------------------------------------------
-
 def per_run_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate per (run, model): n, mean, std, n_good, plus key diagnostics."""
     agg = df.dropna(subset=["mean_foscttm"]).groupby(["run_group", "run", "model"]).agg(
@@ -1037,17 +984,12 @@ def per_run_summary(df: pd.DataFrame) -> pd.DataFrame:
         mean_kappa=("kappa_mean", "mean"),
         mean_beta=("beta_mean", "mean"),
     ).reset_index()
-    # Attach hyperparameters from the original df
     hp_cols = ["lr", "sinkhorn_reg", "lambda_dyn", "phi_init_gain",
                "dyn_warmup_epochs", "use_anchor", "phase1_epochs", "phase3_lr_scale"]
     hp_lookup = df.drop_duplicates("run")[["run"] + hp_cols].set_index("run")
     agg = agg.join(hp_lookup, on="run")
     return agg.sort_values("mean_foscttm")
 
-
-# ---------------------------------------------------------------------------
-# Per-folder analysis
-# ---------------------------------------------------------------------------
 
 STAGE_GROUPS = [
     ("clean",  "clean stage",  lambda s: s == "clean"),
@@ -1069,10 +1011,7 @@ OUTPUT_FOLDER_CHOICES = [name for name, _, _ in STAGE_GROUPS + ANALYSIS_GROUPS]
 
 def run_analysis_subset(df: pd.DataFrame, output_dir: Path, label: str,
                          base_dir: Path) -> None:
-    """Generate all plots + tables + report for one filtered DataFrame.
-
-    If the subset is empty, write a small README explaining that and return.
-    """
+    """Plots and tables for one filtered subset; an empty subset still gets a README."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if df.empty:
@@ -1120,10 +1059,6 @@ def run_analysis_subset(df: pd.DataFrame, output_dir: Path, label: str,
 
     analyze_local_minima(df, base_dir, output_dir, good_threshold=THRESHOLD_GOOD)
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     global THRESHOLD_GOOD

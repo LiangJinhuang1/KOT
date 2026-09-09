@@ -1,6 +1,6 @@
-"""Refuse to start on a broken CUDA allocation. nvidia-smi can look healthy
-while every CUDA init fails. Exit 42 is the container (do not requeue); 44/45
-are this node. Smoke-test every GPU; drop only the bad ones.
+"""Refuse to start on a broken CUDA allocation.
+
+Exit 42 is the container (do not requeue); 44/45 are this node.
 """
 
 from __future__ import annotations
@@ -22,12 +22,9 @@ MIN_BLACKWELL_CUDA = (12, 8)
 
 
 def gpu_report() -> str:
-    """What nvidia-smi says about the cards, which works even when CUDA does not.
+    """nvidia-smi listing, even when CUDA does not work.
 
-    Its absence is not a verdict on the allocation -- a container without the binary
-    on PATH still has to be judged by the CUDA probe below -- so a missing nvidia-smi
-    degrades to an empty report rather than taking the preflight down with an exit
-    code the requeue branch does not recognise.
+    A missing binary is not a verdict and must not take the preflight down with an unrecognized exit code.
     """
     try:
         smi = subprocess.run(
@@ -81,10 +78,7 @@ def main() -> int:
         )
         return EXIT_CONTAINER_MISMATCH
 
-    # The one place try/except earns its keep in this repo: turning a driver-level
-    # failure into the exit code the SLURM script requeues on. Without it a raising
-    # CUDA init would exit 1, code 45 could never be produced, and the requeue branch
-    # that tests for it would be dead.
+    # try/except so a driver failure becomes the requeue exit code.
     try:
         available = torch.cuda.is_available()
         count = torch.cuda.device_count()

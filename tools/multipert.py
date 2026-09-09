@@ -43,10 +43,9 @@ BLOCK = 4000
 
 def write_rna_in_blocks(source: Path, destination: Path, cells: pd.Index,
                         perturbation: pd.Series) -> None:
-    """Stream the 1.4GB all-gene RNA matrix into MultiPert's convention.
+    """Stream the all-gene RNA matrix into MultiPert's convention.
 
-    All genes, not the 691-gene retained set: MultiPert selects its own 5,000 HVGs, and
-    handing it a pre-narrowed panel would be a handicap this comparison did not intend.
+    All genes, not a pre-narrowed panel: MultiPert selects its own HVGs.
     """
     backed = ad.read_h5ad(source, backed="r")
     obs_names = pd.Index(backed.obs_names.astype(str))
@@ -186,11 +185,7 @@ def deltas_main() -> None:
             f"MultiPert predicted {predicted.shape[1]} ADT columns against {len(adt_names)} "
             f"in {args.protein}; the panels must match for the columns to be named.")
 
-    # MultiPert works in normalize_total(1e4)+log1p ADT units, the benchmark in its own.
-    # Fit a per-protein affine map from ITS control values onto the OBSERVED control
-    # values of the same cells, then apply the slope to the shift; the intercept cancels
-    # in a difference. Control cells only, so the calibration never sees a knockout --
-    # the same rule calibrate_direct follows for the direct predictors.
+    # Unit mismatch: fit a per-protein affine map on control cells, then apply the slope to the shift.
     known = control_cells.isin(observed.index)
     if not known.all():
         raise SystemExit(
@@ -216,10 +211,7 @@ def deltas_main() -> None:
 
 
 VENDOR_CODE = PROJECT_ROOT / "vendor" / "multipert" / "code"
-# MultiPert's entry point is a bare `main.py` that does `from data_loader import *`, so its
-# own directory has to be importable. A plain `import main` would then bind the name
-# `main` process-wide and shadow this repo's own main.py, so it is loaded under a distinct
-# module name instead.
+# Import under a distinct name: a plain `import main` would shadow this repo's main.py.
 sys.path.insert(0, str(VENDOR_CODE))
 MULTIPERT_SPEC = importlib.util.spec_from_file_location("multipert_entry",
                                                         VENDOR_CODE / "main.py")

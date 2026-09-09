@@ -36,10 +36,6 @@ from src.evaluation.protocol import (
 )
 
 
-# ============================================================================
-# signal
-# ============================================================================
-
 ADT_GENE_MAP = {
     "CD86": "CD86",
     "PDL1": "CD274",
@@ -51,8 +47,7 @@ ADT_GENE_MAP = {
 CONTROL_LABEL = "NT"
 
 
-# Design-sufficiency thresholds, fixed before any model is scored. A knockout must be
-# sampled this well for its effect estimate to mean anything, whatever that effect is.
+# Design-sufficiency thresholds, frozen before any model is scored.
 MIN_CELLS = 20
 MIN_REPLICATES = 2
 REPLICATE_COLUMN = "replicate"
@@ -82,9 +77,7 @@ def load_metadata(path: Path) -> pd.DataFrame:
 
 
 def load_target_gene_expression(path: Path, genes: list[str]) -> pd.DataFrame:
-    """log1p CP10K expression of `genes`, streamed in row blocks so the 1.4GB
-    matrix is never held in memory. X is spliced+unspliced counts, identical to
-    the `counts` layer written by tools/build_inputs.py papalexi."""
+    """log1p CP10K expression of `genes`, streamed in row blocks so the matrix is never held in memory."""
     backed = ad.read_h5ad(path, backed="r")
     var_names = pd.Index(backed.var_names.astype(str))
     present = [g for g in genes if g in var_names]
@@ -116,11 +109,8 @@ def load_target_gene_expression(path: Path, genes: list[str]) -> pd.DataFrame:
 def normalize_adt(counts: np.ndarray, rna_totals: np.ndarray) -> dict[str, np.ndarray]:
     """Three ADT normalizations with different compositional exposure.
 
-    raw_log1p    no size factor at all; immune to composition, sensitive to depth.
-    rna_size     size factor from total RNA counts, i.e. outside the 4-plex panel,
-                 so a drop in one protein cannot inflate the other three.
-    clr          the CITE-seq convention, included because reviewers expect it;
-                 fully compositional across only 4 features.
+    raw_log1p has no size factor. rna_size uses total RNA, so a drop in one protein cannot inflate the others.
+    clr is the CITE-seq convention reviewers expect; fully compositional on this small panel.
     """
     raw_log1p = np.log1p(counts)
 
@@ -298,10 +288,6 @@ def signal_main() -> None:
     report(effects, rna_effect_table(expr, groups), args.out_dir)
 
 
-# ============================================================================
-# benchmark
-# ============================================================================
-
 PREDICTION_RE = re.compile(
     r"^(?P<model>.+?)_(?P<dataset>papalexi_(?:retained|regvelo))"
     r"(?:_seed_(?P<seed>\d+))?\.h5ad$"
@@ -443,9 +429,7 @@ def evaluate_run(run: dict, observed_adt: pd.DataFrame, groups_all: pd.Series,
     predicted_values, predictor = predict_protein(
         emb_rna, emb_protein, values, control_mask, k, device, use_direct=use_direct)
 
-    # The direct prediction lives in the units KOT trained on, the target in the units
-    # this script fixed. Calibrating per protein on NT cells is what makes the pooled
-    # Spearman a statement about the map and not about the two normalisations.
+    # Calibrate per protein on NT cells so pooled metrics are in one unit.
     raw_merged = scored_deltas(predicted_values, adt_names, groups, scoring, min_cells)
     if use_direct:
         predicted_values, scale = calibrate_direct(predicted_values, values, control_mask)
@@ -462,8 +446,7 @@ def evaluate_run(run: dict, observed_adt: pd.DataFrame, groups_all: pd.Series,
         **score(merged["pred_delta"].to_numpy(), merged["obs_delta"].to_numpy()),
         "degenerate": False,
         "predictor": predictor,
-        # What the same prediction scores before calibration, so the fix is auditable
-        # rather than something the reader has to take on faith.
+        # Same prediction before calibration, so the fix is auditable.
         "spearman_uncalibrated": score(raw_merged["pred_delta"].to_numpy(),
                                        raw_merged["obs_delta"].to_numpy())["spearman"],
         "shuffled_alignment_spearman_mean": null_mean,
@@ -934,10 +917,6 @@ def benchmark_main() -> None:
     (args.out_dir / PROVENANCE_NAME).write_text(json.dumps(record, indent=2))
     print(f"\n[out] wrote tables and {PROVENANCE_NAME} to {args.out_dir}")
 
-
-# ============================================================================
-# dispatch
-# ============================================================================
 
 COMMANDS = {"signal": signal_main, "benchmark": benchmark_main}
 

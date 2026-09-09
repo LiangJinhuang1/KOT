@@ -17,15 +17,15 @@ Stages, in the order they have to be run:
   audit     §3 — print and save what the data actually contains; refuse relay without u/s
   split     §4 — one 70/10/20 split, then destroy the training pairing
   velocity  §7/§8 — chromatin velocity: temporal OT for HSPC, a directional field for BMMC
-  train     §9-§12 — law R1 (chromatin→mature RNA) or R2 (chromatin→unspliced→spliced)
+  train     regulatory R2 only (chromatin→unspliced→spliced)
   evaluate  §13-§17 — Tasks A-D, each scored against the TRUE velocity and the true G
 
-The two laws:
+The active law (linear RNA abundances in a common normalization):
 
-  R1  J_phi(c) v_c ~ kappa(c) [alpha(c) (*) Gc - gamma (*) phi(c)]
   R2  Phi(c) = [u, s], with
-      du = kappa(c) [alpha(c) (*) Gc - beta (*) u]
+      du = kappa(c) [alpha(Gc) - beta (*) u]
       ds = kappa(c) [beta (*) u        - gamma (*) s]
+  Align on s; constrain auxiliary u by its unpaired marginal; anchor gamma to RNA decay.
 """
 
 from __future__ import annotations
@@ -51,15 +51,20 @@ if str(PROJECT_ROOT) not in sys.path:
 import torch
 
 from src.data.chromatin import (
+    CHROMATIN_TRANSFORMS,
     audit_report,
     build_bmmc,
     build_hspc,
+    chromatin_features,
     gene_map,
     make_splits,
     require_relay_inputs,
     usable_splicing_genes,
 )
 from src.data.chromatin_map import permute_chromatin_projection
+from src.data.chromatin_r2 import (
+    SHARED_SPLICED, shared_splicing_targets, load_gamma_anchors, gamma_anchor_loss,
+)
 from src.data.chromatin_velocity import (
     bmmc_velocity,
     direction_diversity,
@@ -76,11 +81,14 @@ from src.evaluation.chromatin_eval import (
     task_c_integration,
     task_d_kinetics,
 )
-from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
+from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM, permuted_pairing_floor
 from src.losses.chromatin_laws import (
+    LOG1P_MAX,
+    LOG1P_MIN,
     LAWS,
     REDUCED,
-    REDUCED_CONDITIONS,
+    RELAY_CONDITIONS,
+    FORMULATION,
     RELAY,
     alignment_gauge,
     block_scales,
@@ -91,7 +99,7 @@ from src.losses.chromatin_laws import (
     law_rhs,
 )
 from src.losses.sinkhorn import sinkhorn_divergence
-from src.models.chromatin_kot import ChromatinKOT
+from src.models.chromatin_kot import PHI_GATES, ChromatinKOT
 from src.training.chromatin_baselines import (
     BASELINES,
     BaselineInputs,
@@ -111,8 +119,7 @@ CACHE_ROOT = PROJECT_ROOT / "cache" / "chromatin"
 HSPC_SOURCE = PROJECT_ROOT / "Datasets" / "HSPC_GSE209878"
 BMMC_PROCESSED = (PROJECT_ROOT / "Datasets" / "BMMC"
                   / "GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad")
-# The 13-batch rebuild (55,131 cells), not the two-batch cache the barcode-suffix bug
-# left behind (10,780). Separate label, so the old file is still there to compare against.
+# Separate cache name so the older incomplete BMMC velocity file is not overwritten.
 BMMC_VELOCITY = (PROJECT_ROOT / "cache" / "velocity" / "bmmc_multiome_full"
                  / "bmmc_multiome_full_scvelo_results.h5ad")
 
@@ -149,14 +156,25 @@ def gene_map_path(dataset: str) -> Path:
     return PROJECT_ROOT / "cache" / "results" / "mapping" / f"chromatin_gene_map_{dataset}.csv"
 
 
-def velocity_path(dataset: str, split_seed: int = 0) -> Path:
+def velocity_path(dataset: str, split_seed: int = 0, transform: str = "as_is") -> Path:
+    """One cache per (dataset, split, chromatin transform).
+
+    The transform is part of the identity because v_c is a displacement in phi's input
+    space: a field built on `tfidf_lsi` is a different field, not a different encoding of
+    the same one, and overwriting the `as_is` cache with it would silently destroy the
+    comparison. `as_is` keeps the original filename so existing caches still resolve.
+    """
     suffix = "" if split_seed == 0 else f"_split_seed{split_seed}"
+    if transform != "as_is":
+        suffix = f"{suffix}_{transform}"
     return CACHE_ROOT / f"{dataset}_velocity{suffix}.npz"
 
 
-def load_velocity(dataset: str, split_seed: int = 0) -> dict:
-    path = velocity_path(dataset, split_seed)
-    assert path.exists(), f"{path} not built yet — run `velocity --dataset {dataset}` first"
+def load_velocity(dataset: str, split_seed: int = 0, transform: str = "as_is") -> dict:
+    path = velocity_path(dataset, split_seed, transform)
+    assert path.exists(), (
+        f"{path} not built yet — run `velocity --dataset {dataset} "
+        f"--chromatin-transform {transform}` first")
     with np.load(path, allow_pickle=True) as handle:
         result = {key: handle[key] for key in handle.files}
     version = int(result.get("protocol_version", 0))
@@ -165,6 +183,13 @@ def load_velocity(dataset: str, split_seed: int = 0) -> dict:
     cached_seed = int(result.get("split_seed", 0))
     assert cached_seed == split_seed, (
         f"{path} was built for split seed {cached_seed}, requested {split_seed}")
+    # The field is a displacement in phi's input space; a mismatched transform would still load.
+    cached_transform = str(result.get("chromatin_transform", "as_is"))
+    if cached_transform != transform:
+        raise ValueError(
+            f"{path} was built on chromatin transform {cached_transform!r}, requested "
+            f"{transform!r}; rebuild it with `velocity --dataset {dataset} "
+            f"--chromatin-transform {transform}`")
     return result
 
 
@@ -236,6 +261,9 @@ def split_main(args: argparse.Namespace) -> int:
 def velocity_main(args: argparse.Namespace) -> int:
     adata = load_dataset(args.dataset)
     save_audit(adata)
+    # Apply the transform in memory so the cached h5ad stays untransformed for other gauges.
+    adata.obsm["gene_activity"] = chromatin_features(adata, args.chromatin_transform)
+    print(f"[velocity] chromatin transform: {args.chromatin_transform}")
     splits = pd.read_csv(split_path(args.dataset, args.split_seed), index_col=0)
     assert splits.index.equals(adata.obs_names), (
         "the split file does not match this dataset — run `split` on the current build")
@@ -272,20 +300,18 @@ def velocity_main(args: argparse.Namespace) -> int:
     result.update({key: np.float32(value) for key, value in diversity.items()})
     result["split_seed"] = np.int64(args.split_seed)
     result["protocol_version"] = np.int64(VELOCITY_PROTOCOL_VERSION)
+    result["chromatin_transform"] = np.str_(args.chromatin_transform)
     result["fit_source_mask"] = train_source
-    out = velocity_path(args.dataset, args.split_seed)
+    out = velocity_path(args.dataset, args.split_seed, args.chromatin_transform)
     np.savez_compressed(out, **result)
     print(f"[velocity] wrote {out}")
     return 0
 
 
 
-CONDITIONS = REDUCED_CONDITIONS
+CONDITIONS = RELAY_CONDITIONS
 
-# The RNA→protein runs' hyperparameters are the starting point, not a fresh set: a
-# difference between the two experiments should come from the modality pair and the law,
-# not from a learning rate somebody re-picked. Left column is this script's name, right
-# column the key in training.yaml's `defaults`. A CLI flag overrides whatever is read.
+# Inherit RNA–protein hyperparameters so a difference is the modality pair, not a re-tune.
 TRAINING_YAML_KEYS = {
     "n_epochs": "n_epochs",
     "batch_size": "batch_size",
@@ -323,7 +349,8 @@ def apply_training_defaults(args: argparse.Namespace, config_path: Path) -> dict
     rates are gamma and beta, where the RNA→protein model has only beta. Everything else
     keeps its name.
     """
-    defaults = load_yaml(config_path).get("defaults", {})
+    config = load_yaml(config_path)
+    defaults = config.get("defaults", {}) | config.get("chromatin_r2", {})
     taken = {}
     for name, key in TRAINING_YAML_KEYS.items():
         if getattr(args, name, None) is None and key in defaults:
@@ -345,8 +372,9 @@ def run_directory(args: argparse.Namespace) -> Path:
     if args.subsample is not None:
         name = f"{name}_sub{args.subsample}"
     path = Path(args.run_dir) if args.run_dir else CACHE_ROOT / "runs" / name
+    if path.exists() and any(path.iterdir()):
+        raise FileExistsError(f"Refusing to overwrite an existing run: {path}")
     path.mkdir(parents=True, exist_ok=True)
-    (path / "preflight_passed.json").unlink(missing_ok=True)
     return path
 
 
@@ -377,13 +405,14 @@ def apply_velocity_condition(velocity: np.ndarray, confidence: np.ndarray,
     return velocity, confidence, dynamic
 
 
-def rna_target_layer(adata: sc.AnnData, requested: str, law: str = REDUCED) -> str:
+def rna_target_layer(adata: sc.AnnData, requested: str, law: str = RELAY) -> str:
     """Which RNA quantity phi is aligned against, and why that one.
 
-    R1 predicts the mature gene-expression state, so `auto` uses the complete RNA matrix.
-    The optional velocyto cache is not a safe R1 default: in BMMC it covers only a subset
-    of cells and genes, which turns hundreds of valid mature-RNA targets into artificial
-    all-zero columns. A caller can still request `--rna-target spliced` explicitly.
+    R1 predicts mature RNA. `auto` prefers `spliced_lognorm` when it exists so the
+    training target matches the scVelo reference used by Task D / preflight; cells and
+    genes without usable splicing are dropped by `target_cell_mask` / `output_gene_mask`
+    rather than zero-filled. Pass `--rna-target rna` to force the complete total-RNA
+    matrix when splicing coverage is too thin for a given analysis.
 
     The relay law is not allowed the total-counts fallback. It predicts [u, s] and fits
     ds = beta*u - gamma*s; if s were TOTAL RNA it would contain u, the relay would be
@@ -391,6 +420,12 @@ def rna_target_layer(adata: sc.AnnData, requested: str, law: str = REDUCED) -> s
     stop being splicing and degradation rates. R2 trains and scores only on cells that
     carry splicing anyway, so spliced counts are always available to it.
     """
+    if law == RELAY:
+        if requested not in ("auto", "spliced"):
+            raise ValueError("relay law requires spliced RNA as its s target")
+        if not {"unspliced", "spliced"}.issubset(adata.layers):
+            raise ValueError("relay law requires measured unspliced and spliced RNA")
+        return SHARED_SPLICED
     if requested != "auto":
         layer = f"{requested}_lognorm"
         if law == RELAY and layer != "spliced_lognorm":
@@ -398,7 +433,7 @@ def rna_target_layer(adata: sc.AnnData, requested: str, law: str = REDUCED) -> s
         if layer not in adata.layers:
             raise ValueError(f"requested RNA target layer {layer!r} is absent")
         return layer
-    if law == RELAY:
+    if law == RELAY or "spliced_lognorm" in adata.layers:
         if "spliced_lognorm" not in adata.layers:
             raise ValueError("relay law requires measured spliced RNA")
         return "spliced_lognorm"
@@ -407,7 +442,11 @@ def rna_target_layer(adata: sc.AnnData, requested: str, law: str = REDUCED) -> s
 
 def build_targets(adata: sc.AnnData, law: str, target_layer: str,
                   gene_mask: np.ndarray | None = None) -> np.ndarray:
-    """phi's alignment target: mature RNA for R1, [u, s] for R2."""
+    """R2 [u, s] in shared units; legacy single-block views for static diagnostics."""
+    if law == RELAY:
+        if target_layer != SHARED_SPLICED:
+            raise ValueError("Regulatory R2 requires shared RNA coordinates")
+        return shared_splicing_targets(adata, gene_mask)
     columns = slice(None) if gene_mask is None else gene_mask
     spliced = to_dense(adata.layers[target_layer], np.float32)[:, columns]
     if law == REDUCED:
@@ -416,19 +455,21 @@ def build_targets(adata: sc.AnnData, law: str, target_layer: str,
     return np.concatenate([unspliced, spliced], axis=1)
 
 def output_gene_mask(adata: sc.AnnData, law: str,
-                     rows: np.ndarray | None = None) -> np.ndarray:
-    """Genes the law has measured targets for; R2 never treats missing u/s as zero."""
-    if law == REDUCED:
+                     rows: np.ndarray | None = None,
+                     target_layer: str | None = None) -> np.ndarray:
+    """Genes the law has measured targets for; never zero-fill missing u/s."""
+    needs_splicing = law == RELAY or target_layer == "spliced_lognorm"
+    if not needs_splicing:
         return np.ones(adata.n_vars, dtype=bool)
     mask = usable_splicing_genes(adata, rows=rows)
     if not mask.any():
-        raise ValueError("relay law has no gene with usable measured u/s counts")
+        raise ValueError("no gene with usable measured u/s counts for this RNA target")
     return mask
 
 
 def target_cell_mask(adata: sc.AnnData, target_layer: str) -> np.ndarray:
     """Cells carrying the requested target, distinct from ATAC-only source eligibility."""
-    if target_layer == "spliced_lognorm" and "has_splicing" in adata.obs:
+    if target_layer in (SHARED_SPLICED, "spliced_lognorm", "unspliced_lognorm") and "has_splicing" in adata.obs:
         return adata.obs["has_splicing"].to_numpy(dtype=bool)
     return np.ones(adata.n_obs, dtype=bool)
 
@@ -454,8 +495,43 @@ def chromatin_param_groups(model, lr: float, lr_phi, lr_alpha_kappa, lr_rates) -
             for name, rate, params in heads if params]
 
 
+def alignment_columns(law: str, align_block: str, n_output_genes: int,
+                      device: torch.device) -> torch.Tensor | None:
+    """Which output columns the transport plan is measured on; None means all of them.
+
+    Under the relay law "spliced" drops the u half. The OT itself always runs in
+    align_dims dimensions, so this does not shrink the divergence's space — what it
+    changes is which directions those are. Measured on BMMC (2026-09-08): fitted to the
+    scaled [u, s] cloud, all 16 leading directions are majority-u, mean share 0.66, and
+    they carry 3.0% of s's variance where a basis fitted to s alone carries 8.6%. Every
+    metric the run is judged on is computed on s.
+    """
+    if law == REDUCED or align_block == "joint":
+        return None
+    if align_block == "unspliced":
+        return torch.arange(0, n_output_genes, device=device)
+    return torch.arange(n_output_genes, 2 * n_output_genes, device=device)
+
+
+def held_block_columns(law: str, align_block: str, n_output_genes: int,
+                       device: torch.device) -> torch.Tensor | None:
+    """The block the transport plan does NOT see, which the moment term therefore holds."""
+    if law == REDUCED or align_block == "joint":
+        return None
+    other = "unspliced" if align_block == "spliced" else "spliced"
+    return alignment_columns(law, other, n_output_genes, device)
+
+
+def align_view(values: torch.Tensor, columns: torch.Tensor | None, scale: torch.Tensor,
+               basis: torch.Tensor | None) -> torch.Tensor:
+    """The coordinates the alignment cost is measured in: chosen columns, scaled, projected."""
+    selected = values if columns is None else values[:, columns]
+    scaled = selected / scale
+    return scaled if basis is None else scaled @ basis
+
+
 def alignment_basis(target: torch.Tensor, scale: torch.Tensor, rows: torch.Tensor,
-                    n_dims: int) -> torch.Tensor | None:
+                    n_dims: int, columns: torch.Tensor | None) -> torch.Tensor | None:
     """An orthonormal basis of the RNA cells' own variation, or None for no projection.
 
     An entropic OT between two 2048-point clouds in 1281 dimensions is close to
@@ -467,7 +543,7 @@ def alignment_basis(target: torch.Tensor, scale: torch.Tensor, rows: torch.Tenso
     """
     if n_dims <= 0:
         return None
-    observed = target[rows] / scale
+    observed = align_view(target[rows], columns, scale, None)
     centred = observed - observed.mean(dim=0, keepdim=True)
     basis = torch.linalg.svd(centred, full_matrices=False)[2][:n_dims].T
     explained = float((centred @ basis).var(dim=0).sum() / centred.var(dim=0).sum())
@@ -479,7 +555,8 @@ def alignment_basis(target: torch.Tensor, scale: torch.Tensor, rows: torch.Tenso
 def sinkhorn_step(model, chromatin: torch.Tensor, target: torch.Tensor,
                   atac_rows: torch.Tensor, rna_rows: torch.Tensor, max_points: int,
                   scale: torch.Tensor, blur: float, backend: str,
-                  basis: torch.Tensor | None) -> torch.Tensor:
+                  basis: torch.Tensor | None,
+                  columns: torch.Tensor | None) -> torch.Tensor:
     """Sinkhorn divergence between phi(ATAC cells) and the RNA cells' observed profiles.
 
     The two sides are drawn INDEPENDENTLY from disjoint cell sets, so no cell can appear
@@ -489,10 +566,8 @@ def sinkhorn_step(model, chromatin: torch.Tensor, target: torch.Tensor,
     device = atac_rows.device
     source = subsample_rows(len(atac_rows), max_points, device, atac_rows)
     sink = subsample_rows(len(rna_rows), max_points, device, rna_rows)
-    predicted = model.phi(chromatin[source]) / scale
-    observed = target[sink] / scale
-    if basis is not None:
-        predicted, observed = predicted @ basis, observed @ basis
+    predicted = align_view(model.phi(chromatin[source]), columns, scale, basis)
+    observed = align_view(target[sink], columns, scale, basis)
     return sinkhorn_divergence(predicted, observed, blur=blur, backend=backend)
 
 
@@ -530,6 +605,23 @@ def gene_affine_calibration(production: torch.Tensor, target: torch.Tensor,
     return scale, bias
 
 
+def block_moment_loss(model, chromatin: torch.Tensor, target: torch.Tensor,
+                      source: torch.Tensor, sink: torch.Tensor, columns: torch.Tensor,
+                      scale: torch.Tensor) -> torch.Tensor:
+    """Unpaired per-gene mean and std match on the block the transport plan cannot see.
+
+    Once the plan is restricted to one block, the relay law is the only thing shaping the
+    other — and the law carries a free per-cell alpha, so that block can drift anywhere
+    while ds = beta*u - gamma*s still balances. This holds it on the observed marginals as
+    a side task, without letting it back into the geometry the pairing is decided in. The
+    two cell sets are disjoint, as everywhere else, so no pairing leaks.
+    """
+    predicted = model.phi(chromatin[source])[:, columns]
+    observed = target[sink][:, columns]
+    return (((predicted.mean(dim=0) - observed.mean(dim=0)) / scale).pow(2)
+            + ((predicted.std(dim=0) - observed.std(dim=0)) / scale).pow(2)).mean()
+
+
 def phi_gradient_norm(model, loss: torch.Tensor) -> tuple[float, torch.Tensor]:
     """Norm of this loss's gradient on phi alone, and the flat gradient itself."""
     grads = torch.autograd.grad(loss, [p for p in model.phi.parameters()],
@@ -542,7 +634,8 @@ def grad_interaction(model, law: str, chromatin: torch.Tensor, target: torch.Ten
                      velocity: torch.Tensor, production: torch.Tensor,
                      confidence: torch.Tensor, probe: torch.Tensor, sink: torch.Tensor,
                      scales: tuple, blur: float, backend: str, weight: float,
-                     basis: torch.Tensor | None, residual_mask: torch.Tensor) -> dict:
+                     basis: torch.Tensor | None, residual_mask: torch.Tensor,
+                     columns: torch.Tensor | None) -> dict:
     """How much of phi's gradient the kinetics term actually supplies, and whether it fights.
 
     This project already learned that the kinetics term must be judged by its GRADIENT and
@@ -554,10 +647,8 @@ def grad_interaction(model, law: str, chromatin: torch.Tensor, target: torch.Ten
     align_scale, dyn_scale = scales
     was_training = model.training
     model.eval()
-    predicted = model.phi(chromatin[probe]) / align_scale
-    observed = target[sink] / align_scale
-    if basis is not None:
-        predicted, observed = predicted @ basis, observed @ basis
+    predicted = align_view(model.phi(chromatin[probe]), columns, align_scale, basis)
+    observed = align_view(target[sink], columns, align_scale, basis)
     align = sinkhorn_divergence(predicted, observed, blur=blur, backend=backend)
     align_norm, align_grad = phi_gradient_norm(model, align)
     dyn = kinetics_loss(model, law, chromatin[probe], velocity[probe], production[probe],
@@ -575,27 +666,73 @@ def grad_interaction(model, law: str, chromatin: torch.Tensor, target: torch.Ten
     }
 
 
+def check_r2_main(args: argparse.Namespace) -> int:
+    """Read-only server check of the frozen data and actual RNA training panel."""
+    adata = load_dataset(args.dataset)
+    require_relay_inputs(adata)
+    splits = pd.read_csv(split_path(args.dataset, args.split_seed), index_col=0)
+    if not splits.index.equals(adata.obs_names):
+        raise ValueError("Split cell order does not match the dataset")
+    fields = load_velocity(args.dataset, args.split_seed, args.chromatin_transform)
+    if fields["velocity"].shape != adata.obsm["gene_activity"].shape:
+        raise ValueError("Cached velocity shape does not match chromatin input")
+    if not np.isfinite(fields["velocity"]).all():
+        raise ValueError("Cached chromatin velocity contains non-finite values")
+    covered = target_cell_mask(adata, SHARED_SPLICED)
+    training = splits["split"].eq("train").to_numpy()
+    rna_rows = np.flatnonzero(training & splits["train_side"].eq("rna").to_numpy() & covered)
+    atac_rows = np.flatnonzero(training & splits["train_side"].eq("atac").to_numpy())
+    if len(rna_rows) == 0 or len(atac_rows) == 0:
+        raise ValueError("Measured RNA and ATAC training populations must be nonempty")
+    mask = output_gene_mask(adata, RELAY, rows=rna_rows, target_layer=SHARED_SPLICED)
+    genes = adata.var_names[mask]
+    anchors = load_gamma_anchors(args.gamma_anchor_csv, genes)
+    _, _, kinetic_mask = gene_map(adata, gene_map_path(args.dataset))
+    dynamic = np.asarray(fields["dynamic_mask"])[atac_rows]
+    summary = {
+        "dataset": args.dataset, "formulation": FORMULATION,
+        "target_layer": SHARED_SPLICED, "aligned_output": "spliced",
+        "n_atac_train": len(atac_rows), "n_measured_rna_train": len(rna_rows),
+        "n_dynamic_atac_train": int(dynamic.sum()),
+        "n_output_genes": len(genes), "n_kinetic_genes": int(kinetic_mask[mask].sum()),
+        "n_gamma_anchors": len(anchors["indices"]),
+        "gamma_anchor_fraction": len(anchors["indices"]) / len(genes),
+        "gamma_anchor_sha256": anchors["sha256"],
+        "time_convention": anchors["time_convention"],
+        "reference_layers": [name for name in adata.layers if name.startswith("velocity_")],
+    }
+    print(json.dumps(summary, indent=2))
+    if not dynamic.any():
+        raise ValueError("No dynamic ATAC training cells; full R2 would have no kinetic loss")
+    return 0
+
+
 def train_main(args: argparse.Namespace) -> int:
+    if args.law != RELAY or args.align_block != "spliced":
+        raise ValueError("Regulatory R2 aligns on spliced RNA only")
+    if not args.gamma_anchor_csv or args.lambda_gamma_anchor <= 0:
+        raise ValueError("R2 requires --gamma-anchor-csv with RNA-decay measurements and a positive prior weight")
     adata = load_dataset(args.dataset)
     save_audit(adata, args.law)
     from_yaml = apply_training_defaults(args, Path(args.training_config))
     allowed = conditions_for_law(args.law)
     assert args.condition in allowed, (
         f"law {args.law} only runs {allowed}; got condition={args.condition!r}")
-    # training.yaml carries lambda_dyn: 1000, tuned for a ~130-protein target. On this
-    # 2000-gene one it drives phi to a near-constant: measured FOSCTTM 0.474 against a
-    # constant-map floor of 0.25, prediction spread 0.003. Inheriting it by omitting the
-    # flag is silent, so say so rather than let a whole sweep arm collapse unremarked.
+    # The protein default for lambda_dyn is too strong here and can collapse phi if inherited silently.
     if args.lambda_dyn >= 10 and "lambda_dyn" in from_yaml:
         print(f"[train] WARNING: lambda_dyn={args.lambda_dyn} inherited from "
               f"{args.training_config}. On chromatin the measured optimum is 1 and >=10 "
               "collapses phi. Pass --lambda-dyn explicitly if this is deliberate.")
+    assert args.lambda_held_block == 0.0 or args.law == RELAY, (
+        "--lambda-held-block supervises the relay block outside the plan; R1 has one block")
+    assert args.align_block == "joint" or args.law == RELAY, (
+        "--align-block splits the relay's [u, s]; the reduced law has a single block")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     output_dir = run_directory(args)
     splits = pd.read_csv(split_path(args.dataset, args.split_seed), index_col=0)
     assert splits.index.equals(adata.obs_names), "split file does not match the dataset"
-    fields = load_velocity(args.dataset, args.split_seed)
+    fields = load_velocity(args.dataset, args.split_seed, args.chromatin_transform)
 
     target_layer = rna_target_layer(adata, args.rna_target, args.law)
     split_column = splits["split"].to_numpy()
@@ -606,9 +743,14 @@ def train_main(args: argparse.Namespace) -> int:
               "cells measured; absent targets are excluded, never zero-filled")
     gene_fit_rows = np.flatnonzero(
         target_covered & (split_column == "train") & (side_column == "rna"))
-    gene_mask = output_gene_mask(adata, args.law, rows=gene_fit_rows)
+    gene_mask = output_gene_mask(
+        adata, args.law, rows=gene_fit_rows, target_layer=target_layer)
     output_genes = adata.var_names[gene_mask]
-    chromatin_np = np.asarray(adata.obsm["gene_activity"], dtype=np.float32)
+    anchors = load_gamma_anchors(
+        args.gamma_anchor_csv, output_genes, target=args.gamma_anchor_target,
+        hours_per_model_time=args.gamma_hours_per_model_time)
+    (output_dir / "gamma_anchors.json").write_text(json.dumps(anchors, indent=2))
+    chromatin_np = chromatin_features(adata, args.chromatin_transform)
     target_np = build_targets(adata, args.law, target_layer, gene_mask)
     full_mapping, full_alignment_mask, full_kinetic_mask = gene_map(
         adata, gene_map_path(args.dataset))
@@ -624,8 +766,6 @@ def train_main(args: argparse.Namespace) -> int:
     velocity_np, confidence_np, dynamic_np_all = apply_velocity_condition(
         fields["velocity"], fields["confidence"], fields["dynamic_mask"],
         args.condition, args.seed, eligible=shuffle_eligible)
-    if args.condition == "permG":
-        mapping = permute_chromatin_projection(mapping, args.seed)
 
     rows = np.arange(adata.n_obs)
     if args.subsample is not None:
@@ -653,34 +793,31 @@ def train_main(args: argparse.Namespace) -> int:
     dynamic_rows = torch.as_tensor(np.flatnonzero(dynamic_np), device=device)
     if min(len(atac_rows), len(rna_rows), len(val_rows)) == 0:
         raise ValueError("ATAC train, measured RNA train, and measured validation sets must be non-empty")
+    if args.condition != "noDyn" and args.lambda_dyn > 0 and len(dynamic_rows) == 0:
+        raise ValueError("No dynamic ATAC training cells; R2 would have no kinetic loss")
     print(f"[train] {args.dataset} {args.law}/{args.condition} seed {args.seed} -> {output_dir}")
     print(f"[train] rows: atac {len(atac_rows)}, rna {len(rna_rows)}, val {len(val_rows)}, "
           f"kinetic {len(dynamic_rows)}; target '{target_layer}' ({target.shape[1]} columns); "
           f"genes: {int(alignment_mask.sum())} aligned, {int(kinetic_mask.sum())} in G")
 
-    # Fitted on the RNA TRAINING half only. §4 puts the split before everything, and a
-    # per-gene scale taken over all cells is a statistic of the test set leaking into the
-    # loss — small, but it is exactly the kind of thing the split rule exists to prevent.
-    # Two different scales on purpose: the kinetics residual is divided per gene so no
-    # gene dominates the ODE, the alignment cost is divided by that AND by the cloud's
-    # diameter so `blur` is a fraction of the distance between cells.
+    # Training-half scales only. Per-gene so no gene dominates the ODE; cloud diameter so blur is a cell-distance fraction.
     fit_target = target[rna_rows]
     target_scale = block_scales(fit_target, args.law)
     phi_scale, phi_bias = gene_affine_calibration(
         production, target, atac_rows, rna_rows, args.law)
-    # permG corrupts G_train in the kinetic RHS and nothing else (§12). phi always sees
-    # the same named gene-activity coordinates; feeding the permuted G into its shortcut
-    # would turn one ablation into two simultaneous corruptions.
     phi_projection = torch.as_tensor(
         true_mapping.toarray().astype(np.float32), device=device)
     if args.law == RELAY:
         phi_projection = torch.cat([phi_projection, phi_projection], dim=0)
-    align_scale = alignment_scale(fit_target, args.law)
-    # The residual is only defined where chromatin can drive the gene; a zero G row would
-    # otherwise contribute a pure -gamma*phi decay term with no production to balance it.
+    # u and s share a library factor; no source-cell RNA enters the kinetic RHS.
+    align_columns = alignment_columns(args.law, args.align_block, len(output_genes), device)
+    held_columns = held_block_columns(args.law, args.align_block, len(output_genes), device)
+    aligned_fit = fit_target if align_columns is None else fit_target[:, align_columns]
+    align_scale = alignment_scale(aligned_fit, args.law if align_columns is None else REDUCED)
+    # A transcription-head bias does not establish support for an unmapped gene.
     residual_mask = torch.as_tensor(law_mask(kinetic_mask, args.law), device=device)
 
-    basis = alignment_basis(target, align_scale, rna_rows, args.align_dims)
+    basis = alignment_basis(target, align_scale, rna_rows, args.align_dims, align_columns)
     model = ChromatinKOT(
         len(output_genes), args.law, n_input_features=adata.n_vars,
         phi_dims=args.phi_dims, kappa_dims=args.kappa_dims,
@@ -688,9 +825,15 @@ def train_main(args: argparse.Namespace) -> int:
         phi_spectral_norm=args.phi_spectral_norm, activation=args.activation,
         init_method=args.init_method, kappa_min=args.kappa_min, kappa_max=args.kappa_max,
         phi_projection=phi_projection, phi_scale=phi_scale, phi_bias=phi_bias,
-        phi_residual_weight=args.phi_residual_weight,
+        phi_residual_weight=args.phi_residual_weight, phi_gate=args.phi_gate,
         alpha_min=args.alpha_min, alpha_max=args.alpha_max,
     ).to(device)
+    with torch.no_grad():
+        gamma_target = model.gamma_raw.new_tensor(anchors["gamma"])
+        if bool((gamma_target <= 1e-6).any()):
+            raise ValueError("Gamma targets fall below the model's positive rate floor")
+        positive = gamma_target - 1e-6
+        model.gamma_raw[anchors["indices"]] = positive + torch.log(-torch.expm1(-positive))
     optimiser = torch.optim.Adam(chromatin_param_groups(
         model, args.lr, args.lr_phi, args.lr_alpha_kappa, args.lr_rates))
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -703,7 +846,7 @@ def train_main(args: argparse.Namespace) -> int:
     with torch.no_grad():
         initial_held = sinkhorn_step(
             model, chromatin, target, val_rows, val_rows, args.sinkhorn_max_points,
-            align_scale, args.sinkhorn_blur, args.sinkhorn_backend, basis)
+            align_scale, args.sinkhorn_blur, args.sinkhorn_backend, basis, align_columns)
     history = []
     monitor_ready_at = 0 if lambda_dyn == 0.0 else args.dyn_warmup_epochs
     if monitor_ready_at > args.n_epochs:
@@ -725,8 +868,17 @@ def train_main(args: argparse.Namespace) -> int:
         optimiser.zero_grad(set_to_none=True)
         align = sinkhorn_step(model, chromatin, target, atac_rows, rna_rows,
                               args.sinkhorn_max_points, align_scale, args.sinkhorn_blur,
-                              args.sinkhorn_backend, basis)
+                              args.sinkhorn_backend, basis, align_columns)
         align.backward()
+        held_value = 0.0
+        if args.lambda_held_block > 0.0 and held_columns is not None:
+            held = block_moment_loss(
+                model, chromatin, target,
+                subsample_rows(len(atac_rows), args.sinkhorn_max_points, device, atac_rows),
+                subsample_rows(len(rna_rows), args.sinkhorn_max_points, device, rna_rows),
+                held_columns, target_scale[held_columns])
+            (args.lambda_held_block * held).backward()
+            held_value = float(held.detach())
 
         weight = lambda_dyn * dyn_weight_factor(epoch, args.dyn_warmup_epochs)
         dyn_value = 0.0
@@ -739,6 +891,8 @@ def train_main(args: argparse.Namespace) -> int:
                                      residual_mask)
                 ((weight * share) * loss).backward()
                 dyn_value += share * float(loss)
+        anchor = gamma_anchor_loss(model.gamma, anchors)
+        (args.lambda_gamma_anchor * anchor).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimiser.step()
         scheduler.step()
@@ -748,8 +902,10 @@ def train_main(args: argparse.Namespace) -> int:
             with torch.no_grad():
                 held = sinkhorn_step(model, chromatin, target, val_rows, val_rows,
                                      args.sinkhorn_max_points, align_scale,
-                                     args.sinkhorn_blur, args.sinkhorn_backend, basis)
+                                     args.sinkhorn_blur, args.sinkhorn_backend, basis,
+                                     align_columns)
             row = {"epoch": epoch, "loss_align": float(align), "loss_dyn": dyn_value,
+                   "loss_held_block": held_value, "loss_gamma_anchor": float(anchor),
                    "val_align": float(held), "lambda_dyn_effective": weight}
             if len(dynamic_rows) > 0:
                 row.update(grad_interaction(
@@ -757,7 +913,7 @@ def train_main(args: argparse.Namespace) -> int:
                     subsample_rows(len(dynamic_rows), args.batch_size, device, dynamic_rows),
                     subsample_rows(len(rna_rows), args.batch_size, device, rna_rows),
                     (align_scale, target_scale), args.sinkhorn_blur, args.sinkhorn_backend,
-                    weight, basis, residual_mask))
+                    weight, basis, residual_mask, align_columns))
             history.append(row)
             print(f"[train] epoch {epoch:4d}  align {float(align):.5f}  "
                   f"dyn {dyn_value:.5f}  val_align {float(held):.5f}  "
@@ -770,7 +926,8 @@ def train_main(args: argparse.Namespace) -> int:
 
     frame = pd.DataFrame(history)
     frame.to_csv(output_dir / "training_loss.csv", index=False)
-    settings = vars(args) | {"target_layer": target_layer,
+    settings = vars(args) | {"target_layer": target_layer, "formulation": FORMULATION,
+                             "gamma_anchors": anchors,
                              "n_input_features": int(adata.n_vars),
                              "n_output_genes": int(len(output_genes)),
                              "hyperparameters_from_training_yaml": from_yaml,
@@ -781,6 +938,7 @@ def train_main(args: argparse.Namespace) -> int:
     for name, state, epoch in [("best_align", best["state"], best["epoch"]),
                                ("final", model.state_dict(), args.n_epochs)]:
         torch.save({"state_dict": state, "epoch": epoch, "law": args.law,
+                    "formulation": FORMULATION, "gamma_anchors": anchors,
                     "condition": args.condition, "seed": args.seed,
                     "target_layer": target_layer, "dataset": args.dataset,
                     "gene_names": list(output_genes),
@@ -788,9 +946,7 @@ def train_main(args: argparse.Namespace) -> int:
                    output_dir / f"checkpoint_{name}.pt")
     model.load_state_dict(best["state"])
     print(f"[train] best val_align {best['val_align']:.5f} at epoch {best['epoch']}")
-    # The JVP checks run on validation cells that HAVE a velocity. On HSPC only day-0
-    # cells do (§7), and they are 40% of the data — so a median over all validation rows
-    # is the median of a mostly-zero vector and reports 0.0 whatever the model does.
+    # Score JVP only on cells that have a velocity; a median over mostly-zero rows is uninformative.
     velocity_val = np.flatnonzero(
         np.isin(np.arange(adata.n_obs), val_rows.cpu().numpy())
         & fields["dynamic_mask"] & target_covered)
@@ -799,7 +955,8 @@ def train_main(args: argparse.Namespace) -> int:
                                               device=device),
                               val_rows, torch.as_tensor(velocity_val, device=device),
                               target_scale, adata, args.reference_layer,
-                              reference_columns=np.flatnonzero(gene_mask))
+                              reference_columns=np.flatnonzero(gene_mask),
+                              target_layer=target_layer)
     (output_dir / "preflight.json").write_text(json.dumps(checks, indent=2))
     print(json.dumps(checks, indent=2))
     passed, failures = preflight_verdict(checks, args.condition)
@@ -809,7 +966,7 @@ def train_main(args: argparse.Namespace) -> int:
             print(f"  - {line}")
         if args.condition in ("full", "noDyn"):
             print("[train] refusing to treat this as a launchable checkpoint "
-                  "(shuffle/reverse/zero/permG wait until full/noDyn pass)")
+                  "(shuffle waits until full/noDyn pass)")
             return 1
         print("[train] corruption arms are allowed to fail the biological gate; "
               "the checkpoint is still written")
@@ -838,24 +995,94 @@ def preflight_verdict(checks: dict, condition: str) -> tuple[bool, list[str]]:
     if not (np.isfinite(pearson) and pearson > 0):
         failures.append(f"state Pearson {pearson} is not positive")
     foscttm = checks["foscttm"]
-    floor = checks.get("foscttm_constant_floor")
+    floor = checks.get("foscttm_permuted_floor")
     if floor is None or not np.isfinite(floor):
-        failures.append("constant-map FOSCTTM floor is missing")
+        failures.append("permuted-pairing FOSCTTM floor is missing")
     elif not (np.isfinite(foscttm) and foscttm < floor):
         failures.append(
-            f"FOSCTTM {foscttm:.3f} is not below the constant-map floor {floor:.3f}")
-    cosine = checks.get("jvp_vs_reference_cosine_median")
-    if cosine is None:
-        failures.append("JVP vs RNA velocity is missing — run `reference` first")
-    elif not (np.isfinite(cosine) and cosine > 0):
-        failures.append(f"JVP vs RNA velocity cosine {cosine:.4g} is not positive")
+            f"FOSCTTM {foscttm:.3f} is not below the permuted-pairing floor {floor:.3f}")
+    # Raw cosine is reported, not gated: every field shares the reference mean, so only the centred statistic is per-cell.
     centred = checks.get("jvp_vs_reference_cosine_centred_median")
-    if centred is None:
-        failures.append("centred JVP vs RNA velocity cosine is missing")
-    elif not (np.isfinite(centred) and centred > 0):
+    null = checks.get("jvp_vs_reference_cosine_centred_null_p95")
+    if checks.get("jvp_vs_reference_skipped"):
+        pass
+    elif centred is None or null is None:
+        failures.append("centred JVP vs RNA velocity cosine is missing — run `reference` first")
+    elif not (np.isfinite(centred) and np.isfinite(null) and centred > null):
         failures.append(
-            f"centred JVP vs RNA velocity cosine {centred:.4g} is not positive")
+            f"centred JVP vs RNA velocity cosine {centred:.4g} does not clear its "
+            f"permutation null {null:.4g}")
     return len(failures) == 0, failures
+
+
+def reference_agreement(pushed: np.ndarray, prediction: np.ndarray, reference: np.ndarray,
+                        velocity_rows: torch.Tensor, reference_columns: np.ndarray | None,
+                        prefix: str) -> dict:
+    """Task D against one RNA-only reference velocity, on the cells and genes it covers.
+
+    The two sides live in different coordinates and one of them has to move. The JVP is a
+    log1p rate; scVelo's velocity is a LINEAR rate. Converting the JVP is the exact
+    direction — dx/dt = (dy/dt)(1 + x) = (dy/dt) exp(y) — because scVelo's own library
+    normalisation differs from CP10K only by a per-cell scalar, which is gene-independent
+    and therefore cancels in a per-cell cosine. Converting the reference instead would
+    need scVelo's own Ms, which is not stored. The exponent is clamped to the range a
+    log1p count can occupy so an out-of-range prediction cannot overflow it.
+
+    Genes as well as cells: scVelo fits a subset of the panel and the rest is zero-filled,
+    and leaving those columns in dilutes the cosine by roughly the square root of the
+    covered fraction.
+    """
+    pushed = pushed * np.exp(np.clip(prediction, LOG1P_MIN, LOG1P_MAX))
+    selected = reference[velocity_rows.cpu().numpy()]
+    if reference_columns is not None:
+        selected = selected[:, reference_columns]
+    scored = np.flatnonzero(np.abs(selected).sum(axis=1) > 0)
+    genes = np.flatnonzero(np.abs(selected).sum(axis=0) > 0)
+    if len(scored) == 0 or len(genes) == 0:
+        return {}
+    metrics = task_d_kinetics(pushed[np.ix_(scored, genes)], selected[np.ix_(scored, genes)])
+    return {
+        f"{prefix}_cosine_median": metrics["cell_cosine_median"],
+        f"{prefix}_cosine_centred_median": metrics["cell_cosine_centred_median"],
+        f"{prefix}_cosine_centred_null_p95": metrics["cell_cosine_centred_null_p95"],
+        f"{prefix}_gene_pearson_median": metrics["gene_pearson_median"],
+        f"{prefix}_n_cells": int(len(scored)),
+        f"{prefix}_n_genes": int(len(genes)),
+    }
+
+
+def state_metrics(prediction: torch.Tensor, observed: torch.Tensor,
+                  sample: torch.Tensor, n_probe: int = 200) -> dict:
+    """Task A and the pairing floor on ONE output block.
+
+    A phi that ignores its input still scores a respectable Sinkhorn loss by sitting on
+    the target's mean. Then every per-gene correlation is ~0 and the spread across cells
+    is ~0, and that ratio is what tells the two apart from the loss curve alone. FOSCTTM
+    is measured here rather than left to the evaluate stage because a run whose alignment
+    never happened has to be caught before the other 17 conditions are launched.
+    """
+    per_gene = torch.stack([
+        torch.corrcoef(torch.stack([prediction[:, col], observed[:, col]]))[0, 1]
+        for col in range(0, prediction.shape[1], max(1, prediction.shape[1] // n_probe))
+    ])
+    sampled_prediction = prediction[sample].detach().cpu().numpy()
+    sampled_observed = observed[sample].cpu().numpy()
+    constant = np.broadcast_to(sampled_observed.mean(axis=0, keepdims=True),
+                               sampled_prediction.shape).copy()
+    return {
+        "foscttm": float(np.mean(calc_domainAveraged_FOSCTTM(
+            sampled_prediction, sampled_observed))),
+        # Gate on the permuted floor. The constant floor is kept so older preflight files remain readable.
+        "foscttm_permuted_floor": permuted_pairing_floor(
+            sampled_prediction, sampled_observed),
+        "foscttm_constant_floor": float(np.mean(calc_domainAveraged_FOSCTTM(
+            constant, sampled_observed))),
+        "foscttm_n_cells": int(len(sample)),
+        "state_pearson_median": float(torch.nanmedian(per_gene)),
+        "state_pearson_positive_fraction": float((per_gene > 0).float().mean()),
+        "prediction_spread_ratio": float((prediction.std(dim=0).median()
+                                          / observed.std(dim=0).median()).clamp(max=1e6)),
+    }
 
 
 def preflight_checks(model, law: str, chromatin: torch.Tensor, target: torch.Tensor,
@@ -863,12 +1090,12 @@ def preflight_checks(model, law: str, chromatin: torch.Tensor, target: torch.Ten
                      rows: torch.Tensor, velocity_rows: torch.Tensor, scale: torch.Tensor,
                      adata: sc.AnnData, reference_layer: str,
                      reference_columns: np.ndarray | None = None,
-                     foscttm_cells: int = 2000) -> dict:
-    """The gate the run order puts before launching anything else.
+                     foscttm_cells: int = 2000,
+                     target_layer: str | None = None) -> dict:
+    """The gate before launching anything else.
 
-    Deliberately reads the TRUE velocity even when the run was trained on a corrupted one
-    (§13): a checkpoint scored only against its own corrupted law can look perfectly
-    self-consistent while having learned nothing about chromatin.
+    Reads the true velocity even when the run trained on a corrupted field: a checkpoint
+    can look self-consistent against its own corrupted law while having learned nothing.
     """
     model.eval()
     residual, moving = kinetics_residual(model, law, chromatin[velocity_rows],
@@ -879,35 +1106,9 @@ def preflight_checks(model, law: str, chromatin: torch.Tensor, target: torch.Ten
     with torch.no_grad():
         prediction = model.phi(chromatin[rows])
     observed = target[rows]
-    state_prediction = spliced_block(prediction, law)
-    state_observed = spliced_block(observed, law)
-    per_gene = torch.stack([
-        torch.corrcoef(torch.stack([state_prediction[:, col], state_observed[:, col]]))[0, 1]
-        for col in range(0, state_prediction.shape[1],
-                         max(1, state_prediction.shape[1] // 200))
-    ])
-    # A phi that ignores its input still scores a respectable Sinkhorn loss by sitting on
-    # the target's mean. Then every per-gene correlation is ~0 and the spread across cells
-    # is ~0, and this ratio is what tells the two apart from the loss curve alone.
-    spread = float((state_prediction.std(dim=0).median()
-                    / state_observed.std(dim=0).median()).clamp(max=1e6))
-    # "FOSCTTM is sensible" is on the gate list, so it is measured here and not left to
-    # the evaluate stage: a run whose alignment never happened should be caught before the
-    # other 17 conditions are launched.
     sample = torch.randperm(len(rows))[:foscttm_cells]
-    sampled_prediction = state_prediction[sample].detach().cpu().numpy()
-    sampled_observed = state_observed[sample].cpu().numpy()
-    constant_prediction = np.broadcast_to(
-        sampled_observed.mean(axis=0, keepdims=True), sampled_prediction.shape).copy()
     checks = {
-        "foscttm": float(np.mean(calc_domainAveraged_FOSCTTM(
-            sampled_prediction, sampled_observed))),
-        "foscttm_constant_floor": float(np.mean(calc_domainAveraged_FOSCTTM(
-            constant_prediction, sampled_observed))),
-        "foscttm_n_cells": int(len(sample)),
-        "state_pearson_median": float(torch.nanmedian(per_gene)),
-        "state_pearson_positive_fraction": float((per_gene > 0).float().mean()),
-        "prediction_spread_ratio": spread,
+        **state_metrics(spliced_block(prediction, law), spliced_block(observed, law), sample),
         "state_prediction_finite": bool(torch.isfinite(prediction).all()),
         "jvp_norm_median": float(pushforward.norm(dim=1).median()),
         "jvp_finite": bool(torch.isfinite(pushforward).all()),
@@ -915,34 +1116,42 @@ def preflight_checks(model, law: str, chromatin: torch.Tensor, target: torch.Ten
         "jvp_rhs_cosine_median": float(torch.nn.functional.cosine_similarity(
             pushforward, pushforward - residual, dim=1).median()),
         "jvp_n_cells": int(len(velocity_rows)),
+        "target_layer": target_layer,
+        "jvp_vs_reference_skipped": False,
     }
-    # The gate's "JVP vs RNA velocity is positive". Absent before `reference` has run,
-    # which is why it is reported as null rather than silently skipped.
+    # Gate stays on spliced RNA; report unspliced beside it because a relay plan can steer that block.
+    if law == RELAY:
+        checks.update({
+            f"unspliced_{key}": value for key, value in state_metrics(
+                unspliced_block(prediction, law), unspliced_block(observed, law),
+                sample).items()})
+    # Missing reference is null, not a skip. Total-RNA targets are a different quantity from the spliced reference.
     reference = reference_velocity(adata, reference_layer)
     checks["jvp_vs_reference_cosine_median"] = None
-    if reference is not None:
-        selected = reference[velocity_rows.cpu().numpy()]
-        if reference_columns is not None:
-            selected = selected[:, reference_columns]
-        scored = np.flatnonzero(np.abs(selected).sum(axis=1) > 0)
-        # Genes as well as cells, matching Task D. scVelo fits a subset of the panel and
-        # the rest is zero-filled; leaving those columns in dilutes the cosine by roughly
-        # the square root of the covered fraction, on a gate item that reads
-        # "JVP vs RNA velocity is positive".
-        genes = np.flatnonzero(np.abs(selected).sum(axis=0) > 0)
-        if len(scored) > 0 and len(genes) > 0:
-            pushed = spliced_block(pushforward.detach().cpu().numpy(), law)
-            reference_metrics = task_d_kinetics(
-                pushed[np.ix_(scored, genes)], selected[np.ix_(scored, genes)])
-            checks["jvp_vs_reference_cosine_median"] = reference_metrics[
-                "cell_cosine_median"]
-            checks["jvp_vs_reference_cosine_centred_median"] = reference_metrics[
-                "cell_cosine_centred_median"]
-            checks["jvp_vs_reference_gene_pearson_median"] = reference_metrics[
-                "gene_pearson_median"]
-            checks["jvp_vs_reference_n_cells"] = int(len(scored))
-            checks["jvp_vs_reference_n_genes"] = int(len(genes))
+    if target_layer is not None and target_layer not in ("spliced_lognorm", SHARED_SPLICED):
+        checks["jvp_vs_reference_skipped"] = True
+        checks["jvp_vs_reference_skip_reason"] = (
+            f"target {target_layer!r} is not spliced; scVelo reference comparison disabled")
+    elif reference is not None:
+        pushed = spliced_block(pushforward.detach().cpu().numpy(), law)
+        checks.update(reference_agreement(
+            pushed, spliced_block(moving.detach().cpu().numpy(), law), reference,
+            velocity_rows, reference_columns, "jvp_vs_reference"))
+    # Reported, never gated, so both laws stay on one spliced standard.
+    if law == RELAY:
+        reference_u = reference_velocity(adata, f"{reference_layer}_u")
+        if reference_u is not None:
+            pushed_u = unspliced_block(pushforward.detach().cpu().numpy(), law)
+            checks.update(reference_agreement(
+                pushed_u, unspliced_block(moving.detach().cpu().numpy(), law), reference_u,
+                velocity_rows, reference_columns, "jvp_vs_reference_u"))
     return checks
+
+
+def unspliced_block(prediction, law: str):
+    """The u half of a relay prediction; the reduced law has no u output."""
+    assert law == RELAY, "the reduced law predicts a single block"
+    return prediction[:, :prediction.shape[1] // 2]
 
 
 def spliced_block(prediction: np.ndarray, law: str) -> np.ndarray:
@@ -961,9 +1170,9 @@ def load_checkpoint(run_dir: Path, name: str, device: torch.device):
     payload = torch.load(run_dir / f"checkpoint_{name}.pt", map_location=device,
                          weights_only=False)
     config = json.loads((run_dir / "run_config.json").read_text())
-    # Every architecture setting, not just the layer widths. phi_spectral_norm in
-    # particular changes the parameter NAMES (weight -> weight_orig/_u/_v), so a model
-    # rebuilt on the defaults cannot load a checkpoint trained with it at all.
+    if payload.get("formulation") != FORMULATION or config.get("formulation") != FORMULATION:
+        raise ValueError("Legacy chromatin checkpoint: its law/units differ from regulatory R2; do not reinterpret it")
+    # Rebuild every architecture flag: spectral norm changes parameter names and a default model cannot load.
     input_names = payload.get("input_gene_names", payload["gene_names"])
     phi_state = payload["state_dict"]
     phi_kwargs = {}
@@ -973,6 +1182,8 @@ def load_checkpoint(run_dir: Path, name: str, device: torch.device):
             "phi_scale": phi_state["phi.gene_scale"],
             "phi_bias": phi_state["phi.gene_bias"],
             "phi_residual_weight": config.get("phi_residual_weight", 0.1),
+            # Older checkpoints omit phi_gate; the wrong mode changes the parameter shape.
+            "phi_gate": config.get("phi_gate", "scalar-zero"),
         }
     model = ChromatinKOT(
         len(payload["gene_names"]), payload["law"], n_input_features=len(input_names),
@@ -1013,16 +1224,12 @@ def reference_main(args: argparse.Namespace) -> int:
 
     subset = adata[rows][:, usable].copy()
     if args.backend == "regvelo":
-        # Second reference (§17). Same spliced/unspliced input, a GRN-informed velocity
-        # model — so a Task D agreement that only holds for one backend is visible.
+        # Second backend on the same input, so agreement that holds for only one velocity model is visible.
         subset, _ = run_regvelo(subset, n_top_genes=int(usable.sum()), hvg_flavor="seurat_v3",
                                 min_shared_counts=args.min_shared_counts, n_pcs=args.n_pcs,
                                 n_neighbors=args.n_neighbors, grn_prior_csv=args.grn_prior_csv)
     else:
-        # The same HVG → filter/normalise → PCA → neighbours → moments the RNA→protein
-        # velocities were built with, so the two experiments' references are comparable and
-        # this stage cannot drift from that pipeline. n_top_genes is the whole subset: the
-        # gene choice was already made by the gene map.
+        # Same velocity pipeline as the RNA–protein runs, so the two experiments' references stay comparable.
         subset, _ = preprocess_for_velocity(
             subset, n_top_genes=subset.n_vars, hvg_flavor="seurat_v3",
             min_shared_counts=args.min_shared_counts, n_pcs=args.n_pcs,
@@ -1031,8 +1238,7 @@ def reference_main(args: argparse.Namespace) -> int:
         scv.tl.velocity(subset, mode="dynamical")
 
     columns = adata.var_names.get_indexer(subset.var_names)
-    # Both blocks: the relay law predicts [u, s], so §17's joint u/s comparison needs the
-    # reference's unspliced velocity as well as its spliced one.
+    # Relay predicts both blocks, so the unspliced reference has to exist too.
     output_layer = args.layer or f"velocity_{args.backend}"
     for source, layer in [("velocity", output_layer), ("velocity_u", f"{output_layer}_u")]:
         if source not in subset.layers:
@@ -1079,13 +1285,13 @@ def evaluate_main(args: argparse.Namespace) -> int:
     adata = load_dataset(dataset)
     save_audit(adata, law)
     splits = pd.read_csv(split_path(dataset, config["split_seed"]), index_col=0)
-    # `reference` rewrites the dataset h5ad in place, so a split built against an older
-    # build would misalign every row without raising.
+    # reference rewrites the h5ad in place; an older split would misalign every row without raising.
     assert splits.index.equals(adata.obs_names), (
         "the split file does not match this dataset — rebuild the split")
-    fields = load_velocity(dataset, config["split_seed"])
+    fields = load_velocity(dataset, config["split_seed"],
+                           config.get("chromatin_transform", "as_is"))
 
-    chromatin_np = np.asarray(adata.obsm["gene_activity"], dtype=np.float32)
+    chromatin_np = chromatin_features(adata, config.get("chromatin_transform", "as_is"))
     chromatin = torch.as_tensor(chromatin_np, device=device)
     input_names = list(payload.get("input_gene_names", payload["gene_names"]))
     assert input_names == list(adata.var_names), "checkpoint ATAC features do not match dataset"
@@ -1109,14 +1315,15 @@ def evaluate_main(args: argparse.Namespace) -> int:
     if not target_covered.all():
         print(f"[evaluate] scoring {len(test_rows)} test cells with measured "
               f"{config['target_layer']}; absent targets are not treated as zero")
-    observed = to_dense(adata.layers[config["target_layer"]], np.float32)[
-        np.ix_(test_rows, output_columns)]
+    observed_full = shared_splicing_targets(adata[test_rows], output_columns)
+    observed = spliced_block(observed_full, law)
     with torch.no_grad():
         predicted_full = model.phi(chromatin[test_rows]).cpu().numpy()
     predicted = spliced_block(predicted_full, law)
 
     results = {"run_dir": str(run_dir), "checkpoint": args.checkpoint, "dataset": dataset,
-               "law": law, "condition": config["condition"], "seed": config["seed"],
+               "law": law, "formulation": FORMULATION,
+               "condition": config["condition"], "seed": config["seed"],
                "n_test_cells": len(test_rows)}
     gene_names = list(payload["gene_names"])
     summary, per_gene = task_a_state(predicted, observed, gene_names)
@@ -1149,8 +1356,7 @@ def evaluate_main(args: argparse.Namespace) -> int:
         (split_column == "train") & (side_column == "atac") & train_dynamic)
 
     results["task_d"] = {}
-    # INTERNAL: the cells that entered L_dyn, the velocity they were trained with, the G
-    # they were trained with. This asks whether optimisation satisfied its own law.
+    # Cells, velocity, and G that entered the loss: whether optimisation satisfied its own law.
     results["task_d"]["internal_n_cells"] = int(len(internal_rows))
     if len(internal_rows) > 0:
         jvp_train, rhs_train = pushforward_and_rhs(
@@ -1162,8 +1368,7 @@ def evaluate_main(args: argparse.Namespace) -> int:
             np.median(np.linalg.norm(jvp_train, axis=1)))
         results["task_d"]["internal_vs_law"] = task_d_kinetics(jvp_train, rhs_train)
 
-    # BIOLOGICAL: held-out cells, TRUE velocity, TRUE G. RNA velocity is a later
-    # comparison, not a substitute for the law residual.
+    # Held-out cells with true velocity and G. RNA velocity is a later comparison, not a substitute.
     moving = np.flatnonzero(np.abs(true_velocity_np[test_rows]).sum(axis=1) > 0)
     results["task_d"]["biological_n_moving_cells"] = int(len(moving))
     if len(moving) > 0:
@@ -1301,9 +1506,7 @@ def baseline_main(args: argparse.Namespace) -> int:
             chromatin[train], observed[train]).predict(chromatin[test]).astype(np.float32),
         "paired_mlp": paired_mlp.predict(chromatin[test]).astype(np.float32),
     }
-    # Split by whether chromatin can reach the gene at all. The panel deliberately keeps
-    # genes with no chromatin support, and those can only score ~0 — pooling them into one
-    # median understates the ceiling for the genes the law actually covers.
+    # Unmapped genes cannot be predicted from chromatin; pooling them understates the covered-gene ceiling.
     _, _, kinetic_mask = gene_map(adata, gene_map_path(args.dataset))
     subsets = {"all": np.ones(adata.n_vars, dtype=bool), "in_G": kinetic_mask,
                "not_in_G": ~kinetic_mask}
@@ -1311,7 +1514,10 @@ def baseline_main(args: argparse.Namespace) -> int:
     for name, predicted in predictions.items():
         summary, per_gene = task_a_state(predicted, observed[test], list(adata.var_names))
         per_gene["in_G"] = kinetic_mask
-        per_gene.to_csv(CACHE_ROOT / f"{args.dataset}_baseline_{name}_per_gene.csv", index=False)
+        # Target in the filename so parallel targets do not overwrite each other.
+        per_gene.to_csv(
+            CACHE_ROOT / f"{args.dataset}_{target_layer}_baseline_{name}_per_gene.csv",
+            index=False)
         results[name] = {
             subset: {
                 "gene_pearson_median": float(np.nanmedian(per_gene.loc[mask, "pearson"])),
@@ -1326,7 +1532,7 @@ def baseline_main(args: argparse.Namespace) -> int:
               f"  in_G {results[name]['in_G']['gene_pearson_median']:+.4f}"
               f"  not_in_G {results[name]['not_in_G']['gene_pearson_median']:+.4f}"
               f"   cell cosine {summary['cell_cosine_median']:.4f}")
-    out = CACHE_ROOT / f"{args.dataset}_baselines.json"
+    out = CACHE_ROOT / f"{args.dataset}_{target_layer}_baselines.json"
     out.write_text(json.dumps(results, indent=2))
     print(f"[baseline] wrote {out}")
     return 0
@@ -1370,8 +1576,7 @@ def baseline_model_main(args: argparse.Namespace) -> int:
     result = BASELINES[args.method](inputs, **baseline_kwargs(args))
     runtime = (datetime.now() - started).total_seconds()
 
-    # Subsampled methods scored only the rows they saw, and BOTH modalities use that one
-    # sample so each test cell is compared against its own partner.
+    # Score both modalities on the subsample the method actually saw, so each test cell is compared to its partner.
     scored = np.asarray(result.notes.get("test_rows", np.arange(len(test))))
     predicted = result.predicted
     if predicted is None:
@@ -1390,8 +1595,7 @@ def baseline_model_main(args: argparse.Namespace) -> int:
     per_gene.to_csv(output_dir / "task_a_per_gene.csv", index=False)
     results["task_a"] = summary
 
-    # Tasks B and C in the method's OWN space: a latent method aligns there, and scoring
-    # it after kNN imputation into gene space would measure the imputation, not the method.
+    # Score B and C in the method's own space; imputing to genes would measure the imputer.
     labels = adata.obs["cell_type"].astype(str).to_numpy()[test][scored] \
         if "cell_type" in adata.obs else None
     if result.atac_latent is not None:
@@ -1444,8 +1648,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit = sub.add_parser("audit", help="§3 dataset audit")
     audit.add_argument("--dataset", choices=DATASETS, required=True)
-    audit.add_argument("--law", choices=["reduced", "relay"], default="reduced")
+    audit.add_argument("--law", choices=LAWS, default=RELAY)
     audit.set_defaults(func=audit_main)
+
+    check_r2 = sub.add_parser("check-r2", help="read-only R2 data, velocity and anchor coverage check")
+    check_r2.add_argument("--dataset", choices=DATASETS, required=True)
+    check_r2.add_argument("--split-seed", type=int, default=0)
+    check_r2.add_argument("--gamma-anchor-csv", required=True)
+    check_r2.add_argument("--chromatin-transform", choices=CHROMATIN_TRANSFORMS,
+                          default="as_is",
+                          help="check the velocity cache and coverage for this transform")
+    check_r2.set_defaults(func=check_r2_main)
 
     split = sub.add_parser("split", help="§4 fixed 70/10/20 split with disjoint train sides")
     split.add_argument("--dataset", choices=DATASETS, required=True)
@@ -1458,6 +1671,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="replace an existing frozen split (off by default)")
     velocity = sub.add_parser("velocity", help="§7/§8 chromatin velocity, from ATAC alone")
     velocity.add_argument("--dataset", choices=DATASETS, required=True)
+    velocity.add_argument("--chromatin-transform", choices=CHROMATIN_TRANSFORMS,
+                          default="as_is",
+                          help="normalisation of phi's chromatin input; the velocity is a "
+                               "displacement in this space, so train must match it")
     velocity.add_argument("--split-seed", type=int, default=0,
                           help="must match the split every method reuses; OT/DPT are "
                                "fitted inside that split so test cells cannot write v_train")
@@ -1478,7 +1695,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     train = sub.add_parser("train", help="§9-§12 train one law under one condition")
     train.add_argument("--dataset", choices=DATASETS, required=True)
-    train.add_argument("--law", choices=LAWS, default=REDUCED)
+    train.add_argument("--law", choices=LAWS, default=RELAY)
     train.add_argument("--condition", choices=CONDITIONS, default="full",
                        help="R2 (relay) only allows full/shuffle/noDyn")
     train.add_argument("--seed", type=int, default=None,
@@ -1488,7 +1705,17 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--run-dir", default=None)
     train.add_argument("--subsample", type=int, default=None,
                        help="cells to keep — the small-subset check before a large run")
-    train.add_argument("--rna-target", choices=["auto", "spliced", "rna"], default="auto")
+    train.add_argument("--chromatin-transform", choices=CHROMATIN_TRANSFORMS, default="as_is",
+                       help="must match the transform the cached velocity was built with")
+    train.add_argument("--rna-target", choices=["auto", "spliced"], default="auto",
+                       help="spliced RNA under the shared u+s library normalization")
+    train.add_argument("--gamma-anchor-csv", required=True,
+                       help="external RNA decay: gene_symbol,molecule,source,gamma_per_hour or half_life_hours")
+    train.add_argument("--lambda-gamma-anchor", type=float, default=1.0)
+    train.add_argument("--gamma-anchor-target", type=float, default=0.5,
+                       help="whole-table geometric-mean gamma in relative model time")
+    train.add_argument("--gamma-hours-per-model-time", type=float, default=None,
+                       help="explicit physical time conversion; otherwise relative-rate anchors")
     train.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     train.add_argument("--training-config", default="config/training.yaml",
                        help="the RNA→protein hyperparameters every unset flag is taken from")
@@ -1514,6 +1741,15 @@ def build_parser() -> argparse.ArgumentParser:
                             "(0 = the full gene space)")
     train.add_argument("--phi-dims", type=int, nargs="+", default=None)
     train.add_argument("--phi-init-gain", type=float, default=None)
+    train.add_argument("--align-block", choices=["spliced"], default="spliced",
+                       help="s is the primary aligned output; u is auxiliary")
+    train.add_argument("--lambda-held-block", type=float, default=1.0,
+                       help="relay only: weight of the unpaired per-gene mean/std match "
+                            "on the block the transport plan cannot see")
+    train.add_argument("--phi-gate", choices=PHI_GATES, default="scalar-zero",
+                       help="how much of the nonlinear path reaches phi's output: "
+                            "scalar-zero starts it at exactly 0 and throttles its "
+                            "gradient, none removes the switch, per-gene starts it open")
     train.add_argument("--phi-residual-weight", type=float, default=1.0,
                        help="maximum nonlinear residual weight around the trainable, "
                             "marginally calibrated G initialisation")
@@ -1563,7 +1799,10 @@ def build_parser() -> argparse.ArgumentParser:
     baseline = sub.add_parser("baseline", help="§14 simple and paired ridge/MLP references")
     baseline.add_argument("--dataset", choices=DATASETS, required=True)
     baseline.add_argument("--split-seed", type=int, default=0)
-    baseline.add_argument("--rna-target", choices=["auto", "spliced", "rna"], default="auto")
+    baseline.add_argument("--rna-target", choices=["auto", "spliced", "rna", "unspliced"],
+                          default="auto",
+                          help="unspliced is the target chromatin drives DIRECTLY: "
+                               "transcription makes u, and s is only made from u")
     baseline.add_argument("--ridge-alpha", type=float, default=100.0)
     baseline.add_argument("--max-fit-cells", type=int, default=20000)
     baseline.add_argument("--mlp-hidden", type=int, nargs="+", default=[256, 128])

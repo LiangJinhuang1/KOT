@@ -1,25 +1,7 @@
 #!/usr/bin/env python3
-"""KOT on the Papalexi GSE153056 CRISPR screen — the experiment, not the exploration.
+"""KOT CRISPR experiment, not the exploratory tools/papalexi.py pair.
 
-`tools/papalexi.py` is the earlier exploratory pair (signal + benchmark) and stays as it
-is. This is the CRISPR experiment proper, and it is built in the order the evaluation has
-to exist before a model result means anything:
-
-  effects   the observed response table, written BEFORE any model is trained
-  gate      the sanity gate: can NT-supervised models predict these responses at all?
-  preprocess  velocity inputs whose every fitted statistic comes from NT cells alone
-  predict   a checkpoint's two perturbation predictions: phi and its Jacobian
-  competitors  put the Task A competitors on the SAME per-replicate delta format
-  evaluate  the full metric suite over the four effect sets, with unit-level CIs
-
-Panel (4 ADTs, and the transcript each one is read off):
-  CD86   -> CD86        PDL1  -> CD274
-  PDL2   -> PDCD1LG2    CD366 -> HAVCR2
-
-THE THRESHOLD IS FROZEN HERE. A knockout is usable when it has at least
-MIN_KO_CELLS cells in each of at least MIN_REPLICATES replicates
-(src.evaluation.perturbation.sufficient_knockouts, the same rule the benchmark's scoring
-set uses). It is fixed before any model is scored so that no later result can move it.
+Evaluation is written before any model is scored, and the knockout threshold is frozen so a later result cannot move it.
 """
 from __future__ import annotations
 
@@ -75,9 +57,7 @@ from tools.papalexi import (
     to_dense,
 )
 
-# Default inputs and outputs, named once: they are shared by five subcommands, and a
-# subcommand pointed at a different protein file than the effects table it is scored
-# against would produce a table nothing else in the pipeline could be joined to.
+# Shared defaults so subcommands cannot point at mismatched files.
 PROTEIN_H5AD = Path("Datasets/Papalexi_GSE153056/papalexi_protein.h5ad")
 METADATA_TSV = Path("data/papalexi/ECCITE_metadata.tsv")
 RNA_H5AD = Path("Datasets/Papalexi_GSE153056/papalexi_rna_input.h5ad")
@@ -86,43 +66,28 @@ CRISPR_DIR = Path("cache/results/crispr")
 EFFECTS_CSV = CRISPR_DIR / "crispr_effects_observed.csv"
 MULTIPERT_SUBSET_CSV = Path("config/papalexi_multipert_subset.csv")
 
-# Frozen before model evaluation. Raising either after seeing a result would be choosing
-# the benchmark to suit the answer.
+# Frozen before evaluation so the benchmark is not chosen after seeing a result.
 MIN_KO_CELLS = 20
 MIN_REPLICATES = 2
 REPLICATE_COLUMN = "replicate"
 
-# A phi whose control-cell spread is below this fraction of the observed spread has
-# collapsed. Rescaling it onto the observed units divides numerical dust by a very small
-# number, which is how the zero-velocity control arm -- sd_ratio 0.002, i.e. a constant
-# phi -- came to post the highest primary Spearman of any ablation. Below the floor the
-# protein is dropped from scoring instead.
+# Collapse threshold: rescale would inflate a near-constant phi, so the protein is dropped instead.
 MIN_CALIBRATION_SD_RATIO = 0.01
 
-# Stabilises the relative Jacobian linearisation error when the nonlinear response is
-# effectively zero. This is deliberately tiny: it prevents division by zero without
-# changing a response at the scale represented by the prediction table.
+# Stabilizer for relative Jacobian error when the nonlinear response is ~0.
 LINEARIZATION_EPS = 1e-12
 
-# A self effect is a knockout of the gene the protein is read off. A CRISPR indel can
-# destroy the protein while leaving the transcript intact, so these say nothing about an
-# RNA->protein map and are counted separately, never scored with the rest.
+# Self effects can destroy protein while leaving transcript; they do not test an RNA→protein map.
 SELF_PAIRS = {(gene, adt) for adt, gene in ADT_GENE_MAP.items()}
 
 
-# The gate is deliberately generous: these models are handed the NT cells' RNA<->protein
-# PAIRING, which KOT never gets. A pass says the responses are predictable from KO RNA at
-# all; it says nothing about whether KOT can do it.
+# Gate is generous because these models get pairing KOT never gets.
 GATE_PREDICTORS = ("zero_change", "cognate_mrna", "ridge", "mlp")
 N_PERMUTATIONS = 2000
 
 
 def load_rna_layer(path: Path, layer: str) -> ad.AnnData:
-    """Read one layer plus obs/var names, not all eleven.
-
-    The retained Papalexi object carries Ms, Mu, velocity, spliced, unspliced and more at
-    ~858MB; a plain read_h5ad of it is the difference between fitting in memory and not.
-    """
+    """Read one layer plus obs/var names so the full object need not fit in memory."""
     with h5py.File(path, "r") as handle:
         matrix = read_elem(handle[f"layers/{layer}"])
         obs_names = read_elem(handle["obs"]).index
@@ -164,8 +129,7 @@ def score_predictor(predicted: np.ndarray, observed: np.ndarray, seed: int) -> d
     finite = np.isfinite(predicted) & np.isfinite(observed)
     predicted, observed = predicted[finite], observed[finite]
     if len(predicted) < 3 or np.std(predicted) == 0:
-        # zero_change is constant by construction: Spearman is undefined, MAE is not, and
-        # MAE is the metric that makes "predict nothing" a meaningful reference.
+        # zero_change has undefined Spearman; MAE is the "predict nothing" reference.
         return {"n_pairs": int(len(predicted)), "spearman": np.nan, "pearson": np.nan,
                 "sign_acc": np.nan, "mae": float(np.mean(np.abs(predicted - observed))),
                 "null_mean": np.nan, "null_sd": np.nan, "z_vs_null": np.nan}
@@ -184,12 +148,7 @@ def score_predictor(predicted: np.ndarray, observed: np.ndarray, seed: int) -> d
 
 
 def pooled_effects(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    """One row per (perturbation, protein): the mean over replicates.
-
-    Equal weight per replicate, matching how the replicate correlations are computed, so
-    a perturbation with more cells in one batch does not quietly become that batch's
-    estimate and the pooled and replicate-level rows stay on the same footing.
-    """
+    """Mean over replicates with equal weight so a larger batch cannot dominate."""
     return frame.groupby(["perturbation", "protein"], as_index=False)[columns].mean()
 
 
@@ -210,12 +169,7 @@ def print_gate_table(title: str, scores: dict[str, dict]) -> None:
 
 
 def gate_verdict(pooled: dict[str, dict], threshold: float) -> int:
-    """PASS if either NT-supervised model is clearly above chance on the pooled effects.
-
-    The spec's rule: if BOTH are random, the dataset or the effect calculation is broken
-    and KOT must not be tuned to compensate. This returns a non-zero exit code in that
-    case so a pipeline stops here rather than proceeding to train.
-    """
+    """PASS if either NT-supervised model is above chance; otherwise stop so KOT is not tuned to a broken evaluation."""
     supervised = {name: pooled[name] for name in ("ridge", "mlp") if name in pooled}
     passing = {name: score for name, score in supervised.items()
                if np.isfinite(score["z_vs_null"]) and score["z_vs_null"] >= threshold}
@@ -237,11 +191,7 @@ def gate_verdict(pooled: dict[str, dict], threshold: float) -> int:
 
 
 def replicate_effect_correlations(effects: pd.DataFrame) -> pd.DataFrame:
-    """Spearman between replicates over their shared (perturbation, protein) effects.
-
-    This is the reproducibility of the thing being predicted. A model cannot beat it, so
-    it belongs in the report before any model number does.
-    """
+    """Replicate Spearman of the quantity being predicted; a model cannot beat this ceiling."""
     wide = effects.pivot_table(index=["perturbation", "protein"], columns="replicate",
                                values="delta_protein")
     replicates = list(wide.columns)
@@ -349,8 +299,7 @@ def effects_main() -> None:
                                 groups, replicates, CONTROL_LABEL)
     usable = sufficient_knockouts(groups, replicates, CONTROL_LABEL,
                                   MIN_KO_CELLS, MIN_REPLICATES)
-    # The rule travels with the table: a reader should not have to re-derive which rows
-    # the thresholds admit, and no downstream script should re-implement it.
+    # The rule travels with the table so downstream does not re-implement it.
     effects["passes_threshold"] = (
         effects["perturbation"].isin(usable) & (effects["n_ko_cells"] >= MIN_KO_CELLS)
     )
@@ -404,8 +353,7 @@ def gate_main() -> None:
     groups = meta["gene"].astype(str)
     replicates = meta[REPLICATE_COLUMN].astype(str)
 
-    # The models are fitted against the SAME ADT units the observed table is in, so the
-    # predicted delta needs no rescaling before it is compared with the observed one.
+    # Predicted deltas are already in observed ADT units.
     values = normalize_adt(to_dense(protein.X).astype(np.float64),
                            np.asarray(meta["nCount_RNA"], dtype=np.float64))[args.normalization]
     protein.X = values.astype(np.float32)
@@ -414,9 +362,7 @@ def gate_main() -> None:
     print(f"[gate] training ridge and MLP on {len(fit_rows)} paired {CONTROL_LABEL} cells")
     predictions = supervised_cell_predictions(rna, protein, fit_rows, args.rna_layer, args.seed)
 
-    # No cognate RNA is needed for the PREDICTED deltas: they are read from the models'
-    # per-cell protein. The observed table already carries delta_cognate_rna, which is
-    # where the cognate-mRNA passthrough reference comes from.
+    # Predicted deltas need no cognate RNA; the observed table already carries it.
     empty_rna = pd.DataFrame(index=pd.Index(cells))
     predicted_tables = {
         name: replicate_effects(matrix, adt_names, empty_rna, ADT_GENE_MAP,
@@ -465,11 +411,7 @@ def gate_main() -> None:
 
 
 def preprocess_main() -> None:
-    """Build the NT-only velocity cache, written BESIDE the existing one, never over it.
-
-    A separate path keeps every finished run reproducible and makes the leakage question
-    answerable by running the same model on both caches.
-    """
+    """NT-only velocity cache beside the existing one so leakage can be tested without overwriting finished runs."""
     parser = argparse.ArgumentParser(
         description="Velocity preprocessing fitted on NT cells only.")
     parser.add_argument("--rna", type=Path,
@@ -501,8 +443,7 @@ def preprocess_main() -> None:
     print(f"[preprocess] {adata.n_obs} cells, {int(fit_mask.sum())} {CONTROL_LABEL} controls "
           f"fitted, {int((~fit_mask).sum())} knockout cells transformed only")
 
-    # Same source of truth and same column the existing velocity pipeline uses, so the
-    # NT-only cache force-retains exactly the ADT target genes the current one does.
+    # Same ADT source as the velocity pipeline.
     retain_genes = sorted({record["gene_symbol"]
                            for record in load_mapping_records(args.retain_genes_csv)
                            if record["gene_symbol"]})
@@ -540,17 +481,9 @@ def benchmark_units_adt(protein_path: Path, metadata_path: Path, normalization: 
 
 def calibrated_phi(model, features: torch.Tensor, observed: np.ndarray,
                    control_mask: np.ndarray) -> np.ndarray:
-    """phi for every cell rescaled onto the observed table's units, and the scale used.
+    """Residual rescale onto observed units, not a units conversion.
 
-    A residual per-protein correction, not a units conversion: phi now trains against the
-    same normalisation the benchmark scores (protein_target_normalization), so this only
-    absorbs the scale a distribution match leaves behind. It cannot rescue a phi trained
-    in another normalisation -- CLR is a per-cell row operation and no per-protein factor
-    inverts it, which is what check_checkpoint_units refuses. The scale is
-    fitted on CONTROL cells only, is strictly POSITIVE, and carries no intercept: an
-    intercept cancels in a difference, and a signed slope would let a model that predicts
-    a protein backwards be flipped the right way round for free. The competitors go
-    through the identical step, so the two are on the same footing.
+    Control-only, strictly positive, no intercept: an intercept cancels in a difference, and a signed slope would flip a backwards map for free. A per-protein factor cannot invert a per-cell transform such as CLR.
     """
     with torch.no_grad():
         predicted = model.phi(features).cpu().numpy().astype(np.float64)
@@ -563,18 +496,9 @@ def perturbation_predictions(model, features: torch.Tensor, groups: pd.Series,
                              replicates: pd.Series, adt_names: list[str],
                              min_cells: int, phi_values: np.ndarray,
                              phi_slope: np.ndarray) -> pd.DataFrame:
-    """The two predictions this benchmark asks a checkpoint for, per (perturbation, replicate).
+    """Per-replicate phi and Jacobian perturbation predictions.
 
-    delta_p_phi       mean phi(r_KO) - mean phi(r_NT). The full nonlinear response of the
-                      learned map, which is what the benchmark scores.
-    delta_p_jacobian  J_phi(mean r_NT) . (mean r_KO - mean r_NT). The LOCAL linear response
-                      of the same map, from one forward-mode pass. It tests the map's
-                      DIFFERENTIAL directly under a real intervention, which is the object
-                      KOT's ODE residual actually constrains -- phi can score well while
-                      its Jacobian is wrong, and only this separates the two.
-
-    Both are taken within a replicate against that replicate's own controls, so a batch
-    shift shared by a knockout and its controls cancels in each.
+    The Jacobian tests the map's differential, which the ODE residual constrains and phi scores can hide. Within-replicate so a shared batch shift cancels.
     """
     is_control = (groups == CONTROL_LABEL).to_numpy()
     rows = []
@@ -613,15 +537,7 @@ def perturbation_predictions(model, features: torch.Tensor, groups: pd.Series,
 
 
 def energy_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """Multivariate energy distance, normalised by the reference cloud's own spread.
-
-    E = 2E|X-Y| - E|X-X'| - E|Y-Y'|, divided by E|Y-Y'| so it is scale-free: 0 means the
-    two clouds are the same distribution, 1 means they are as far apart as the reference
-    is wide. It is sensitive to location, scale and shape of the joint cloud, and WEAKLY
-    sensitive to the between-protein correlation structure: independently permuting each
-    protein of a real sample destroys every correlation and still scores ~0.01 here.
-    `correlation_gap` is what covers that.
-    """
+    """Scale-free energy distance; weakly sensitive to correlation, which correlation_gap covers."""
     cross = float(np.mean(np.linalg.norm(a[:, None, :] - b[None, :, :], axis=-1)))
     within_a = float(np.mean(np.linalg.norm(a[:, None, :] - a[None, :, :], axis=-1)))
     within_b = float(np.mean(np.linalg.norm(b[:, None, :] - b[None, :, :], axis=-1)))
@@ -631,12 +547,7 @@ def energy_distance(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def correlation_gap(a: np.ndarray, b: np.ndarray) -> float:
-    """Mean absolute difference between the two protein-protein correlation matrices.
-
-    The dependence structure energy_distance cannot see. A phi that reproduces each
-    protein's margin while getting their joint behaviour wrong is not reproducing the
-    panel, and on a 4-plex panel that is most of what there is to get right.
-    """
+    """Protein-protein correlation gap that energy_distance cannot see."""
     upper = np.triu_indices(a.shape[1], k=1)
     return float(np.mean(np.abs(np.corrcoef(a, rowvar=False)[upper]
                                 - np.corrcoef(b, rowvar=False)[upper])))
@@ -645,26 +556,9 @@ def correlation_gap(a: np.ndarray, b: np.ndarray) -> float:
 def observational_metrics(model, features: torch.Tensor, protein: np.ndarray,
                           control_mask: np.ndarray, adt_names: list[str], seed: int,
                           max_cells: int = 1500) -> pd.DataFrame:
-    """How well phi reproduces the OBSERVED protein DISTRIBUTION of the fitted cells.
+    """Distributional match of phi to observed protein; KOT is unpaired so paired per-cell scores cannot rank it.
 
-    Distributional, not per-cell, because KOT is unpaired: it never learns which control
-    cell goes with which control protein, so a paired per-cell correlation is a metric it
-    structurally cannot win, and scoring it that way made every arm read ~0.02 and emptied
-    the observational half of the ablation question. What KOT does claim is that phi(r)
-    lands on the protein distribution, and that is what these measure:
-
-      sd_ratio     sd(phi_j) / sd(observed_j). The collapse detector -- a phi pinned to a
-                   constant reads 0 here whatever its correlation says.
-      mean_gap     |mean(phi_j) - mean(obs_j)| / sd(obs_j). Location match.
-      wasserstein  1-D optimal-transport distance per protein, over sd(obs_j). Full
-                   marginal match, not just the first two moments.
-      panel_energy Energy distance over all four proteins at once: location, scale and
-                   shape of the joint cloud.
-      panel_corr_gap Mean |difference| between the predicted and observed protein-protein
-                   correlations, which energy distance is nearly blind to.
-
-    `obs_spearman` is kept but is PAIRED, so it is fair only between paired methods
-    (ridge, MLP, totalVI) and must not be used to rank KOT against them.
+    obs_spearman is paired and is fair only among paired methods.
     """
     rows_all = np.nonzero(control_mask)[0]
     rng = np.random.default_rng(seed)
@@ -699,12 +593,7 @@ def discover_seed_checkpoints(run_dir: Path, checkpoint: str,
                               dataset: str | None = None,
                               model: str | None = None
                               ) -> tuple[list[tuple[Path, int]], str, str]:
-    """Find one model/dataset's seed checkpoints below a run root.
-
-    Dataset and model filters are applied before ambiguity checks. Their authoritative
-    names come from <root>/<model>/<dataset>/seed_<n>/ rather than the root config, whose
-    default model/dataset may differ from the checkpoint being loaded.
-    """
+    """Find seed checkpoints; names come from the path, not the root config, which may disagree."""
     found, datasets, models = [], set(), set()
     for path in sorted(run_dir.glob(f"*/*/seed_*/checkpoint_{checkpoint}.pt")):
         path_dataset = path.parents[1].name
@@ -730,13 +619,9 @@ def discover_seed_checkpoints(run_dir: Path, checkpoint: str,
 
 def check_checkpoint_units(checkpoints: list[tuple[Path, int]], run_cfg: dict,
                            allow_unstamped: bool) -> None:
-    """Refuse a checkpoint whose phi was trained in units this scorer is not scoring.
+    """Refuse a checkpoint trained in different protein units: identical shapes would otherwise score a units mismatch as the map.
 
-    `protein_units` is stamped into every checkpoint by run_kot. A CLR checkpoint and an
-    rna_size one have identical shapes and load into the same architecture without
-    complaint, so nothing else here can tell them apart -- and scoring a CLR phi against
-    the rna_size benchmark ranks a units mismatch, not the map. Checkpoints written
-    before the stamp existed are CLR; they must be retrained, not re-scored.
+    Unstamped checkpoints predate the stamp and were CLR-trained.
     """
     wanted = protein_target_units(run_cfg, run_cfg.get("kot_protein_layer"))
     unstamped, mismatched = [], []
@@ -797,11 +682,7 @@ def predict_main() -> None:
                         help="must match the observed effects table; phi is calibrated "
                              "onto these units before its deltas are taken")
     parser.add_argument("--device", default="auto")
-    # The two control arms randomise S and v per seed, so the checkpoint tool refuses to
-    # rebuild them. Neither quantity is READ here: phi and its JVP are functions of r
-    # alone, and S and v only enter the ODE right-hand side, which this tool never forms.
-    # `real` is therefore safe for those arms and changes nothing for the others -- what it
-    # must NOT be taken to mean is that the arm was trained with the true S or velocity.
+    # Shuffle arms refuse rebuild; phi/JVP depend only on RNA, so `real` is safe and does not mean the arm was trained that way.
     parser.add_argument("--mapping", default="as-trained", choices=["as-trained", "real"],
                         help="use `real` for the kot_s_permute (permS) arm")
     parser.add_argument("--velocity", default="as-trained", choices=["as-trained", "real"],
@@ -842,10 +723,7 @@ def predict_main() -> None:
 
     protein_values = built[3].cpu().numpy()
     control_mask = (groups == CONTROL_LABEL).to_numpy()
-    # The benchmark's own ADT units. With protein_target_normalization=rna_size this is
-    # the same normalisation phi trained against, so the scale below is a residual
-    # correction rather than a units conversion -- which is the point: a per-protein
-    # rescale can correct a scale, and cannot undo a per-cell transform like CLR.
+    # Benchmark ADT units so the scale is a residual, not a unit mismatch.
     benchmark_adt = benchmark_units_adt(args.protein, args.metadata, args.normalization,
                                         rna_adata.obs_names)
 
@@ -866,9 +744,7 @@ def predict_main() -> None:
         agreement = stats.spearmanr(predictions["delta_p_phi"],
                                     predictions["delta_p_jacobian"],
                                     nan_policy="omit")
-        # Never silent: a protein the calibration floor rejected leaves NaN deltas, and a
-        # reader comparing arms has to see that this one predicted nothing for it rather
-        # than find a smaller n in the summary and have to work out why.
+        # Rejected proteins must stay visible as NaN, not silent.
         collapsed = [adt for adt, factor in zip(adt_names, phi_slope)
                      if not np.isfinite(factor)]
         note = f"   COLLAPSED phi, not scored: {collapsed}" if collapsed else ""
@@ -890,8 +766,7 @@ def predict_main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(out, index=False)
 
-    # Written beside the perturbation predictions and tagged the same way, so the two
-    # halves of item 28's question can be joined on (run_dir, checkpoint, seed).
+    # Written beside perturbation predictions so the two halves join.
     obs_table = pd.concat(observational, ignore_index=True)
     for column in ("run_dir", "checkpoint", "dataset", "model"):
         obs_table[column] = combined[column].iloc[0]
@@ -908,12 +783,7 @@ CRISPR_ABLATION_ARMS = ("shuffleVel", "revVel", "zeroVel", "noDyn")
 
 
 def arm_label(run_dir: str, model: str) -> str:
-    """The ablation arm a prediction came from.
-
-    Read from the run directory, because the arm lives in three different config keys
-    (kot_velocity_ablation, kot_velocity_shuffle, kot_s_permute) plus the model name, and
-    deriving it from any one of them silently merges arms.
-    """
+    """Ablation arm from the run directory; any one config key would silently merge arms."""
     name = Path(str(run_dir)).name
     if ARM_PATTERN in name:
         return name.split(ARM_PATTERN, 1)[1]
@@ -922,12 +792,9 @@ def arm_label(run_dir: str, model: str) -> str:
 
 def score_arm_seeds(merged: pd.DataFrame, column: str, n_boot: int,
                     seed: int) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Per (arm, effect set, seed) metrics, and the arm-level consensus with CIs.
+    """Per-seed metrics then arm-level consensus; averaging predictions first would hide seed spread.
 
-    Seeds are scored SEPARATELY and then summarised, so the spread across seeds is a real
-    error bar rather than something hidden by averaging predictions first. The bootstrap
-    CI is taken on the arm's consensus prediction (the per-effect mean over seeds), over
-    PERTURBATIONS -- 24 experiments, not 20,000 cells.
+    Bootstrap CI is over perturbations, not cells.
     """
     per_seed, consensus, breakdown = [], [], {}
     for (arm, effect_set), block in merged.groupby(["arm", "effect_set"]):
@@ -956,8 +823,7 @@ def score_arm_seeds(merged: pd.DataFrame, column: str, n_boot: int,
         row["delta_norm_ratio_mean"] = float(norms["norm_ratio"].mean())
         row["delta_norm_ratio_median"] = float(norms["norm_ratio"].median())
         row["delta_norm_slope"] = delta_norm_slope(pooled, column, "delta_protein")
-        # Both diagnostics are per (perturbation, replicate, seed), so they are de-duplicated
-        # once: repeating the drop for each one counted every experiment four times over.
+        # De-duplicate once so a drop is not counted per diagnostic.
         per_experiment = block.drop_duplicates(["perturbation", "replicate", "seed"])
         for diagnostic in ("delta_r_norm", "jacobian_linearization_error"):
             if diagnostic in per_experiment:
@@ -965,9 +831,7 @@ def score_arm_seeds(merged: pd.DataFrame, column: str, n_boot: int,
                 row[f"{diagnostic}_median"] = float(per_experiment[diagnostic].median())
         consensus.append(row)
 
-        # The three per-set tables item 27 asks to be SAVED rather than summarised: which
-        # proteins the model gets right, which perturbations, and the response shape of
-        # each one. A pooled correlation hides all three.
+        # Saved per set because a pooled correlation hides protein and perturbation failures.
         tag = f"{column}_{arm}_{effect_set}"
         breakdown[f"{tag}_per_protein"] = per_group_correlation(
             pooled, "protein", column, "delta_protein")
@@ -984,12 +848,7 @@ def score_ablation_correlation_differences(
     n_boot: int,
     seed: int,
 ) -> pd.DataFrame:
-    """Paired full-minus-ablation correlation differences over perturbations.
-
-    Predictions are first averaged over seeds and replicates exactly as in the arm-level
-    consensus. Full KOT and one ablation are then inner-joined on the same experimental
-    effects before their shared perturbation bootstrap is drawn.
-    """
+    """Paired full-minus-ablation correlation differences on the same effects, using the consensus averaging."""
     result_columns = [
         "full_arm", "ablation_arm", "effect_set", "predictor", "metric",
         "n_effects", "n_perturbations", "full_correlation",
@@ -1076,7 +935,7 @@ def score_ablation_correlation_differences(
 
 def print_arm_table(consensus: pd.DataFrame, per_seed: pd.DataFrame,
                     observational: pd.DataFrame | None) -> None:
-    """Item 28's question in one table: same observational quality, different perturbational?"""
+    """Same observational quality, different perturbational?"""
     for effect_set in EFFECT_SETS:
         block = consensus[consensus["effect_set"] == effect_set]
         if block.empty:
@@ -1118,12 +977,7 @@ SPEC_METRICS = ["spearman", "pearson", "mae", "nrmse", "sign_acc"]
 
 
 def write_effects_predicted(merged: pd.DataFrame, out_dir: Path) -> Path:
-    """crispr_effects_predicted.csv, one row per scored (perturbation, replicate, protein).
-
-    Every prediction beside the observation it is judged against and the two flags that
-    say which subset it belongs to, so the per-effect record is readable without joining
-    anything back to the observed table.
-    """
+    """Per-effect record with observation and subset flags so it is readable without a join."""
     table = merged.rename(columns={
         "delta_protein": "delta_p_observed",
         "in_self": "is_self",
@@ -1138,12 +992,7 @@ def write_effects_predicted(merged: pd.DataFrame, out_dir: Path) -> Path:
 
 
 def write_summary(consensus: pd.DataFrame, out_dir: Path) -> Path:
-    """crispr_summary.csv, phi and Jacobian side by side on one row per model+condition.
-
-    The per-arm table carries one row PER PREDICTOR; the spec wants them paired, because
-    the question it is built to answer -- does the differential of the map beat the map --
-    is only readable when both sit on the same line.
-    """
+    """Phi and Jacobian on one row so the differential can be compared with the map."""
     wide = consensus.pivot_table(
         index=["model", "condition", "effect_subset"],
         columns="predictor", values=SPEC_METRICS + ["n"], aggfunc="first")
@@ -1209,7 +1058,7 @@ def evaluate_main() -> None:
                + diagnostic_columns)
     merged = observed.merge(predictions[keys + carried], on=keys, how="inner")
     per_effect = merged.copy()
-    # One row per (effect set, arm, seed, effect); an arm is never pooled with another.
+    # One row per (set, arm, seed, effect); never pool arms.
     merged = pd.concat([merged[merged[f"in_{name}"]].assign(effect_set=name)
                         for name in EFFECT_SETS], ignore_index=True)
     print(f"[evaluate] arms: {sorted(predictions['arm'].unique())}")
@@ -1264,11 +1113,7 @@ def evaluate_main() -> None:
 def competitor_deltas(predicted: np.ndarray, observed: np.ndarray, adt_names: list[str],
                       groups: pd.Series, replicates: pd.Series,
                       control_mask: np.ndarray) -> pd.DataFrame:
-    """One competitor's per-replicate predicted deltas, in the observed table's units.
-
-    The per-protein scale is fitted on CONTROL cells only and is strictly positive, so
-    it corrects units without granting a sign flip. KOT goes through the identical step.
-    """
+    """Competitor deltas in observed units; control-only positive scale, same step as KOT."""
     rows = np.nonzero(control_mask)[0]
     scale = positive_scale(predicted.astype(np.float64), observed.astype(np.float64), rows,
                            MIN_CALIBRATION_SD_RATIO)
@@ -1336,8 +1181,7 @@ def competitors_main() -> None:
             frames.append(table)
         print(f"[competitors] {model}: {len(paths)} file(s)")
 
-    # The two mandatory simple references. Neither needs a model, and both are computed
-    # from the observed table so they cannot drift from the effects they are compared to.
+    # Mandatory simple references from the observed table so they cannot drift.
     effects = pd.read_csv(args.effects)
     for arm, column in (("zero_change", None), ("cognate_mrna", "delta_cognate_rna")):
         reference = effects[["perturbation", "replicate", "protein", "n_ko_cells"]].copy()
@@ -1347,8 +1191,7 @@ def competitors_main() -> None:
         print(f"[competitors] {arm}: {len(reference)} rows")
 
     if args.multipert.exists():
-        # MultiPert predicts one delta per (perturbation, protein); broadcast it to the
-        # replicates so it joins, and label the regime it was trained under.
+        # Broadcast MultiPert's per-(perturbation, protein) delta to replicates so it joins.
         pairs = pd.read_csv(args.multipert).rename(columns={"knockout": "perturbation",
                                                             "adt": "protein"})
         keys = effects[["perturbation", "replicate", "protein", "n_ko_cells"]]
@@ -1374,12 +1217,7 @@ def competitors_main() -> None:
 
 def load_task_b_rna(path: Path, perturbation_column: str,
                     matrix_key: str) -> pd.DataFrame:
-    """Load ISP-predicted KO RNA profiles in the frozen KOT input feature space.
-
-    CSV files contain one row per predicted cell (or one row per perturbation) and a
-    perturbation column; duplicate rows are averaged below. H5AD files use
-    obs[perturbation_column] and obsm[matrix_key] (falling back to X).
-    """
+    """Load ISP-predicted KO RNA in the frozen KOT feature space; duplicate rows are averaged."""
     if path.suffix.lower() == ".h5ad":
         predicted = ad.read_h5ad(path)
         if perturbation_column not in predicted.obs:
@@ -1418,12 +1256,7 @@ def task_b_metrics(predicted: np.ndarray, observed: np.ndarray) -> dict:
 
 
 def task_b_main() -> None:
-    """Score predicted KO RNA profiles through a frozen NT-only KOT checkpoint.
-
-    The ISP output must already be represented in the exact feature coordinates consumed
-    by the checkpoint. This command does not fit or tune an ISP, so outputs from
-    RegVelo, GEARS, TxPert, scGPT, or a linear baseline use one common adapter.
-    """
+    """Score predicted KO RNA through a frozen KOT checkpoint; this command does not fit an ISP."""
     parser = argparse.ArgumentParser(
         description="Task B: predicted KO RNA -> frozen KOT -> predicted protein.")
     parser.add_argument("--predicted-rna", type=Path, required=True,
@@ -1464,10 +1297,7 @@ def task_b_main() -> None:
         args.run_dir, args.dataset or found_dataset)
     check_checkpoint_units([(checkpoint, checkpoint_seed)], run_cfg,
                            args.allow_unstamped_checkpoints)
-    # Real velocity and mapping, whatever the arm trained with. Task B reads only the
-    # frozen phi and the input features; velocity merely initialises tensors here. Without
-    # this the shuffle-velocity and permuted-mapping arms refuse to build at all, because
-    # their training-time velocity is per-seed and not reproducible outside training.
+    # Task B reads frozen phi; use real velocity/mapping regardless of training arm.
     built = build_model_and_tensors(run_cfg, rna_adata, protein_adata,
                                     found_model, device,
                                     velocity_mode="real", mapping_mode="real")
@@ -1496,9 +1326,7 @@ def task_b_main() -> None:
         raise ValueError("Task B cannot score a checkpoint with collapsed calibrated phi")
     predicted_profiles = predicted[predicted.columns[1:]].to_numpy(dtype=np.float32)
     perturbations = predicted["perturbation"].to_numpy(dtype=str)
-    # mean phi(r_NT), not phi(mean r_NT): the same reference Task A and the linear ISP
-    # use. The two differ by a Jensen gap that is ~19% of the effect size on this
-    # checkpoint, which is invisible to a correlation and moves every MAE and NRMSE.
+    # mean phi(r_NT), not phi(mean r_NT).
     with torch.no_grad():
         baseline = model.phi(control_rows).mean(dim=0, keepdim=True)
         queries = torch.as_tensor(predicted_profiles, device=device)
@@ -1506,10 +1334,7 @@ def task_b_main() -> None:
             (model.phi(queries) - baseline).cpu().numpy() * phi_slope
         )
 
-    # The frozen effect sets travel with the observation, so Task B is scored on the same
-    # 94 primary pairs Task A is. Pooling every (perturbation, protein) pair instead
-    # silently added the two self effects and four under-sampled pairs that item 26
-    # excludes, which is a different benchmark rather than a different format.
+    # Same frozen effect sets as Task A; pooling all pairs would silently change the benchmark.
     observed = annotate_effect_sets(pd.read_csv(args.effects))
     subset_flags = [f"in_{name}" for name in EFFECT_SETS]
     observed_protein = (
@@ -1557,11 +1382,8 @@ def task_b_main() -> None:
     summary.append({"model": args.isp_model, "seed": checkpoint_seed, "space": "rna",
                     "effect_subset": "all_eligible", **scores, "n": int(len(rna_block))})
     protein_block = effects[effects["space"] == "protein"]
-    # An ISP that emits one mean profile per perturbation cannot produce mean phi(r_KO),
-    # so this arm is stamped phi_of_mean and must not have its MAE or NRMSE compared with
-    # a cell-level ISP's without saying so. Correlations agree to r=0.99.
-    # checkpoint_seed, not args.seed: the latter defaults to None when the run has a
-    # single checkpoint, and default_rng(None) would draw a different interval each run.
+    # Mean-profile ISP cannot emit mean phi(r_KO); do not compare MAE/NRMSE with phi_of_mean.
+    # Use checkpoint_seed, not args.seed: None would make default_rng non-reproducible.
     for row in score_effect_subsets(protein_block, "predicted_delta", "observed_delta",
                                     args.n_boot, checkpoint_seed).to_dict("records"):
         summary.append({"model": args.isp_model, "seed": checkpoint_seed,

@@ -3,34 +3,23 @@
 # Generate jobs.txt for slurm/parallel_train.sh — one runner arg-string per line.
 #
 # Usage:
-#   bash slurm/make_jobs.sh                       # writes jobs.txt
-#   bash slurm/make_jobs.sh --models kot_main     # headline arm only (3x faster)
+#   bash slurm/make_jobs.sh
+#   bash slurm/make_jobs.sh --models kot_main
 #   bash slurm/make_jobs.sh --out jobs/jobs_quick.txt
-#
-# Run dirs contain the literal token @STAMP@; parallel_train.sh replaces it with
-# a single timestamp taken when the sweep starts, so a jobs file can sit around
-# and still produce directories named for when it actually ran.
 #
 #   sbatch --export=ALL,JOBS_FILE=jobs/jobs_quick.txt,MAX_PARALLEL=16 slurm/parallel_train.sh
 #
-# Every line gets a UNIQUE --run-dir: parallel jobs sharing one silently
-# overwrite each other's results. The deliberate exception is that a single line
-# may train several arms via --models, since the runner writes each to
-# <run-dir>/<model>/ — arms sharing a run dir and seed are what make a matched
-# ablation, and tools/make_paper_figures.py refuses to compare arms across runs.
+# @STAMP@ is replaced at sweep start so a jobs file still names dirs for when it ran.
+# Unique --run-dir per line so parallel jobs cannot overwrite each other.
+# Several arms on one line share a run dir and seed, which is what makes a matched ablation.
 set -euo pipefail
 
 STAMP="@STAMP@"   # resolved by parallel_train.sh at run time
 ROOT="cache/training"
 OUT="jobs.txt"
-# These are the REPORTED runs, so they train on every cell, exactly like the baselines
-# do. The validation slice (config/training.yaml val_fraction) exists to choose
-# hyperparameters -- slurm/make_sweep_jobs.sh holds it out -- and once they are chosen
-# there is nothing left to hold it out for. val_foscttm is still written for these runs
-# and is marked in-sample by val_holdout=false, so it can never be mistaken for a
-# held-out number.
+# Reported runs train on every cell like the baselines; the val slice is for hyperparameter choice, not for fitting the reported model.
 FULL_DATA="--set val_holdout_from_training=false"
-# `kot` is the model GROUP: kot + kot_noanchor + kot_nodyn.
+# `kot` is the model group: kot + kot_noanchor + kot_nodyn.
 MODELS="kot"
 REAL_LAMBDAS=(1 2)
 SYN_LAMBDAS=(1 10)
@@ -39,7 +28,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --models) MODELS="$2"; shift 2 ;;
     --out)    OUT="$2";    shift 2 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -81,7 +70,7 @@ lam_tag() { printf "lam%03d" "$1"; }
   done
 } > "${OUT}"
 
-# Count only job lines: the header comment also contains the string "--run-dir".
+# Count lines starting with --; the header comment also contains "--run-dir".
 n_jobs=$(grep -c '^--' "${OUT}")
 n_dirs=$(grep '^--' "${OUT}" | grep -o '\-\-run-dir [^ ]*' | sort -u | wc -l)
 echo "Wrote ${OUT}: ${n_jobs} jobs, ${n_dirs} unique run-dirs"

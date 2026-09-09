@@ -21,6 +21,11 @@ model_groups:
 # not launch every baseline and every stochastic seed.
 default_models: kot_main
 
+# Regulatory chromatin R2 overrides only; RNA→protein defaults remain unchanged.
+chromatin_r2:
+  lambda_dyn: 1.0
+  kot_alpha_max: null  # alpha is a transcription rate, not an abundance multiplier
+
 defaults:
   output_root: cache/training
   synthetic_seed: 42

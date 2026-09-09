@@ -1,33 +1,9 @@
 #!/usr/bin/env python3
-"""Why does phi collapse? Separate "optimiser failed" from "the objective prefers this".
+"""Why does phi collapse? Separate optimiser failure from an objective that prefers collapse.
 
-Three questions, in the order that decides what to fix:
+Reported as a function of `--align-dims`, because empirical OT between independent samples of the same distribution does not vanish in high dimension while a point mass at the barycentre can sit closer than a genuine second sample.
 
- 1. SCALE     Does phi's output span the target's range, or is it squashed toward the mean?
-              Spectral norm caps each layer's gain, so a low-magnitude input may simply be
-              unable to reach the target scale.
-
- 2. OBJECTIVE Is the collapsed map a BAD point of the Sinkhorn loss, or a good one? If the
-              trained phi scores close to what a constant scores, the optimiser is at a
-              minimum the objective genuinely likes, and no amount of tuning fixes it —
-              the loss does not identify the map. If it scores far worse than a paired
-              oracle, the objective is fine and the optimisation is the problem.
-
- 3. HEADROOM  What does the loss look like for a map that IS right (the true paired RNA)?
-              That is the value a working run should approach.
-
-Everything is reported as a function of the number of target directions the divergence is
-measured in, because that is the knob `--align-dims` turns. Empirical OT between two
-independent n-samples of the same distribution does not vanish in high d — it decays like
-n^(-1/d), which at d=2000 is barely at all — while a point mass at the barycentre sits
-closer to the cloud than a genuine second sample does. If that is what is happening, the
-oracle beats the constant at low d and loses at high d.
-
-`blur` is an absolute length and the gauge that makes it relative is fitted in the FULL
-space, so projecting shrinks the cloud without shrinking the blur. `blur_over_pair_distance`
-is that ratio in the space each row was actually measured in: a large value says the
-divergence has been smoothed until it cannot tell the three maps apart, which is a
-different failure from the concentration one and has the opposite fix.
+`blur` is an absolute length; `blur_over_pair_distance` is that length in the space each row was measured in.
 """
 
 from __future__ import annotations
@@ -55,9 +31,7 @@ from src.training.kot import choose_torch_device
 def spread_ratio(predicted: torch.Tensor, observed: torch.Tensor) -> float:
     """Median per-gene spread of the map over that of the target — the collapse number.
 
-    A phi that ignores its input still scores a respectable Sinkhorn loss by sitting on the
-    target's mean, and the loss curve looks the same either way. This ratio is what tells
-    the two apart.
+    A phi that ignores its input still scores a respectable Sinkhorn loss by sitting on the target's mean.
     """
     return float(predicted.std(dim=0).median() / observed.std(dim=0).median())
 
@@ -83,9 +57,7 @@ def held_out_metrics(predicted: np.ndarray, observed: np.ndarray, gene_names: li
                      seed: int) -> dict:
     """Task A and Task B on test cells, where the pairing is revealed after the fact.
 
-    Same functions the `evaluate` stage calls, on a capped sample: the point is to read
-    the collapse in the reported metrics without paying for a full evaluation of a run
-    that is only being diagnosed.
+    Same functions the evaluate stage calls, on a capped sample so a diagnostic run is not a full evaluation.
     """
     summary, _ = task_a_state(predicted, observed, gene_names)
     retrieval = retrieval_metrics(predicted, observed, seed)
@@ -116,8 +88,7 @@ def main() -> int:
     parser.add_argument("--out", default=None, help="JSON path (default: inside the run dir)")
     args = parser.parse_args()
 
-    # The gauge probes 1000 random cells, so without a seed the same checkpoint gives a
-    # slightly different align_scale on every call and the runs stop being comparable.
+    # Seed the gauge subsample so align_scale is comparable across calls.
     torch.manual_seed(0)
     device = choose_torch_device({"device": args.device})
     model, payload, config = chromatin.load_checkpoint(Path(args.run_dir), args.checkpoint,
@@ -151,7 +122,7 @@ def main() -> int:
     with torch.no_grad():
         predicted = model.phi(torch.as_tensor(activity[a_sample], device=device))
     observed = torch.as_tensor(target[r_sample], device=device)
-    paired = torch.as_tensor(target[a_sample], device=device)   # the ATAC cells' OWN RNA
+    paired = torch.as_tensor(target[a_sample], device=device)
     candidates = {"constant": observed.mean(0, keepdim=True).expand_as(predicted),
                   "trained_phi": predicted, "paired_oracle": paired}
 
@@ -201,6 +172,12 @@ def main() -> int:
             chromatin.spliced_block(target[test_sample], payload["law"]),
             list(payload["gene_names"]), config["seed"]),
     }
+    # Report relay u beside s, not instead of it.
+    if payload["law"] == chromatin.RELAY:
+        results["held_out_unspliced"] = held_out_metrics(
+            chromatin.unspliced_block(test_predicted.cpu().numpy(), payload["law"]),
+            chromatin.unspliced_block(target[test_sample], payload["law"]),
+            list(payload["gene_names"]), config["seed"])
     out = Path(args.out) if args.out else Path(args.run_dir) / "failure_analysis.json"
     out.write_text(json.dumps(results, indent=2))
     print(json.dumps(results, indent=2))

@@ -72,6 +72,29 @@ def calc_domainAveraged_FOSCTTM(x1_mat: np.ndarray, x2_mat: np.ndarray) -> list[
     return [(f1 + f2) / 2 for f1, f2 in zip(fracs1, fracs2)]
 
 
+def permuted_pairing_floor(prediction: np.ndarray, observed: np.ndarray,
+                           seed: int = 0) -> float:
+    """FOSCTTM of the same predictions under a shuffled correspondence.
+
+    This is the "no per-cell information" baseline. A CONSTANT map cannot serve as one:
+    `calc_frac_idx` counts strictly-closer neighbours, so when every predicted row is the
+    same vector the observed->prediction direction is entirely ties and scores exactly 0,
+    and `calc_domainAveraged_FOSCTTM` returns (0.5 + 0)/2 = 0.25 for ANY data — measured
+    to 6 decimal places at n = 500, 2000 and 878. That is the same tie artefact
+    `is_degenerate_embedding` warns about, inherited by anything using a collapsed
+    embedding as its reference, and it makes the floor 0.25 by arithmetic rather than by
+    property of the data.
+
+    Permuting leaves the predictions non-degenerate, so both directions are honest and the
+    floor sits at 0.5. Collapse is still caught, by the separate spread-ratio check.
+    """
+    predicted = np.asarray(prediction)
+    if len(predicted) != len(observed):
+        raise ValueError("permuted pairing needs one prediction per observed cell")
+    order = np.random.default_rng(seed).permutation(len(predicted))
+    return float(np.mean(calc_domainAveraged_FOSCTTM(predicted[order], np.asarray(observed))))
+
+
 def is_degenerate_embedding(matrix: np.ndarray, tol: float = 1e-8) -> bool:
     """
     True when an embedding has collapsed to (essentially) a single point: every

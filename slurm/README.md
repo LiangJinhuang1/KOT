@@ -187,66 +187,86 @@ sbatch --partition=jobs-cpu --gres=none --mem=128GB --time=02:00:00 --job-name=v
   slurm/train_slurm.sh
 ```
 
-**Chromatin→RNA (`run_kot_chromatin.py`)** — the second modality pair. Stages run in this
-order; each writes into `cache/chromatin/` and the next one refuses to start without it.
+**Chromatin→RNA (`run_kot_chromatin.py`)** uses regulatory R2 only:
+`du = kappa(c) [alpha(Gc) - beta*u]`, `ds = kappa(c) [beta*u - gamma*s]`.
+The transport output is spliced RNA; unspliced RNA is auxiliary and receives an
+unpaired marginal constraint. Both use `log1p` after a shared `1e4/sum(u+s)` factor;
+the ODE is transformed to these coordinates before comparison with the JVP.
+`G` feeds the transcription-rate network. It is not an abundance multiplier.
+The reduced law and old multiplicative-relay checkpoints cannot be trained/loaded.
+
+The gamma prior comes from the human K562 sheet of [TimeLapse-seq Supplementary
+Table 2](https://www.nature.com/articles/nmeth.4582). The CSV contains 5,391 genes:
+11 ambiguous spreadsheet date serials and 17 genes with more than twofold replicate
+disagreement are excluded. The adjacent JSON records the original workbook and CSV
+checksums. This is a prior from a different cell system, not measured BMMC/HSPC
+kinetics. By default the whole-table geometric mean is set to 0.5 in model time,
+before intersecting with the RNA training panel; it does not calibrate kappa to hours.
+
+After syncing the local changes, run this **from the server repository root** to
+check the existing caches and anchor coverage without training:
 
 ```bash
-# 1. build the paired object (CPU). hspc streams two 10x ARC matrices and does an LSI
-#    over ~197k union peaks, so give it memory; bmmc reuses the shipped gene activity.
+mkdir -p logs
+sbatch --partition=jobs-cpu --gres=none --mem=96GB --time=00:30:00 --job-name=chr_r2_check \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -m unittest discover -s tests -p "test_chromatin*.py" -v && PYTHONPATH=. python -u run_kot_chromatin.py check-r2 --dataset bmmc --gamma-anchor-csv config/gamma_anchors_k562_timelapse.csv' \
+  slurm/train_slurm.sh
+```
+
+Replace `bmmc` with `hspc` for its check. Read `logs/slurm<JOBID>.log` and `.err`.
+`check-r2` verifies the split cell order and velocity protocol, selects output genes
+using only measured RNA training cells, and reports dynamic training cells, supported
+genes, actual anchor coverage, and available RNA-reference layers. It does not alter
+prepared data or frozen splits. Missing dependencies or caches fail visibly.
+
+If inputs are missing, prepare them through the existing container on SLURM; use the
+same frozen split seed (0). Do not replace existing splits merely to make a check pass.
+
+```bash
 sbatch --partition=jobs-cpu --gres=none --mem=192GB --time=06:00:00 \
   --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py prepare --dataset hspc' \
   slurm/train_slurm.sh
-
-# 2. audit, split, chromatin velocity (CPU, minutes)
-PYTHONPATH=. python -u run_kot_chromatin.py audit    --dataset bmmc --law reduced
-PYTHONPATH=. python -u run_kot_chromatin.py split    --dataset bmmc --seed 0
-PYTHONPATH=. python -u run_kot_chromatin.py velocity --dataset bmmc
-
-# 3. the Task D reference: scVelo on the panel's own spliced/unspliced (CPU, hours)
+# For a dataset without a split/velocity cache, in this order:
+sbatch --partition=jobs-cpu --gres=none --mem=96GB --time=04:00:00 \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py split --dataset hspc --seed 0 && PYTHONPATH=. python -u run_kot_chromatin.py velocity --dataset hspc --split-seed 0' \
+  slurm/train_slurm.sh
+# If the RNA-only reference is absent, build it before the pilot:
 sbatch --partition=jobs-cpu --gres=none --mem=96GB --time=08:00:00 \
   --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py reference --dataset hspc' \
   slurm/train_slurm.sh
-
-# 4. train one condition (GPU)
-sbatch --job-name=chrom_r1 --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py \
-  train --dataset bmmc --law reduced --condition full --seed 0' slurm/train_slurm.sh
-
-# 5. score it: Tasks A-D, biological AND internal track (GPU)
-sbatch --job-name=chrom_eval --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py \
-  evaluate --run-dir cache/chromatin/runs/<run>' slurm/train_slurm.sh
 ```
 
-Do not put chromatin lines in `parallel_train.sh`: that launcher hardcodes
-`python -m src.training.runner`. The phase submitter uses one `train_slurm.sh` job per
-condition, evaluates it, and refuses every later phase until all four pilot directories
-contain `preflight_passed.json`:
+Review the R2 pilot commands, then submit two seed-42 arms for one dataset:
 
 ```bash
-# exactly four jobs: HSPC/BMMC × R1 full/noDyn, one seed
-bash slurm/submit_chromatin_phase.sh pilot
-
-# only after all four pass: eight remaining R1 jobs, then six R2 jobs
-bash slurm/submit_chromatin_phase.sh r1-ablation
-bash slurm/submit_chromatin_phase.sh relay
+bash slurm/submit_chromatin_phase.sh pilot bmmc --dry-run
+bash slurm/submit_chromatin_phase.sh pilot bmmc
+# Only after both full/noDyn pass the existing validation gates:
+bash slurm/submit_chromatin_phase.sh shuffle bmmc
 ```
 
-Together those phases are the exact 18 one-seed conditions: per dataset, R1 has
-full/shuffle/reverse/zero/noDyn/permG and R2 has full/shuffle/noDyn. Development and final
-runs are separate explicit phases:
+Use `both` to select HSPC and BMMC explicitly. Each run has a new `regulatory_r2_v1`
+prefix, and existing directories are refused. The submitter passes gamma anchors and
+`--lambda-dyn 1` explicitly. It supports only pilot/shuffle; retired R1 and large sweep
+phases are rejected. A successful command or low internal ODE residual alone is not
+biological validation; inspect `preflight.json`, including prediction spread and the
+centred JVP comparison against its permutation null. Gates are unchanged.
+
+Evaluate the held-out test set separately after validation decisions are frozen:
 
 ```bash
-# 18 conditions × 3 frozen development seeds
-bash slurm/submit_chromatin_phase.sh development
-
-# 12 seeds: six central conditions per dataset (R1/R2 full, shuffle, noDyn)
-bash slurm/submit_chromatin_phase.sh final-central
-
-# optional frozen run of all 18 conditions × 12 seeds
-bash slurm/submit_chromatin_phase.sh final-all
+sbatch --job-name=chr_r2_eval \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py evaluate --run-dir cache/chromatin/runs/regulatory_r2_v1_bmmc_relay_full_seed42' \
+  slurm/train_slurm.sh
 ```
 
-The submitter passes `--lambda-dyn 1` explicitly; it never inherits the RNA→protein
-default of 1000, which collapses this 2,000-gene chromatin map.
+Do not put chromatin commands in `parallel_train.sh`, which invokes the RNA→protein
+runner. Historical job lists under `jobs/` describe prior experiments and are not R2
+launch commands. To rebuild anchors from the original workbook:
+
+```bash
+python tools/build_gamma_anchors.py --out config/gamma_anchors_k562_timelapse.csv
+```
 
 **BMMC spliced/unspliced over every batch** (CPU, long). The cached
 `bmmc_multiome_scvelo_results.h5ad` covers s1d1 and s2d4 only — 10,780 of 69,249 cells,

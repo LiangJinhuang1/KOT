@@ -1,16 +1,7 @@
 #!/usr/bin/env python
 """Task B in-silico perturbation: predict knockout RNA, then score it through frozen KOT.
 
-One entry point for every competitor. The selected model's module is imported only after
-the model name is read, because GEARS and scGPT run under their own virtualenvs and the
-five dependency stacks cannot be imported in one process:
-
-    python run_crispr_isp.py linear --run-dir RUN --out-dir OUT
-    python run_crispr_isp.py regvelo --run-dir RUN --out-dir OUT
-    cache/.gears_venv/bin/python run_crispr_isp.py gears --out-dir OUT
-    cache/.scgpt_venv/bin/python run_crispr_isp.py scgpt --out-dir OUT
-
-`run_crispr_isp.py MODEL --help` lists that model's own options.
+One entry point; the selected module is imported only after the name is read, because competitor stacks cannot share a process.
 """
 from __future__ import annotations
 
@@ -22,8 +13,7 @@ from src.evaluation.isp import MODELS
 
 
 def main() -> None:
-    # Two stages: the model name selects a module, and only that module contributes the
-    # rest of the command line. Building one parser up front would import all five.
+    # Two-stage parser so unused competitor modules are not imported.
     selector = argparse.ArgumentParser(add_help=False)
     selector.add_argument("model", choices=sorted(MODELS))
     selected, remaining = selector.parse_known_args()

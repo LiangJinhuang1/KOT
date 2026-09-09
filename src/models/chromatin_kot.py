@@ -10,9 +10,8 @@ degradation). The relay law needs two per-gene rates, and they mean different th
     beta   splicing:    unspliced -> spliced
     gamma  degradation: spliced -> nothing
 
-The reduced law needs only gamma, and its gamma plays exactly the role the frozen model's
-beta plays. Both are parameters rather than networks for the same reason as there: a rate
-that varies per cell is not identifiable against a per-cell kappa.
+Both rates are per-gene parameters. The transcription head receives Gc as regulatory
+input and produces alpha directly; chromatin is not a molecular substrate in the ODE.
 
 Every other constructor default matches `config/training.yaml`, which is where a run
 actually reads them from — the defaults here only make the class usable on its own.
@@ -25,6 +24,20 @@ import torch.nn as nn
 
 from src.losses.chromatin_laws import RELAY
 from src.models.KOT import BoundedPositiveMLP, PhiTheta
+
+# How much of the nonlinear path reaches the output, and whether that is learned.
+PHI_GATES = ["scalar-zero", "none", "per-gene"]
+
+
+def residual_gate_init(scale: torch.Tensor) -> torch.Tensor:
+    """Per-gene gate, opened widest where the affine path cannot carry the gene.
+
+    `gene_affine_calibration` leaves scale == 0 wherever a marginal could not be matched
+    — 207 of 992 BMMC outputs — and those genes are a constant bias plus whatever the
+    network adds. They start nearly open; a gene that already has a usable affine path
+    starts near half, so the warm start survives where it means something.
+    """
+    return torch.where(scale == 0, 1.5, 0.5)
 
 
 class GeneAffineResidualPhi(PhiTheta):
@@ -40,7 +53,7 @@ class GeneAffineResidualPhi(PhiTheta):
 
     def __init__(self, d_input: int, d_output: int, hidden_dims: list[int],
                  projection: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor,
-                 residual_weight: float = 1.0, **kwargs):
+                 residual_weight: float = 1.0, gate: str = "scalar-zero", **kwargs):
         super().__init__(d_input, d_output, hidden_dims, **kwargs)
         if projection.shape != (d_output, d_input):
             raise ValueError(
@@ -56,17 +69,35 @@ class GeneAffineResidualPhi(PhiTheta):
         self.gene_scale = nn.Parameter(scale.detach().clone().float())
         self.gene_bias = nn.Parameter(bias.detach().clone().float())
         self.residual_weight = float(residual_weight)
-        self.residual_gate = nn.Parameter(torch.zeros(()))
+        self.gate = gate
+        if gate == "scalar-zero":
+            self.residual_gate = nn.Parameter(torch.zeros(()))
+        elif gate == "per-gene":
+            self.residual_gate = nn.Parameter(residual_gate_init(scale))
+
+    def residual_scale(self) -> torch.Tensor | float:
+        """How much of the network reaches the output.
+
+        "scalar-zero" multiplies the network by tanh(0) = 0 at step 1, which also zeroes
+        the gradient on every network weight; the gate then only moves if the output of a
+        still-random network happens to help, so it does not. Measured over 500 BMMC
+        epochs it ended at -0.077, meaning the nonlinear path trained throttled by ~12x
+        for the whole run while the affine path had full gradient from the start. The
+        other two modes exist to measure that: "none" removes the switch, "per-gene"
+        starts it open and lets each gene decide.
+        """
+        if self.gate == "none":
+            return self.residual_weight
+        return self.residual_weight * torch.tanh(self.residual_gate)
 
     def forward(self, chromatin: torch.Tensor) -> torch.Tensor:
         projected = chromatin @ self.gene_projection.T
         base = projected * self.gene_scale + self.gene_bias
-        residual_scale = self.residual_weight * torch.tanh(self.residual_gate)
-        return base + residual_scale * self.net(chromatin)
+        return base + self.residual_scale() * self.net(chromatin)
 
 
 class ChromatinKOT(nn.Module):
-    """phi: chromatin → RNA (or → [unspliced, spliced]), with kappa, alpha, beta, gamma."""
+    """phi: chromatin → [unspliced, spliced], with kappa, alpha, beta, gamma."""
 
     def __init__(
         self,
@@ -83,17 +114,20 @@ class ChromatinKOT(nn.Module):
         kappa_min: float = 1e-3,
         kappa_max: float | None = 1.5,
         alpha_min: float = 1e-5,
-        alpha_max: float | None = 3.0,
+        alpha_max: float | None = None,
         phi_projection: torch.Tensor | None = None,
         phi_scale: torch.Tensor | None = None,
         phi_bias: torch.Tensor | None = None,
         phi_residual_weight: float = 1.0,
+        phi_gate: str = "scalar-zero",
     ):
         super().__init__()
+        if law != RELAY:
+            raise ValueError("The reduced chromatin law is retired; use relay R2.")
         self.law = law
         self.n_genes = n_genes
         self.n_input_features = n_genes if n_input_features is None else n_input_features
-        phi_output = 2 * n_genes if law == RELAY else n_genes
+        phi_output = 2 * n_genes
         phi_kwargs = dict(
             init_gain=phi_init_gain, activation=activation, init_method=init_method,
             use_spectral_norm=phi_spectral_norm,
@@ -105,20 +139,20 @@ class ChromatinKOT(nn.Module):
                 raise ValueError("gene-aware phi needs projection, scale, and bias")
             self.phi = GeneAffineResidualPhi(
                 self.n_input_features, phi_output, list(phi_dims), phi_projection,
-                phi_scale, phi_bias, residual_weight=phi_residual_weight, **phi_kwargs)
+                phi_scale, phi_bias, residual_weight=phi_residual_weight,
+                gate=phi_gate, **phi_kwargs)
         self.kappa = BoundedPositiveMLP(
             self.n_input_features, 1, list(kappa_dims), activation=activation,
             init_method=init_method,
             min_value=kappa_min, max_value=kappa_max,
         )
         self.g = BoundedPositiveMLP(
-            self.n_input_features, n_genes, list(g_dims), activation=activation,
+            n_genes, n_genes, list(g_dims), activation=activation,
             init_method=init_method,
             min_value=alpha_min, max_value=alpha_max,
         )
         self.gamma_raw = nn.Parameter(torch.rand(n_genes) * 0.1)
-        if law == RELAY:
-            self.beta_raw = nn.Parameter(torch.rand(n_genes) * 0.1)
+        self.beta_raw = nn.Parameter(torch.rand(n_genes) * 0.1)
         self.softplus = nn.Softplus()
 
     @property

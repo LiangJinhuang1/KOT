@@ -1,0 +1,25 @@
+{
+  "source": "Schofield2018_NatMethods_TimeLapseSeq_SuppTable2",
+  "doi": "10.1038/nmeth.4582",
+  "url": "https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fnmeth.4582/MediaObjects/41592_2018_BFnmeth4582_MOESM5_ESM.xlsx",
+  "sheet": "Table S2_K562",
+  "workbook_sha256": "d5c010c1c2b1b22319310644e3194674ac58af059542862639cd43e720e60f19",
+  "csv_sha256": "1b1ca60258f2bed5867480381b747601bf98c2dbda05539871e42ac01910ecad",
+  "source_rows": 5419,
+  "anchor_genes": 5391,
+  "max_replicate_log_ratio": 0.6931471805599453,
+  "ambiguous_symbols": [
+    "42799",
+    "42800",
+    "42801",
+    "42802",
+    "42989",
+    "42980",
+    "42983",
+    "42984",
+    "42985",
+    "42986",
+    "42987"
+  ],
+  "duplicate_policy": "arithmetic mean half-life, then gamma = ln(2) / half-life"
+}
