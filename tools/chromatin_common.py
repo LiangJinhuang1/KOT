@@ -115,10 +115,19 @@ def gate_verdict(name: str) -> str:
         else "fail"
 
 
-def preflight(name: str) -> dict:
-    """The run's gate checks, whichever file they landed in."""
+def preflight(name: str, checkpoint: str = "best_align") -> dict:
+    """The run's gate checks for one checkpoint.
+
+    Newer scores land in `preflight_{checkpoint}.json`. `best_align` still falls
+    back to the untagged launch-gate files so older runs stay readable.
+    """
     import json
     run = Path("cache/chromatin/runs") / name
+    tagged = run / f"preflight_{checkpoint}.json"
+    if tagged.exists():
+        return json.loads(tagged.read_text())
+    if checkpoint != "best_align":
+        raise FileNotFoundError(tagged)
     passed = run / "preflight_passed.json"
     return json.loads((passed if passed.exists() else run / "preflight.json").read_text())
 

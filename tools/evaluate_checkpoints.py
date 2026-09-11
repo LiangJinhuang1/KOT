@@ -314,8 +314,7 @@ def build_model_and_tensors(
     P_t = to_tensor(y, device)
     S_t = to_tensor(S_model, device)
     mask_t = to_tensor(kin_mask_np, device) if kin_mask_np is not None else None
-    # Effective velocity as run_kot built it, so physics numbers match the checkpoint.
-    # as-trained reproduces a control arm's broken field; --velocity real is written under its own name.
+    # Same effective velocity as training. as-trained keeps a control arm's broken field; --velocity real is a separate file.
     if velocity_mode == "as-trained":
         if resolve_velocity_ablation(run_cfg) == "shuffle":
             # Per-seed permutation cannot be rebuilt here; refuse rather than write a different field under the same name.

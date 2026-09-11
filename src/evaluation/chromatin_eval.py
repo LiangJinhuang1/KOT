@@ -35,7 +35,7 @@ from src.evaluation.knn_alignment import alignment_curve
 from src.losses.entropic_ot import sinkhorn_plan
 
 RETRIEVAL_DEPTHS = [1, 5, 10]
-# MaxFuse-style FOSKNN: k as a fraction of n, so HSPC (~5k) and BMMC (~14k) share an axis.
+# k as a fraction of n so datasets of different size share an axis.
 FOSKNN_FRACTIONS = (0.01, 0.05, 0.10)
 
 
@@ -107,12 +107,8 @@ def centred_cosine_null(pushforward: np.ndarray, reference: np.ndarray,
                         n_permutations: int = 20, seed: int = 0) -> dict:
     """The centred cosine's chance level, from random cell pairings.
 
-    Zero is not the chance level for this statistic. Measured on 2026-09-08
-    (`tools/chromatin_velocity_diagnostics.py ceiling`), a ridge fitted on deliberately shuffled pairs
-    still scored a raw cosine of +0.39 and a centred one of +0.006 against BMMC's scVelo
-    reference — both comfortably "positive". Repairing the same two fields at random says
-    what this many cells over this many genes gives for nothing, and an observed value is
-    only evidence once it clears that.
+    Zero is not the chance level: a shuffled-pair fit can still look positive on the raw
+    cosine because every field shares the reference mean. Only a value above this null is evidence.
     """
     rng = np.random.default_rng(seed)
     draws = [float(np.median(centred_cosine(pushforward, reference[rng.permutation(len(reference))])))
@@ -193,10 +189,7 @@ def retrieval_metrics(predicted: np.ndarray, observed: np.ndarray, seed: int = 0
     metrics["partner_diversity"] = float(len(np.unique(partners)) / len(predicted))
     metrics["top_partner_share"] = float(counts.max() / len(predicted))
     metrics["foscttm"] = float(np.mean(calc_domainAveraged_FOSCTTM(predicted, observed)))
-    # The permuted floor is the one a verdict may be read off. The constant floor is
-    # (0.5 + 0)/2 = 0.25 for any data, because a collapsed reference ties every distance in
-    # one of the two averaged directions; it stays only so pre-2026-09-09 runs remain
-    # comparable.
+    # Gate on the permuted floor. The constant floor is kept so older files remain readable.
     metrics["foscttm_permuted_floor"] = permuted_pairing_floor(predicted, observed, seed)
     constant = np.tile(predicted.mean(axis=0), (len(predicted), 1)).astype(predicted.dtype)
     metrics["foscttm_constant_floor"] = float(

@@ -181,13 +181,7 @@ def subset_masks(kin_mask: np.ndarray, align_mask: np.ndarray,
                  anchor_mask: np.ndarray) -> dict:
     """The protein subsets each metric is reported over.
 
-    Each contrast is a split of the term above it, never two arbitrary halves of the
-    panel. `kinetics` vs `alignment_only` splits the ALIGNED panel, so the two differ by
-    the ODE residual alone -- taking `kinetics` over the whole array instead would make
-    the comparison hold only for the proteins the two masks happen to share. `anchored`
-    vs `kinetic_unanchored` splits the KINETIC panel for the same reason: beta appears
-    only in the residual, so an anchor on a protein outside it constrains nothing and
-    would otherwise pad both anchor subsets with proteins the prior never touched.
+    Each contrast splits the term above it, so the two differ by one ingredient only.
     """
     return {
         "measured_panel": np.ones_like(kin_mask),
@@ -210,7 +204,7 @@ def evaluate_one_seed(model, ckpt_path: Path, R_t, V_eff_t, P_t, S_t, mask_t,
     rows = val_idx if val_idx is not None else torch.arange(R_t.shape[0], device=R_t.device)
     R_eval, P_eval = R_t[rows], P_t[rows]
 
-    # phi under no_grad; the JVP below needs autograd and is taken separately.
+    # phi under no_grad; the JVP below needs autograd.
     with torch.no_grad():
         pred = model.phi(R_eval).cpu().numpy().astype(np.float64)
     true = P_eval.cpu().numpy().astype(np.float64)
@@ -234,8 +228,7 @@ def evaluate_one_seed(model, ckpt_path: Path, R_t, V_eff_t, P_t, S_t, mask_t,
         "true_sd": true.std(axis=0),
     })
 
-    # Per-protein ODE agreement, on the same held-out cells. Only the kinetic panel: a
-    # masked protein has both sides forced to zero, so its correlation is meaningless.
+    # Only the kinetic panel: a masked protein has both sides forced to zero.
     _phi, dphi_dv, rhs, _k, _a = jvp_and_rhs(model, R_eval, V_eff_t[rows], S_t, mask_t)
     jvp_np = dphi_dv.detach().cpu().numpy().astype(np.float64)
     rhs_np = rhs.detach().cpu().numpy().astype(np.float64)
@@ -246,8 +239,7 @@ def evaluate_one_seed(model, ckpt_path: Path, R_t, V_eff_t, P_t, S_t, mask_t,
     frame.loc[~frame["in_kinetics"], ["dyn_pearson", "dyn_spearman", "dyn_nrmse",
                                       "dyn_sign_agreement"]] = np.nan
 
-    # Per-cell profile accuracy, computed within each protein subset: a cell's profile
-    # over the kinetic panel is a different question from its profile over the whole panel.
+    # Per-cell profile accuracy within each protein subset.
     per_cell = {}
     for name, mask in subset_masks(kin_mask, align_mask, anchor_mask).items():
         if mask.sum() < 2:      # a correlation across one protein is not defined

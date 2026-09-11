@@ -10,25 +10,90 @@ import pandas as pd
 import torch
 from scipy import sparse
 
+from src.losses.chromatin_laws import (
+    CP10K_TARGET, GLOBAL_LINEAR, PANEL_LOG1P_COMPOSITIONAL, resolve_kinetic_coords,
+)
+
 SHARED_SPLICED = "spliced_shared_lognorm"
 
 
-def shared_splicing_targets(adata, columns=None) -> np.ndarray:
-    """log1p(u), log1p(s) under ONE factor 1e4 / sum(u+s), before gene selection.
-
-    This is a fixed coordinate convention, not a library-size dynamical model.
-    Source-cell RNA never enters the ODE. Raw and existing layers stay unchanged.
-    """
+def splicing_count_matrices(adata, columns=None):
     u = sparse.csr_matrix(adata.layers["unspliced"], dtype=np.float32)
     s = sparse.csr_matrix(adata.layers["spliced"], dtype=np.float32)
     if any(not np.isfinite(x.data).all() or (x.data < 0).any() for x in (u, s)):
         raise ValueError("Shared RNA normalization needs finite nonnegative counts")
-    totals = np.asarray((u + s).sum(axis=1)).ravel()
-    factor = sparse.diags(1e4 / np.maximum(totals, 1.0))
     selected = slice(None) if columns is None else columns
+    return u, s, selected
+
+
+def panel_library_totals(adata, columns) -> np.ndarray:
+    """Per-cell sum of unspliced+spliced on the modeled genes."""
+    if columns is None:
+        raise ValueError("panel library totals need the modeled gene columns")
+    u, s, selected = splicing_count_matrices(adata, columns)
+    return np.asarray((u[:, selected] + s[:, selected]).sum(axis=1)).ravel()
+
+
+def global_linear_scale(totals: np.ndarray) -> float:
+    """One library scale for every cell, from the permitted training totals only."""
+    positive = np.asarray(totals, dtype=np.float64)
+    positive = positive[np.isfinite(positive) & (positive > 0)]
+    if len(positive) == 0:
+        raise ValueError("no positive panel library sizes to set the global RNA scale")
+    return float(np.median(positive))
+
+
+def shared_splicing_targets(adata, columns=None, *, library: str = "transcriptome") -> np.ndarray:
+    """log1p(u), log1p(s) under ONE factor CP10K / T.
+
+    library='transcriptome' uses T = sum(u+s) before gene selection (the current
+    convention). library='panel' uses T on the modeled genes so a compositional
+    \(\dot T\) can be written from the relay itself.
+    This is a coordinate convention, not a library-size dynamical model, until the
+    ODE adds the compositional term. Source-cell RNA never enters the ODE. Raw and
+    existing layers stay unchanged.
+    """
+    u, s, selected = splicing_count_matrices(adata, columns)
+    if library == "transcriptome":
+        totals = np.asarray((u + s).sum(axis=1)).ravel()
+    elif library == "panel":
+        if columns is None:
+            raise ValueError("panel CP10K needs the modeled gene columns")
+        totals = np.asarray((u[:, selected] + s[:, selected]).sum(axis=1)).ravel()
+    else:
+        raise ValueError(f"library must be transcriptome or panel, got {library!r}")
+    factor = sparse.diags(CP10K_TARGET / np.maximum(totals, 1.0))
     return np.concatenate([
         np.log1p((factor @ x)[:, selected].toarray()) for x in (u, s)
     ], axis=1).astype(np.float32)
+
+
+def global_linear_splicing_targets(adata, columns, scale: float) -> np.ndarray:
+    """Linear u,s with one global scale:  CP10K / median_train(T_panel).
+
+    No per-cell library map, so the ODE has no \(\dot T\) term and no log chain rule.
+    `scale` must come from training-RNA panel totals, never from val/test.
+    """
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("global RNA scale must be a positive finite library size")
+    if columns is None:
+        raise ValueError("global linear coordinates need the modeled gene columns")
+    u, s, selected = splicing_count_matrices(adata, columns)
+    factor = CP10K_TARGET / scale
+    return np.concatenate([
+        (x[:, selected].toarray() * factor) for x in (u, s)
+    ], axis=1).astype(np.float32)
+
+
+def splicing_targets(adata, columns, coords: str, global_scale: float | None = None) -> np.ndarray:
+    """[u, s] in the kinetic coordinates the relay will be trained in."""
+    coords = resolve_kinetic_coords(coords)
+    if coords == GLOBAL_LINEAR:
+        if global_scale is None:
+            raise ValueError("global_linear RNA coordinates need the training-RNA library scale")
+        return global_linear_splicing_targets(adata, columns, global_scale)
+    library = "panel" if coords == PANEL_LOG1P_COMPOSITIONAL else "transcriptome"
+    return shared_splicing_targets(adata, columns, library=library)
 
 
 def load_gamma_anchors(path: str, gene_names, *, target: float = 0.5,

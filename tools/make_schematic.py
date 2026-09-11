@@ -18,9 +18,7 @@ FONT = "Liberation Sans, Arial, Helvetica, sans-serif"
 BASE, SMALL, TINY = 11, 9.5, 8.5
 
 
-# Asymmetric on purpose (RNA under cache/velocity/, protein under cache/) — taken
-# from the runner rather than re-typed, so a change to the stage layout cannot
-# leave the schematic reading a path that no longer exists.
+# Paths come from the runner so a stage-layout change cannot leave the schematic stale.
 BRANCH_RNA, BRANCH_PROTEIN = (Path(p) for p in stage_output_paths("branch"))
 
 

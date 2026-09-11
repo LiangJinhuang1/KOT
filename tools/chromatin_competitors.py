@@ -53,15 +53,15 @@ RUNS = PROJECT_ROOT / "cache" / "chromatin" / "runs"
 CACHE = PROJECT_ROOT / "cache" / "chromatin"
 RESULTS = PROJECT_ROOT / "cache" / "results" / "chromatin"
 
-# (column, higher_is_better). FOSCTTM runs the other way, which is exactly the sort of
-# thing a reader of a wide table gets wrong, so the orientation is data rather than prose.
+# Orientation lives in the data: a wide table is easy to read the wrong way for FOSCTTM.
 METRICS = [("A_gene_pearson_median", True), ("A_cell_cosine_median", True),
-           ("B_knn_foscttm", False), ("C_label_transfer_accuracy", True),
-           ("D_bio_scvelo_cell_cosine_centred_median", True)]
+           ("A_cell_pearson_median", True), ("B_knn_foscttm", False),
+           ("B_knn_top1", True), ("C_label_transfer_accuracy", True), ("C_ari", True),
+           ("D_velocity_scvelo_cell_cosine_centred_median", True)]
 
 
 def baseline_references(dataset: str) -> dict:
-    """mean_only / identity / ridge / paired_mlp as measured by the `baseline` stage."""
+    """mean_only / identity / ridge / paired_mlp from the `baseline` stage."""
     path = CACHE / f"{dataset}_baselines.json"
     if not path.exists():
         return {}
@@ -91,13 +91,21 @@ def evaluation_rows(dataset: str | None = None) -> pd.DataFrame:
                 "lambda_dyn": (0.0 if config.get("condition") == "noDyn"
                                else config.get("lambda_dyn")),
                 "formulation": config.get("formulation", ""),
-                "n_test_cells": payload.get("n_test_cells")}
-        for section, prefix in [("a", "A"), ("b", "B"), ("c", "C"), ("task_d", "D")]:
-            block = payload.get(section, {})
-            if isinstance(block, dict):
-                for key, value in block.items():
-                    if isinstance(value, (int, float)):
-                        flat[f"{prefix}_{key}"] = value
+                # KOT writes n_test_cells; the competitor harness writes n_test_scored.
+                "n_test_cells": payload.get("n_test_cells", payload.get("n_test_scored"))}
+        for section, prefix in [("task_a", "A"), ("task_b", "B"), ("task_c", "C")]:
+            for key, value in (payload.get(section) or {}).items():
+                if isinstance(value, (int, float)):
+                    flat[f"{prefix}_{key}"] = value
+        # Task D is nested one level deeper and only KOT has it: the competing methods
+        # have no differentiable chromatin->RNA map to take a JVP through.
+        for key, value in (payload.get("task_d") or {}).items():
+            if isinstance(value, (int, float)):
+                flat[f"D_{key}"] = value
+            elif isinstance(value, dict) and key.startswith("biological_vs_"):
+                for inner, number in value.items():
+                    if isinstance(number, (int, float)):
+                        flat[f"D_{key.replace('biological_vs_', '')}_{inner}"] = number
         rows.append(flat)
     frame = pd.DataFrame(rows)
     if dataset and not frame.empty:
@@ -123,8 +131,7 @@ def add_relative(frame: pd.DataFrame, references: dict) -> pd.DataFrame:
                 continue
             mask = frame.dataset == dataset
             value = (frame.loc[mask, metric] - floor) / span
-            # A lower-is-better metric already flips sign through the span, so no extra
-            # negation is needed; the assert below is what keeps that true if span changes.
+            # Lower-is-better already flips through the span; the assert keeps that true if span changes.
             frame.loc[mask, column] = value if higher_better or span < 0 else -value
     return frame
 
@@ -135,6 +142,10 @@ def main() -> int:
     parser.add_argument("--out", type=Path,
                         default=RESULTS / "r2_competitors.csv")
     parser.add_argument("--datasets", nargs="+", default=["bmmc", "hspc"])
+    # The R1 (reduced-law) KOT runs predicted a different target and belong to the
+    # superseded formulation, so they are not in the comparison unless asked for.
+    parser.add_argument("--include-r1", action="store_true",
+                        help="also list the superseded R1 reduced-law KOT runs")
     args = parser.parse_args()
 
     frame = evaluation_rows()
@@ -156,6 +167,11 @@ def main() -> int:
     frame["role"] = np.where(frame.formulation.astype(str).str.startswith("regulatory_r2"),
                              "KOT (regulatory R2)",
                              np.where(frame.method == "KOT", "KOT (R1 reduced)", "competitor"))
+    if not args.include_r1:
+        dropped = int((frame.role == "KOT (R1 reduced)").sum())
+        frame = frame[frame.role != "KOT (R1 reduced)"]
+        print(f"[competitors] excluded {dropped} superseded R1 reduced-law KOT rows "
+              "(pass --include-r1 to keep them)")
     combined = pd.concat([frame, pd.DataFrame(rows)], ignore_index=True, sort=False)
     combined = add_relative(combined, references)
 

@@ -22,9 +22,22 @@ model_groups:
 default_models: kot_main
 
 # Regulatory chromatin R2 overrides only; RNA→protein defaults remain unchanged.
+# Kinetics are the chromatin r2lsi residual: scaled L2 of J_phi v - kappa * flux,
+# with the trainable clock box r2lsi inherited ([0.001, 1.5]). 1-cos(J_phi v, flux)
+# with kappa pinned at 1 is the fallback if the clock still absorbs the residual;
+# that pair is jobs/jobs_chromatin_direction.txt, not this default.
+# Checkpoint on val FOSCTTM; Sinkhorn val_align is unpaired cloud match.
+# κ prior / λ_reg / grad_clip are --stabilization on the chromatin CLI (default
+# legacy), not keys here: inheriting lambda_reg from defaults would silently
+# change historical r2lsi / r2dir runs.
 chromatin_r2:
   lambda_dyn: 1.0
   kot_alpha_max: null  # alpha is a transcription rate, not an abundance multiplier
+  dyn_residual_weight: 1.0
+  dyn_direction_weight: 0.0
+  kot_kappa_min: 0.001
+  kot_kappa_max: 1.5
+  checkpoint_monitor: foscttm
 
 defaults:
   output_root: cache/training

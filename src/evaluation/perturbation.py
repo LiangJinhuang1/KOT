@@ -284,23 +284,15 @@ def positive_scale(predicted: np.ndarray, observed: np.ndarray, rows: np.ndarray
                    min_sd_ratio: float = 0.0) -> np.ndarray:
     """Per-protein POSITIVE scale, sd(observed)/sd(predicted), fitted on `rows`.
 
-    A unit correction, not a fit. `affine_calibration`'s least-squares slope can come out
-    NEGATIVE, and that is not a rescale: it inverts the prediction. Granting that to an
-    ablation lets the ablation undo itself -- the reversed-velocity arm predicts protein
-    backwards, and a signed slope flips it back, which turned its Spearman from -0.12 into
-    +0.42 and made it beat the unablated model. A model has to get the direction right on
-    its own; only its scale is allowed to be corrected.
+    A unit correction, not a fit. A signed slope can invert the prediction and let an
+    ablation undo itself. A model has to get the direction right on its own; only its
+    scale is allowed to be corrected.
 
     A protein whose prediction is constant over `rows` has no identifiable scale and is
     left at 1 rather than blown up to infinity.
 
-    `min_sd_ratio` guards the case in between, which is worse than either: a prediction
-    that is not quite constant. The zero-velocity control arm's phi has sd 0.002x the
-    observed spread, so this divides its numerical dust by 0.002 and hands the scorer a
-    ranked prediction -- that degenerate arm then posted the HIGHEST primary Spearman of
-    any ablation. A column below the ratio is scaled to NaN so it is dropped from scoring
-    and reported as absent, rather than scored as though it had predicted something. The
-    default is 0.0, which is the historical behaviour; the CRISPR benchmark sets it.
+    `min_sd_ratio` guards a near-constant prediction whose rescale would inflate numerical
+    dust. A column below the ratio is NaN so it is dropped rather than scored as a prediction.
     """
     predicted_sd = predicted[rows].std(axis=0)
     observed_sd = observed[rows].std(axis=0)

@@ -613,11 +613,7 @@ def build_velocity_weight(rna_adata, S_np: np.ndarray, cfg: dict, use_feature_sp
 
 
 # --- Distribution summaries for the physics diagnostics ------------------------------
-# A global mean hides the shape of the distribution it came from: a mean JVP/RHS cosine of
-# 0.2 means something very different if every cell sits at 0.2 than if half the cells are
-# at +0.9 and half at -0.5. Every per-cell / per-protein quantity below is therefore
-# reported as mean/std/min/max plus a quantile ladder, so box plots can be drawn straight
-# from the JSON without reloading the per-cell arrays.
+# A global mean hides the shape, so every per-cell / per-protein quantity is mean/std/min/max plus a quantile ladder.
 DIAG_QUANTILES = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
 STAT_SUFFIXES = ("mean", "std", "min", "max", "median") + tuple(
     f"q{int(round(q * 100)):02d}" for q in DIAG_QUANTILES
@@ -2255,16 +2251,9 @@ def run_kot(context: dict, cfg: dict) -> tuple[list, np.ndarray | None, pd.DataF
     protein_layer = cfg.get("kot_protein_layer")
     velocity_layer = cfg.get("kot_velocity_layer") or cfg.get("velocity_layer")
 
-    # The protein target goes through the SAME contract as the supervised baselines
-    # (src/training/protein_supervised.adt_targets), so `protein_target_normalization`
-    # means one thing for every method on a dataset. Reading protein_adata.X directly
-    # trained phi on CLR while ridge, MLP, sciPENN and scButterfly trained on the
-    # benchmark's rna_size units, and CLR is a per-cell row operation that the
-    # per-protein rescale in the CRISPR scorer cannot invert: a PERFECT CLR map scores
-    # spearman +0.37 on the Papalexi primary set against ridge's +0.51, so phi was
-    # ranked against a ceiling it could not reach. Worse, CLR closure forces the four
-    # predicted deltas onto one compositional axis -- phi got PDL1 right (+0.74) and
-    # the other three exactly backwards.
+    # Same protein-target contract as the supervised baselines, so every method on a dataset
+    # is scored in one unit. Reading protein_adata.X trained phi on CLR while the others used
+    # rna_size; a per-protein rescale cannot invert CLR, so phi would be ranked against a ceiling it cannot reach.
     if use_feature_space:
         x = matrix_from_adata(rna_adata, rna_layer, "RNA")
         y = adt_targets(context, cfg)

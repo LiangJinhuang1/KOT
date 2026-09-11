@@ -22,8 +22,7 @@
 # f first: warmup and early-stopping change what later rounds measure.
 # g and h are superseded by k and kept so old jobs files stay readable.
 # Read a round paired within seed, not as a mean±sd ranking.
-# Search uses 4 seeds; config/training.yaml keeps 12 for paper runs.
-# Report the headline on seeds the search did not see.
+# Headline confirmation uses seeds the search did not rank on.
 set -euo pipefail
 
 STAMP="@STAMP@"          # resolved by parallel_train.sh at submit time
@@ -196,7 +195,7 @@ esac
       ;;
 
     h)
-      # phi rate at the rates g settled (superseded by k). phi is the alignment map FOSCTTM rides on.
+      # phi rate (superseded by the joint round). phi is the alignment map FOSCTTM rides on.
       echo "# ===== lr: phi, at alpha/kappa=${LR_ALPHA_KAPPA} beta=${LR_BETA} ====="
       for ds in ${DATASETS}; do
         for lp in 1.0e-4 3.0e-4 1.0e-3 3.0e-3 1.0e-2; do
@@ -224,7 +223,7 @@ esac
       ;;
 
     j)
-      # Lambda ramp × lambda_dyn. Only ramps i did not run; checkpointing starts after the ramp so a climbing weight cannot hand back a low-dynamics model.
+      # Ramp × weight; checkpoint after the ramp so a climbing weight cannot hand back a low-dynamics model.
       echo "# ===== lambda ramp x lambda_dyn ====="
       for ds in ${DATASETS}; do
         for ramp in 0 100; do
@@ -257,7 +256,7 @@ esac
       ;;
 
     k)
-      # Joint head rates × lambda_dyn (replaces g/h/i). The clip binds, so rates are the step sizes and lambda_dyn only splits a fixed-norm step; sweeping one axis finds a slice.
+      # Joint head rates × lambda_dyn. The clip binds, so rates are step sizes and lambda_dyn only splits a fixed-norm step.
       echo "# ===== joint: lr_phi x lr_alpha_kappa x lr_beta x lambda_dyn ====="
       for ds in ${DATASETS}; do
         for lp in 3.0e-4 1.0e-3 3.0e-3; do
@@ -279,9 +278,7 @@ esac
       ;;
 
     base)
-      # Method-vs-method, not tuned-vs-default. Deterministic methods run once per config.
-      # Screened methods need only separate large differences; confirmation uses the headline seeds.
-      # totalvi is a paired-latent ceiling, not a competitor.
+      # Method-vs-method, not tuned-vs-default. totalvi is a paired-latent ceiling, not a competitor.
       echo "# ===== moscot: epsilon x max_iterations (deterministic, 1 run/config) ====="
       for ds in ${DATASETS}; do
         for eps in 0.01 0.05 0.1 0.5; do

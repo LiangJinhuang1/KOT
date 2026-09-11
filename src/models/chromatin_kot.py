@@ -27,6 +27,8 @@ from src.models.KOT import BoundedPositiveMLP, PhiTheta
 
 # How much of the nonlinear path reaches the output, and whether that is learned.
 PHI_GATES = ["scalar-zero", "none", "per-gene"]
+# What the transcription head reads: the gene's own activity through G, or all of c.
+ALPHA_INPUTS = ["gc", "full"]
 
 
 def residual_gate_init(scale: torch.Tensor) -> torch.Tensor:
@@ -53,7 +55,8 @@ class GeneAffineResidualPhi(PhiTheta):
 
     def __init__(self, d_input: int, d_output: int, hidden_dims: list[int],
                  projection: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor,
-                 residual_weight: float = 1.0, gate: str = "scalar-zero", **kwargs):
+                 residual_weight: float = 1.0, gate: str = "scalar-zero",
+                 trainable_projection: bool = False, **kwargs):
         super().__init__(d_input, d_output, hidden_dims, **kwargs)
         if projection.shape != (d_output, d_input):
             raise ValueError(
@@ -65,7 +68,14 @@ class GeneAffineResidualPhi(PhiTheta):
         # INITIALISATION. Keeping scale/bias as buffers freezes most of J_phi to the
         # affine shortcut: the dynamics loss can then fit alpha/kappa/gamma while barely
         # changing the biological push-forward. They are part of phi and must train.
-        self.register_buffer("gene_projection", projection.detach().clone().float())
+        # G is normally structural: a fixed, curated peak->gene correspondence. Making it
+        # trainable tests the one architectural thing scGLUE does differently -- its
+        # guidance graph is a soft prior that training updates, not a frozen matrix -- and
+        # the velocity ceiling says the frozen push carries almost no direction signal.
+        if trainable_projection:
+            self.gene_projection = nn.Parameter(projection.detach().clone().float())
+        else:
+            self.register_buffer("gene_projection", projection.detach().clone().float())
         self.gene_scale = nn.Parameter(scale.detach().clone().float())
         self.gene_bias = nn.Parameter(bias.detach().clone().float())
         self.residual_weight = float(residual_weight)
@@ -120,6 +130,8 @@ class ChromatinKOT(nn.Module):
         phi_bias: torch.Tensor | None = None,
         phi_residual_weight: float = 1.0,
         phi_gate: str = "scalar-zero",
+        phi_trainable_projection: bool = False,
+        alpha_input: str = "gc",
     ):
         super().__init__()
         if law != RELAY:
@@ -140,14 +152,22 @@ class ChromatinKOT(nn.Module):
             self.phi = GeneAffineResidualPhi(
                 self.n_input_features, phi_output, list(phi_dims), phi_projection,
                 phi_scale, phi_bias, residual_weight=phi_residual_weight,
-                gate=phi_gate, **phi_kwargs)
+                gate=phi_gate, trainable_projection=phi_trainable_projection,
+                **phi_kwargs)
         self.kappa = BoundedPositiveMLP(
             self.n_input_features, 1, list(kappa_dims), activation=activation,
             init_method=init_method,
             min_value=kappa_min, max_value=kappa_max,
         )
+        # alpha's input width. G is a 0/1 DIAGONAL selection matrix, so `Gc` is just each
+        # gene's own activity and the whole right-hand side becomes per-gene: RHS_g depends
+        # on c_g alone. A paired ridge that mixes across genes predicts scVelo velocity at
+        # ~7.5x its null from c; the per-gene form cannot express that map at all. "full"
+        # hands alpha the whole chromatin vector so it can.
+        self.alpha_input = alpha_input
+        alpha_width = self.n_input_features if alpha_input == "full" else n_genes
         self.g = BoundedPositiveMLP(
-            n_genes, n_genes, list(g_dims), activation=activation,
+            alpha_width, n_genes, list(g_dims), activation=activation,
             init_method=init_method,
             min_value=alpha_min, max_value=alpha_max,
         )

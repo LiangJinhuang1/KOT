@@ -1,11 +1,10 @@
 """The protein target contract: one normalisation per dataset, for every method.
 
-KOT read `protein_adata.X` (CLR) while ridge, MLP, sciPENN and scButterfly went through
-`adt_targets` and honoured `protein_target_normalization: rna_size`. The CRISPR benchmark
-scores rna_size deltas, and CLR is a per-cell row operation that the scorer's per-protein
-rescale cannot invert, so phi was ranked against a ceiling of about +0.37 Spearman while
-the baselines were not. These tests pin the contract and the guard that keeps a
-CLR-trained checkpoint from being re-scored as though it were not.
+KOT read `protein_adata.X` (CLR) while the baselines honoured `rna_size`. The CRISPR
+benchmark scores rna_size deltas, and CLR is a per-cell row operation that a per-protein
+rescale cannot invert, so a CLR-trained phi cannot be ranked against those baselines.
+These tests pin the contract and the guard that keeps a CLR-trained checkpoint from being
+re-scored as though it were not.
 """
 import unittest
 

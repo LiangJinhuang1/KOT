@@ -9,7 +9,7 @@
 #SBATCH --output=logs/crispr_gears_isp_%A_%a.log
 #SBATCH --array=0-2%3
 # Submit: sbatch slurm/crispr_gears_isp.sh FROZEN_KOT_RUN NEW_OUTPUT_ROOT
-# Never pip-install GEARS into the container; its resolver wants numpy 2.5 and would break KOT and RegVelo.
+# Never pip-install GEARS into the container; its resolver would break KOT and RegVelo.
 # GEARS downloads from Dataverse with a User-Agent that gets 403; fetch with curl:
 #   curl -sL -o cache/gears/gene2go_all.pkl \
 #     https://dataverse.harvard.edu/api/access/datafile/6153417

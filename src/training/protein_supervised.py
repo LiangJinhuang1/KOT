@@ -37,17 +37,13 @@ def adt_targets(context: dict, cfg: dict) -> np.ndarray:
     normalisation. The default `layer` reads `kot_protein_layer` (CLR in protein.X), which
     is what every non-CRISPR dataset still uses.
 
-    Training on CLR and scoring rna_size deltas cost the ridge baseline more than half its
-    Spearman (+0.51 -> +0.20), and no post-hoc calibration recovers it: CLR divides each
-    cell by its own 4-protein total, so it is a per-cell row operation that a per-protein
-    affine map cannot invert.
+    Training on CLR and scoring rna_size deltas costs the baselines: CLR is a per-cell
+    row operation that a per-protein affine map cannot invert.
 
-    KOT goes through this function too. It did not, and read protein.X directly, so phi
-    trained on CLR while every baseline it was ranked against trained on rna_size. On the
-    Papalexi panel that ceiling is about +0.37 Spearman for a PERFECT CLR map, and CLR
-    closure across only four proteins inverts three of them: phi predicted PDL1 at +0.74
-    and CD366/CD86/PDL2 backwards, which cancelled to ~0 in the pooled metric. One
-    normalisation per dataset, for every method, is the point of this function.
+    KOT goes through this function too. Reading protein.X directly trained phi on CLR
+    while every baseline it was ranked against used rna_size, so phi was scored against a
+    ceiling it could not reach. One normalisation per dataset, for every method, is the
+    point of this function.
 
     Under holdout_second the runner has already cut ``second_adata`` to the fitted cells,
     so its rows line up with ``fit_rows`` without re-indexing.

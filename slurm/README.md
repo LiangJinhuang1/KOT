@@ -195,6 +195,26 @@ the ODE is transformed to these coordinates before comparison with the JVP.
 `G` feeds the transcription-rate network. It is not an abundance multiplier.
 The reduced law and old multiplicative-relay checkpoints cannot be trained/loaded.
 
+New preparation uses `cache/chromatin/train_only_v1/<dataset>_split_seed<seed>.h5ad`
+and an adjacent `.gene_map.csv`. `prepare --split-seed 0` reuses the existing frozen
+split CSV when present, or creates it before fitting preprocessing. RNA gene selection
+uses measured training RNA; peak selection, LSI, TF-IDF and batch centering use training
+ATAC. BMMC LSI is refitted from peak counts instead of using the supplied embedding.
+`split` now verifies this frozen preparation; changing it requires a new preparation.
+Set custom validation/test fractions on `prepare`, not after preprocessing.
+
+Velocity protocol 4 writes separate `_v4.npz` caches, fits its gauge on training ATAC,
+and records the prepared-data ID plus cell/gene order. Old prepared inputs and velocity
+files remain in place. Existing checkpoints retain their old preprocessing for evaluation;
+fixing leakage requires new prepared inputs, new velocity caches, and retraining in a new
+run directory. Run `reference --split-seed 0` on the new panel before its biological gate.
+
+Evaluation respects the checkpoint's RNA target normalization and converts both joint
+u/s velocity blocks to linear units. New checkpoints save alpha's exact training G,
+separately from phi's optionally trainable projection. Legacy fixed-G checkpoints can
+recover this mapping; legacy non-curated/trainable-G checkpoints without the saved alpha
+mapping are rejected rather than silently scored against a different kinetic law.
+
 The gamma prior comes from the human K562 sheet of [TimeLapse-seq Supplementary
 Table 2](https://www.nature.com/articles/nmeth.4582). The CSV contains 5,391 genes:
 11 ambiguous spreadsheet date serials and 17 genes with more than twofold replicate
@@ -219,20 +239,20 @@ using only measured RNA training cells, and reports dynamic training cells, supp
 genes, actual anchor coverage, and available RNA-reference layers. It does not alter
 prepared data or frozen splits. Missing dependencies or caches fail visibly.
 
-If inputs are missing, prepare them through the existing container on SLURM; use the
-same frozen split seed (0). Do not replace existing splits merely to make a check pass.
+If training-only inputs are missing, prepare them through the existing container on SLURM;
+use the same frozen split seed (0). Do not replace existing splits merely to make a check pass.
 
 ```bash
 sbatch --partition=jobs-cpu --gres=none --mem=192GB --time=06:00:00 \
-  --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py prepare --dataset hspc' \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py prepare --dataset hspc --split-seed 0' \
   slurm/train_slurm.sh
-# For a dataset without a split/velocity cache, in this order:
+# After preparation completes, verify its split and build velocity:
 sbatch --partition=jobs-cpu --gres=none --mem=96GB --time=04:00:00 \
   --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py split --dataset hspc --seed 0 && PYTHONPATH=. python -u run_kot_chromatin.py velocity --dataset hspc --split-seed 0' \
   slurm/train_slurm.sh
 # If the RNA-only reference is absent, build it before the pilot:
 sbatch --partition=jobs-cpu --gres=none --mem=96GB --time=08:00:00 \
-  --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py reference --dataset hspc' \
+  --export=ALL,RUN_CMD='PYTHONPATH=. python -u run_kot_chromatin.py reference --dataset hspc --split-seed 0' \
   slurm/train_slurm.sh
 ```
 

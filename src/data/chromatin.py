@@ -8,8 +8,8 @@ Two datasets, one shape on disk, so every downstream stage is dataset-agnostic:
         below exists for exactly that reason: without it, day-0 and day-7 ATAC live
         in different coordinate systems and no OT cost between them means anything.
 
-  bmmc  GSE194122 (NeurIPS 2021), 13 site×donor batches. Gene activity and LSI ship
-        with the processed object, so nothing has to be recomputed for it.
+  bmmc  GSE194122 (NeurIPS 2021), 13 site×donor batches. Gene activity ships
+        with the processed object; peak LSI is refitted on training ATAC counts.
 
 Coordinate systems are kept apart on purpose, and this is the invariant the whole
 experiment rests on:
@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import gzip
 from pathlib import Path
+from uuid import uuid4
 
 import anndata as ad
 import numpy as np
@@ -69,6 +70,23 @@ HSPC_RUNS = {
         "day": 7,
     },
 }
+
+
+def hspc_features_tsv(source_dir: Path) -> Path:
+    """Day-0 features.tsv: gene intervals on GRCh38, reused as a symbol lookup."""
+    return source_dir / f"{HSPC_RUNS['d0']['prefix']}_features.tsv.gz"
+
+
+def hspc_peak_annotation(source_dir: Path) -> pd.DataFrame:
+    """Union of the two HSPC peak→gene annotation tables, one row per unique link."""
+    frames = []
+    for spec in HSPC_RUNS.values():
+        path = source_dir / spec["peaks"]
+        if not path.exists():
+            raise FileNotFoundError(f"HSPC peak annotation missing: {path}")
+        frames.append(pd.read_csv(path, sep="\t"))
+    annotation = pd.concat(frames, ignore_index=True)
+    return annotation.drop_duplicates(["chrom", "start", "end", "gene"])
 
 
 def read_features(path: Path) -> pd.DataFrame:
@@ -194,32 +212,91 @@ def peak_to_gene_rows(features: pd.DataFrame, annotation: pd.DataFrame,
     return rows
 
 
-CHROMATIN_TRANSFORMS = ["as_is", "cp10k_log1p", "tfidf_lsi"]
+# Named chromatin inputs. A–F are the source-representation screen (phi and v_c
+# in the same coordinates; the LSI neighbour / OT graph does not change).
+# Alpha can read a different gauge (--regulatory-transform cp10k_linear) without
+# moving the map.
+# tfidf_lsi_batch is a BMMC-only diagnostic. Raw counts and z-scoring stay
+# outside this list and are not KOT training transforms.
+CHROMATIN_TRANSFORMS = [
+    "as_is", "cp10k_linear", "cp10k_log1p", "l2_per_cell", "tfidf_gene", "tfidf_lsi",
+    "tfidf_lsi_batch",
+]
+INPUT_SCREEN_TRANSFORMS = (
+    "as_is", "cp10k_linear", "cp10k_log1p", "l2_per_cell", "tfidf_gene", "tfidf_lsi",
+)
 TFIDF_LSI_COMPONENTS = 50
+PREPROCESSING_PROTOCOL = "train_only_v1"
 
 
-def tfidf_lsi(counts, n_components: int = TFIDF_LSI_COMPONENTS, seed: int = 0) -> np.ndarray:
-    """TF-IDF then an LSI reconstruction, still one column per gene.
+def preprocessing_rows(adata, side: str) -> np.ndarray:
+    """The frozen population allowed to fit a modality's preprocessing."""
+    if "chromatin_split" not in adata.obs:
+        # Historical datasets remain readable for rescoring their old checkpoints.
+        return np.arange(adata.n_obs)
+    rows = np.flatnonzero(
+        adata.obs["chromatin_split"].eq("train").to_numpy()
+        & adata.obs["chromatin_train_side"].eq(side).to_numpy())
+    if side == "rna" and "has_splicing" in adata.obs:
+        rows = rows[adata.obs["has_splicing"].to_numpy(dtype=bool)[rows]]
+    if len(rows) < 2:
+        raise ValueError(f"Need at least two {side} training cells to fit preprocessing")
+    return rows
 
-    The LSI COMPONENTS would be the usual ATAC representation, but G maps gene columns to
-    gene columns and phi's affine path is `c @ G.T`, so the reconstruction in gene space is
-    what can be fed through the same fixed projection. Truncating to `n_components` is what
-    removes the depth axis: measured on the run panels, PC1 of the untransformed gene
-    activity correlates r = +0.994 (bmmc) / +0.997 (hspc) with per-cell read depth, while
-    the RNA target's PC1 correlates only +0.24 / +0.30 with its own.
-    """
-    binary = sparse.csr_matrix(counts, dtype=np.float32)
-    binary.data = np.ones_like(binary.data)
-    depth = np.asarray(binary.sum(axis=1)).ravel()
-    depth[depth == 0] = 1.0
-    detected = np.asarray(binary.sum(axis=0)).ravel()
-    idf = np.log1p(binary.shape[0] / np.maximum(detected, 1.0))
-    weighted = sparse.diags(1.0 / depth) @ binary @ sparse.diags(idf)
-    dense = np.log1p(weighted.toarray() * 1e4).astype(np.float32)
-    centre = dense.mean(axis=0, keepdims=True)
-    left, singular, right = randomized_svd(dense - centre, n_components=n_components,
-                                           random_state=seed)
-    return ((left * singular) @ right + centre).astype(np.float32)
+
+def assign_preprocessing_split(adata, split_seed: int, val_fraction: float,
+                               test_fraction: float, splits: pd.DataFrame | None = None):
+    """Freeze the split before any feature selection or embedding fit."""
+    if splits is None:
+        splits = make_splits(adata, split_seed, val_fraction, test_fraction)
+    if not splits.index.equals(adata.obs_names):
+        raise ValueError("Frozen split does not match raw cell order")
+    if not splits["split"].isin(["train", "val", "test"]).all():
+        raise ValueError("Invalid frozen split labels")
+    if not splits.loc[splits["split"].eq("train"), "train_side"].isin(["atac", "rna"]).all():
+        raise ValueError("Every training cell needs an ATAC or RNA side")
+    adata.obs["chromatin_split"] = splits["split"].to_numpy()
+    adata.obs["chromatin_train_side"] = splits["train_side"].fillna("").to_numpy()
+    adata.uns["chromatin_preprocessing"] = {
+        "protocol": PREPROCESSING_PROTOCOL, "split_seed": int(split_seed),
+        "id": uuid4().hex,
+    }
+    return splits
+
+
+def validate_preprocessing_split(adata, splits, split_seed: int) -> None:
+    metadata = adata.uns.get("chromatin_preprocessing", {})
+    if metadata.get("protocol") != PREPROCESSING_PROTOCOL:
+        raise ValueError("Rebuild chromatin inputs with training-only preprocessing")
+    if int(metadata["split_seed"]) != split_seed or not splits.index.equals(adata.obs_names):
+        raise ValueError("Prepared chromatin inputs do not match the requested split")
+    for saved, column in (("chromatin_split", "split"), ("chromatin_train_side", "train_side")):
+        if not np.array_equal(adata.obs[saved].astype(str), splits[column].fillna("").astype(str)):
+            raise ValueError("Frozen split changed after preprocessing; rebuild inputs for that split")
+
+
+def tfidf_matrix(counts, fit_rows):
+    """Fit IDF on training ATAC; transform each cell using its own depth."""
+    binary = sparse.csr_matrix(counts, dtype=np.float32).copy()
+    binary.eliminate_zeros()
+    binary.data[:] = 1.0
+    detected = np.asarray(binary[fit_rows].sum(axis=0)).ravel()
+    idf = np.log1p(len(fit_rows) / np.maximum(detected, 1.0))
+    depth = np.maximum(np.asarray(binary.sum(axis=1)).ravel(), 1.0)
+    weighted = (sparse.diags(1.0 / depth) @ binary @ sparse.diags(idf)).tocsr()
+    weighted.data = np.log1p(weighted.data * 1e4)
+    return weighted
+
+
+def tfidf_lsi(counts, n_components: int = TFIDF_LSI_COMPONENTS, seed: int = 0,
+              fit_rows: np.ndarray | None = None) -> np.ndarray:
+    """Training-fitted TF-IDF/SVD reconstruction in the original gene coordinates."""
+    rows = np.arange(counts.shape[0]) if fit_rows is None else np.asarray(fit_rows)
+    dense = tfidf_matrix(counts, rows).toarray()
+    centre = dense[rows].mean(axis=0, keepdims=True)
+    rank = min(n_components, len(rows), dense.shape[1])
+    _, _, right = randomized_svd(dense[rows] - centre, n_components=rank, random_state=seed)
+    return (((dense - centre) @ right.T) @ right + centre).astype(np.float32)
 
 
 def chromatin_features(adata: ad.AnnData, transform: str = "as_is") -> np.ndarray:
@@ -238,7 +315,52 @@ def chromatin_features(adata: ad.AnnData, transform: str = "as_is") -> np.ndarra
     counts = adata.obsm["gene_activity_counts"]
     if transform == "cp10k_log1p":
         return normalize_log(counts)
-    return tfidf_lsi(counts)
+    if transform == "cp10k_linear":
+        return normalize_linear(counts)
+    if transform == "l2_per_cell":
+        raw = counts.toarray() if sparse.issparse(counts) else np.asarray(counts)
+        raw = np.asarray(raw, dtype=np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True).clip(min=1e-6)
+    fit_rows = preprocessing_rows(adata, "atac")
+    if transform == "tfidf_gene":
+        # TF-IDF in gene coordinates, no SVD. Pair with tfidf_lsi to separate weighting
+        # from the rank-50 reconstruction.
+        return np.asarray(tfidf_matrix(counts, fit_rows).toarray(), dtype=np.float32)
+    if transform not in ("tfidf_lsi", "tfidf_lsi_batch"):
+        raise ValueError(f"unknown chromatin transform {transform!r}; "
+                         f"expected one of {CHROMATIN_TRANSFORMS}")
+    values = tfidf_lsi(counts, fit_rows=fit_rows)
+    if transform == "tfidf_lsi_batch":
+        # BMMC is 13 site x donor batches and KOT models none of them, while scGLUE -- the
+        # method that beats it here -- conditions on batch explicitly. Centring c per batch
+        # is the cheapest test of whether cross-batch offset is part of what phi is
+        # discriminating on. The RNA target keeps its own batch structure: this removes the
+        # covariate from the INPUT only, which is the claim being tested.
+        if "batch" not in adata.obs:
+            raise ValueError("tfidf_lsi_batch needs adata.obs['batch']")
+        labels = adata.obs["batch"].to_numpy()
+        training = np.zeros(adata.n_obs, dtype=bool)
+        training[fit_rows] = True
+        for label in np.unique(labels):
+            rows = labels == label
+            fitted = rows & training
+            if not fitted.any():
+                raise ValueError(f"Batch {label!r} has no ATAC training cells for centering")
+            values[rows] -= values[fitted].mean(axis=0, keepdims=True)
+    return values
+
+
+def library_normalized(matrix, target_sum: float = 1e4):
+    """Per-cell CP10K scaling as a sparse matrix; zeros stay zeros."""
+    counts = sparse.csr_matrix(matrix, dtype=np.float32)
+    totals = np.asarray(counts.sum(axis=1)).ravel()
+    totals[totals == 0] = 1.0
+    return sparse.diags(target_sum / totals) @ counts
+
+
+def normalize_linear(matrix, target_sum: float = 1e4) -> np.ndarray:
+    """CP10K without log1p. Diagnostic: the linear depth correction, not the log."""
+    return np.asarray(library_normalized(matrix, target_sum).toarray(), dtype=np.float32)
 
 
 def normalize_log(matrix, target_sum: float = 1e4) -> np.ndarray:
@@ -247,11 +369,7 @@ def normalize_log(matrix, target_sum: float = 1e4) -> np.ndarray:
     Both modalities go through the same transform so that a displacement in gene-activity
     space and a displacement in RNA space are read in comparable units.
     """
-    counts = sparse.csr_matrix(matrix, dtype=np.float32)
-    totals = np.asarray(counts.sum(axis=1)).ravel()
-    totals[totals == 0] = 1.0
-    scaled = sparse.diags(target_sum / totals) @ counts
-    return np.log1p(scaled.toarray()).astype(np.float32)
+    return np.log1p(normalize_linear(matrix, target_sum)).astype(np.float32)
 
 
 def splicing_norm_ratio(adata) -> np.ndarray:
@@ -270,23 +388,28 @@ def splicing_norm_ratio(adata) -> np.ndarray:
     return (totals["unspliced"] / totals["spliced"]).astype(np.float32)
 
 
-def lsi_embedding(peaks: sparse.csr_matrix, n_components: int, seed: int) -> np.ndarray:
-    """TF-IDF then truncated SVD, first component dropped.
+def lsi_embedding(peaks: sparse.csr_matrix, n_components: int, seed: int,
+                  fit_rows: np.ndarray | None = None) -> np.ndarray:
+    """Fit peak TF-IDF/SVD on training ATAC, project all cells, drop component 1."""
+    rows = np.arange(peaks.shape[0]) if fit_rows is None else np.asarray(fit_rows)
+    tfidf = tfidf_matrix(peaks, rows)
+    rank = min(n_components, len(rows), peaks.shape[1])
+    if rank < 2:
+        raise ValueError("LSI needs at least two training cells and two retained peaks")
+    _, _, right = randomized_svd(tfidf[rows], n_components=rank, random_state=seed)
+    return np.asarray(tfidf @ right[1:].T, dtype=np.float32)
 
-    Component 1 of an ATAC LSI is sequencing depth, not biology; keeping it would make
-    the OT cost and the pseudotime root partly a depth ranking.
-    """
-    binary = peaks.copy()
-    binary.data = np.ones_like(binary.data, dtype=np.float32)
-    cell_totals = np.asarray(binary.sum(axis=1)).ravel()
-    cell_totals[cell_totals == 0] = 1.0
-    peak_totals = np.asarray(binary.sum(axis=0)).ravel()
-    idf = np.log(1.0 + binary.shape[0] / np.maximum(peak_totals, 1.0))
-    tfidf = sparse.diags(1.0 / cell_totals) @ binary @ sparse.diags(idf)
-    tfidf.data = np.log1p(tfidf.data * 1e4)
-    left, values, _ = randomized_svd(tfidf.tocsr(), n_components=n_components,
-                                     random_state=seed)
-    return (left * values)[:, 1:].astype(np.float32)
+
+def fit_peak_geometry(adata, peaks, n_lsi: int, min_peak_cells: int, seed: int):
+    fit_rows = preprocessing_rows(adata, "atac")
+    prevalence = np.asarray((peaks[fit_rows] > 0).sum(axis=0)).ravel()
+    keep = prevalence >= min_peak_cells
+    adata.obsm["lsi"] = lsi_embedding(peaks[:, keep], n_lsi, seed, fit_rows)
+    adata.uns["chromatin_preprocessing"]["lsi_fit"] = "training_atac_peak_counts"
+    adata.uns["chromatin_preprocessing"]["n_lsi"] = int(n_lsi)
+    adata.uns["chromatin_preprocessing"]["min_peak_cells"] = int(min_peak_cells)
+    adata.uns["chromatin_preprocessing"]["lsi_seed"] = int(seed)
+    return int(keep.sum())
 
 
 def align_loom_to_barcodes(loom_path: Path, barcodes: pd.Index,
@@ -311,7 +434,9 @@ def align_loom_to_barcodes(loom_path: Path, barcodes: pd.Index,
 
 
 def build_hspc(source_dir: Path, output_path: Path, n_top_genes: int, seed: int,
-               n_lsi: int, min_peak_cells: int, map_path: Path) -> ad.AnnData:
+               n_lsi: int, min_peak_cells: int, map_path: Path, *,
+               split_seed: int = 0, val_fraction: float = 0.1, test_fraction: float = 0.2,
+               splits: pd.DataFrame | None = None) -> ad.AnnData:
     """Assemble day 0 + day 7 into one object with shared gene and peak coordinates."""
     per_run = []
     peak_frames = []
@@ -385,22 +510,19 @@ def build_hspc(source_dir: Path, output_path: Path, n_top_genes: int, seed: int,
     spliced = sparse.vstack([part["layers"]["spliced"] for part in per_run]).tocsr()
     unspliced = sparse.vstack([part["layers"]["unspliced"] for part in per_run]).tocsr()
 
-    prevalence = np.asarray((union_peaks > 0).sum(axis=0)).ravel()
-    keep_peaks = prevalence >= min_peak_cells
-    print(f"[chromatin] LSI on {int(keep_peaks.sum())} peaks seen in >= {min_peak_cells} cells")
-
     adata = ad.AnnData(X=rna, obs=obs, var=pd.DataFrame(index=genes))
     adata.layers["counts"] = rna
     adata.layers["spliced"] = spliced
     adata.layers["unspliced"] = unspliced
     adata.obsm["gene_activity_counts"] = activity
-    adata.obsm["lsi"] = lsi_embedding(union_peaks[:, keep_peaks], n_lsi, seed)
+    assign_preprocessing_split(adata, split_seed, val_fraction, test_fraction, splits)
+    n_kept_peaks = fit_peak_geometry(adata, union_peaks, n_lsi, min_peak_cells, seed)
     adata.uns["gene_activity_names"] = genes.to_numpy()
     activity_total = np.asarray(activity.sum(axis=0)).ravel()
     adata.uns["chromatin_source"] = {
         "dataset": "hspc",
         "n_atac_features": int(block.max() + 1),
-        "n_atac_features_lsi": int(keep_peaks.sum()),
+        "n_atac_features_lsi": n_kept_peaks,
         "n_rna_genes_full": int(len(genes)),
         "n_overlap_activity_rna": int((activity_total > 0).sum()),
     }
@@ -411,8 +533,11 @@ def build_hspc(source_dir: Path, output_path: Path, n_top_genes: int, seed: int,
 
 
 def build_bmmc(processed_path: Path, velocity_path: Path | None, output_path: Path,
-               n_top_genes: int, map_path: Path) -> ad.AnnData:
-    """Assemble BMMC from the processed object, whose gene activity and LSI already ship.
+               n_top_genes: int, map_path: Path, *, n_lsi: int = 51,
+               min_peak_cells: int = 50, seed: int = 42, split_seed: int = 0,
+               val_fraction: float = 0.1, test_fraction: float = 0.2,
+               splits: pd.DataFrame | None = None) -> ad.AnnData:
+    """Assemble BMMC with its supplied gene activity and training-fitted peak LSI.
 
     `velocity_path` is the scVelo cache built from the STARsolo velocyto output. It
     covers only the cells STARsolo was run for, so spliced/unspliced are written for
@@ -436,7 +561,6 @@ def build_bmmc(processed_path: Path, velocity_path: Path | None, output_path: Pa
     adata.layers["counts"] = adata.X
     adata.obsm["gene_activity_counts"] = reindex_columns(
         processed.obsm["ATAC_gene_activity"], activity_names, genes)
-    adata.obsm["lsi"] = select_bmmc_lsi(processed)
     adata.uns["gene_activity_names"] = genes.to_numpy()
     adata.uns["chromatin_source"] = {
         "dataset": "bmmc",
@@ -448,6 +572,11 @@ def build_bmmc(processed_path: Path, velocity_path: Path | None, output_path: Pa
     if velocity_path is not None and Path(velocity_path).exists():
         velocity = sc.read_h5ad(velocity_path)
         attach_splicing(adata, velocity)
+    assign_preprocessing_split(adata, split_seed, val_fraction, test_fraction, splits)
+    peak_mask = processed.var["feature_types"].astype(str).eq("ATAC").to_numpy()
+    peaks = sparse.csr_matrix(processed.layers["counts"][:, peak_mask], dtype=np.float32)
+    adata.uns["chromatin_source"]["n_atac_features_lsi"] = fit_peak_geometry(
+        adata, peaks, n_lsi, min_peak_cells, seed)
     # The NeurIPS object ships gene activity already built, so the peaks behind each gene
     # are not recoverable here — recorded as unknown rather than guessed.
     return finalize_panel(adata, n_top_genes, output_path, None,
@@ -541,26 +670,30 @@ def already_normalised(matrix) -> bool:
 def finalize_panel(adata: ad.AnnData, n_top_genes: int, output_path: Path,
                    peaks_per_gene: np.ndarray | None, peak_definition: str,
                    map_path: Path) -> ad.AnnData:
-    """Decide the panel, write the gene map that records the decision, and save.
+    """Fit the panel/map on permitted training populations, then transform all cells.
 
     The panel is every highly variable expressed gene — NOT only the ones chromatin
     supports. Genes without chromatin support stay in phi's output and in Task A, and are
     kept out of the kinetics term by the map's `use_for_kinetics` flag, exactly as a
     protein with no curated gene stays in the RNA→protein alignment and out of its ODE.
     """
-    counts = adata.copy()
+    if "chromatin_preprocessing" not in adata.uns:
+        raise ValueError("Freeze the preprocessing split before selecting genes")
+    atac_rows = preprocessing_rows(adata, "atac")
+    rna_rows = preprocessing_rows(adata, "rna")
+    counts = adata[rna_rows].copy()
     sc.pp.normalize_total(counts, target_sum=1e4)
     sc.pp.log1p(counts)
     sc.pp.highly_variable_genes(counts, n_top_genes=n_top_genes)
 
-    activity = adata.obsm["gene_activity_counts"]
+    activity = adata.obsm["gene_activity_counts"][atac_rows]
     activity_total = np.asarray(activity.sum(axis=0)).ravel()
-    activity_detected = np.asarray((activity > 0).sum(axis=0)).ravel() / adata.n_obs
-    rna = sparse.csr_matrix(adata.layers["counts"])
+    activity_detected = np.asarray((activity > 0).sum(axis=0)).ravel() / len(atac_rows)
+    rna = sparse.csr_matrix(adata.layers["counts"])[rna_rows]
     rna_total = np.asarray(rna.sum(axis=0)).ravel()
-    rna_detected = np.asarray((rna > 0).sum(axis=0)).ravel() / adata.n_obs
+    rna_detected = np.asarray((rna > 0).sum(axis=0)).ravel() / len(rna_rows)
     has_us = "spliced" in adata.layers and "unspliced" in adata.layers
-    usable_us = (usable_splicing_genes(adata) if has_us
+    usable_us = (usable_splicing_genes(adata, rows=rna_rows) if has_us
                  else np.zeros(adata.n_vars, dtype=bool))
 
     rows = chromatin_map_rows(adata.var_names, activity_total, activity_detected,
@@ -576,7 +709,7 @@ def finalize_panel(adata: ad.AnnData, n_top_genes: int, output_path: Path,
 
     panel = adata[:, usable].copy()
     panel.obsm["gene_activity_counts"] = adata.obsm["gene_activity_counts"][:, usable]
-    pre_normalised = already_normalised(panel.obsm["gene_activity_counts"])
+    pre_normalised = already_normalised(panel.obsm["gene_activity_counts"][atac_rows])
     print(f"[chromatin] gene activity arrives "
           f"{'already normalised — transformed once, not twice' if pre_normalised else 'as raw counts — normalising'}")
     panel.obsm["gene_activity"] = (
@@ -590,6 +723,7 @@ def finalize_panel(adata: ad.AnnData, n_top_genes: int, output_path: Path,
     panel.uns["chromatin_map_csv"] = str(map_path)
     panel.uns["gene_activity_pre_normalised"] = bool(pre_normalised)
 
+    panel.uns["chromatin_preprocessing"]["n_top_genes"] = int(n_top_genes)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     panel.write_h5ad(output_path)
     print(f"[chromatin] wrote {output_path}: {panel.n_obs} cells x {panel.n_vars} genes")
@@ -735,5 +869,5 @@ def gene_map(adata: ad.AnnData, map_path: Path
              ) -> tuple[sparse.csr_matrix, np.ndarray, np.ndarray]:
     """G plus its two masks, read from the gene-map CSV this dataset was built with."""
     return build_chromatin_projection(
-        load_chromatin_map(map_path), adata.var_names,
+        load_chromatin_map(Path(adata.uns.get("chromatin_map_csv", map_path))), adata.var_names,
         pd.Index(np.asarray(adata.uns["gene_activity_names"]).astype(str)))

@@ -34,6 +34,27 @@ from src.losses.entropic_ot import row_entropy, sinkhorn_plan
 # Day 0 → day 7. The denominator of the HSPC velocity, in days.
 HSPC_INTERVAL_DAYS = 7.0
 
+
+def euler_lag(state: np.ndarray, velocity: np.ndarray, tau: float) -> np.ndarray:
+    """Unpaired chromatin at t-τ: c(t-τ) ≈ c - τ v_c.
+
+    τ is in the cached velocity's units, not a physical clock. HSPC's field is
+    gauge-normalised so a typical dynamic cell has ||v|| ≈ 1; τ = 1 is then one
+    velocity-length step (about the full 7-day OT displacement), not one day.
+    BMMC's field is an ATAC-pseudotime difference quotient, similarly gauged.
+    τ = 0 is the instantaneous map; τ > 0 is the past; τ < 0 is a future-chromatin
+    control. Cells with v_c = 0 stay at c. Never paired across cells.
+    """
+    tau = float(tau)
+    chromatin = np.asarray(state, dtype=np.float32)
+    if tau == 0.0:
+        return chromatin
+    if chromatin.shape != np.asarray(velocity).shape:
+        raise ValueError(
+            f"euler lag needs matching chromatin and velocity shapes, got "
+            f"{chromatin.shape} and {np.asarray(velocity).shape}")
+    return chromatin - tau * np.asarray(velocity, dtype=np.float32)
+
 # Lineage grouping for the BMMC per-branch kinetic evaluation. Labels, not velocity
 # inputs: the field itself never reads a cell type.
 BMMC_LINEAGES = {
@@ -184,10 +205,19 @@ def train_neighbour_graph(lsi: np.ndarray, train_mask: np.ndarray,
     return sparse.csr_matrix((data, (full_rows, full_cols)), shape=(n_cells, n_cells))
 
 
+VELOCITY_ESTIMATORS = ["quotient", "regression"]
+
+
 def forward_difference_field(activity: np.ndarray, connectivity: sparse.csr_matrix,
-                             pseudotime: np.ndarray, min_forward: int
+                             pseudotime: np.ndarray, min_forward: int,
+                             estimator: str = "quotient"
                              ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Difference quotient over forward neighbours of one (possibly train-only) graph."""
+    """Local time derivative over the forward neighbours of one (possibly train-only) graph.
+
+    `quotient` averages per-neighbour difference quotients -- the original estimator.
+    `regression` takes the weighted least-squares slope instead, which is the numerically
+    stable form of the same quantity.
+    """
     velocity = np.zeros_like(activity)
     confidence = np.zeros(activity.shape[0], dtype=np.float32)
     n_forward = np.zeros(activity.shape[0], dtype=np.int32)
@@ -205,14 +235,33 @@ def forward_difference_field(activity: np.ndarray, connectivity: sparse.csr_matr
             continue
         forward = candidates[ahead]
         weights = weights[ahead]
-        steps = (activity[forward] - activity[row]) / delta[ahead, None]
-        velocity[row] = (weights[:, None] * steps).sum(axis=0) / weights.sum()
+        gaps = delta[ahead]
+        steps = (activity[forward] - activity[row]) / gaps[:, None]
+        if estimator == "regression":
+            # Weighted least-squares slope of (a_j - a_i) on (tau_j - tau_i), which is what
+            # a local derivative actually is. The difference-quotient mean divides each
+            # neighbour by its own gap, so a near-tied neighbour -- tau gaps run from 1.4e-4
+            # to a 9.2e-3 median, and the 1e-6 guard lets the small ones through -- gets a
+            # weight of ~1e4 and takes the cell over. Measured: 34% of cells put more than
+            # half their weight on one such neighbour, and the resulting field points
+            # forward in pseudotime at BELOW chance (sign agreement 0.41-0.45 vs 0.5).
+            # Regression weights by gap^2, so a tied neighbour contributes nothing instead
+            # of dominating.
+            scaled = weights * gaps
+            denominator = float((scaled * gaps).sum())
+            if denominator <= 0:
+                continue
+            velocity[row] = (scaled[:, None] * (activity[forward] - activity[row])
+                             ).sum(axis=0) / denominator
+        else:
+            velocity[row] = (weights[:, None] * steps).sum(axis=0) / weights.sum()
         confidence[row] = direction_coherence(steps, velocity[row], weights)
     return velocity, confidence, n_forward
 
 
 def bmmc_velocity(adata: sc.AnnData, n_neighbors: int, confidence_quantile: float,
-                  min_forward: int, train_mask: np.ndarray | None = None) -> dict:
+                  min_forward: int, train_mask: np.ndarray | None = None,
+                  estimator: str = "quotient") -> dict:
     """§8. Forward-pseudotime difference quotient over ATAC neighbours.
 
     An ATAC-DERIVED DIRECTIONAL TRAJECTORY FIELD, not a measured chromatin velocity: the
@@ -249,7 +298,7 @@ def bmmc_velocity(adata: sc.AnnData, n_neighbors: int, confidence_quantile: floa
 
     connectivity = train_neighbour_graph(lsi, train_mask, n_neighbors)
     velocity, confidence, n_forward = forward_difference_field(
-        activity, connectivity, pseudotime, min_forward)
+        activity, connectivity, pseudotime, min_forward, estimator)
 
     usable = n_forward >= min_forward
     fit_usable = usable & train_mask
@@ -352,8 +401,11 @@ def direction_diversity(velocity: np.ndarray, mask: np.ndarray, seed: int = 0,
     }
 
 
-def gauge_normalize(velocity: np.ndarray) -> np.ndarray:
-    """Divide by the median non-zero per-cell norm, exactly as the RNA→protein runs do.
+def gauge_normalize(velocity: np.ndarray, fit_mask: np.ndarray | None = None,
+                    *, return_gauge: bool = False):
+    """Fit a median nonzero norm on fit_mask and apply the gauge to all cells.
+
+    The runner passes training ATAC only; None retains the historical helper behavior.
 
     One global scalar, so the relative magnitudes between cells survive and only the unit
     changes. kappa is bounded, so lambda_dyn would otherwise mean something different on
@@ -362,6 +414,11 @@ def gauge_normalize(velocity: np.ndarray) -> np.ndarray:
     """
     norms = np.linalg.norm(velocity, axis=1)
     nonzero = norms > 0
+    if fit_mask is not None:
+        nonzero &= np.asarray(fit_mask, dtype=bool)
+        if not nonzero.any():
+            raise ValueError("No nonzero training-source velocity to fit the gauge")
     gauge = float(np.median(norms[nonzero])) if nonzero.any() else 1.0
     print(f"[velocity] gauge-normalized: median non-zero per-cell norm {gauge:.4g} -> 1.0")
-    return (velocity / gauge).astype(np.float32)
+    normalized = (velocity / gauge).astype(np.float32)
+    return (normalized, gauge) if return_gauge else normalized

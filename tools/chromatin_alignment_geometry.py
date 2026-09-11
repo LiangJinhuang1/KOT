@@ -3,13 +3,16 @@ r"""Choose align_dims and blur before training, against a criterion that means s
 
 The oracle (source cell's own RNA) must beat a constant, and that margin has to be read against whether the projected space still carries cell identity.
 
+R2 trains Sinkhorn on spliced RNA (`--law relay --align-block spliced`). A permuted
+oracle keeps the same RNA measure, so its Sinkhorn score must sit on the paired
+oracle while paired FOSCTTM does not.
+
 Reads the whole dataset; submit rather than run on the login node.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -51,17 +54,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", choices=chromatin.DATASETS, required=True)
-    parser.add_argument("--law", choices=[REDUCED, RELAY], default=REDUCED)
+    parser.add_argument("--law", choices=[REDUCED, RELAY], default=RELAY)
     parser.add_argument("--rna-target", choices=["auto", "spliced", "rna", "unspliced"],
                         default="auto")
-    parser.add_argument("--align-block", choices=["joint", "spliced"], default="joint")
+    parser.add_argument("--align-block", choices=["joint", "spliced"], default="spliced")
     parser.add_argument("--dims", type=int, nargs="+",
                         default=[0, 256, 128, 64, 32, 16, 8, 4])
     parser.add_argument("--blurs", type=float, nargs="+",
                         default=[0.5, 0.2, 0.1, 0.05, 0.02, 0.01])
     parser.add_argument("--n-points", type=int, default=2048)
     parser.add_argument("--n-neighbors", type=int, default=15)
-    parser.add_argument("--split-seed", type=int, default=0)
+    parser.add_argument("--split-seed", type=int, default=0,
+                        help="prepared training-only object and its frozen split")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--out", default=None)
@@ -69,7 +73,9 @@ def main() -> int:
 
     device = choose_torch_device({"device": args.device})
     torch.manual_seed(args.seed)
-    adata = chromatin.load_dataset(args.dataset)
+    # split-seed selects the prepared training-only object. Loading the legacy
+    # `{dataset}.h5ad` against that split scores a different gene panel.
+    adata = chromatin.load_dataset(args.dataset, args.split_seed)
     splits = pd.read_csv(chromatin.split_path(args.dataset, args.split_seed), index_col=0)
     assert splits.index.equals(adata.obs_names), "split file does not match the dataset"
     split_column = splits["split"].to_numpy()
@@ -101,9 +107,14 @@ def main() -> int:
     sink = subsample_rows(len(rna_rows), args.n_points, device, rna_rows)
     assert len(set(source.tolist()) & set(sink.tolist())) == 0, "source and sink overlap"
     observed = target[sink]
+    paired = target[source]
+    perm = torch.as_tensor(np.random.default_rng(args.seed).permutation(len(source)),
+                           device=device)
     candidates = {
         "constant": observed.mean(dim=0, keepdim=True).expand(len(source), -1),
-        "paired_oracle": target[source],
+        "paired_oracle": paired,
+        # Same RNA measure, shuffled assignment: Sinkhorn cannot see the pairing.
+        "permuted_oracle": paired[perm],
     }
 
     rows = []
@@ -124,11 +135,15 @@ def main() -> int:
             scores = {name: float(sinkhorn_divergence(view, reference, blur=blur,
                                                       backend="tensorized"))
                       for name, view in views.items()}
+            gap = abs(scores["permuted_oracle"] - scores["paired_oracle"])
+            n_space = int(columns.numel()) if columns is not None else target.shape[1]
             rows.append({
-                "align_dims": n_dims or target.shape[1],
+                "align_dims": n_dims or n_space,
                 "blur": blur,
                 "constant": scores["constant"],
                 "paired_oracle": scores["paired_oracle"],
+                "permuted_oracle": scores["permuted_oracle"],
+                "permuted_oracle_relative_gap": gap / max(abs(scores["paired_oracle"]), 1e-12),
                 "oracle_beats_constant": scores["paired_oracle"] < scores["constant"],
                 # Ratio vs constant is the signal the pairing has to ride.
                 "oracle_advantage": scores["constant"] / max(scores["paired_oracle"], 1e-12),
@@ -139,6 +154,7 @@ def main() -> int:
             flag = "" if rows[-1]["oracle_beats_constant"] else "   CONSTANT WINS"
             print(f"  dims {rows[-1]['align_dims']:>5}  blur {blur:<6g} "
                   f"constant {scores['constant']:.5g}  oracle {scores['paired_oracle']:.5g}  "
+                  f"perm {scores['permuted_oracle']:.5g}  "
                   f"advantage {rows[-1]['oracle_advantage']:>8.2f}x  "
                   f"var {explained:.1%}  nbr {preserved:.1%}  "
                   f"blur/dist {rows[-1]['blur_over_pair_distance']:.3f}"

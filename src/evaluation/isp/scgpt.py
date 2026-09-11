@@ -146,11 +146,7 @@ def run(args) -> None:
     usable = set(usable_perturbations(groups, replicates, args.min_ko_cells,
                                       args.min_replicates, CONTROL_LABEL))
 
-    # scGPT's perturbation head flags the knocked-out gene at its own position INSIDE the
-    # expression vector, so a knockout that is not measured cannot be represented at all.
-    # Only 5 of 24 CRISPR targets are among the 1,276 HVGs the checkpoint consumes, so the
-    # model is fitted on the union of those genes and the knockout genes themselves, taken
-    # from the full matrix, and the predicted shift is converted back afterwards.
+    # The perturbation head flags the knockout inside the expression vector, so an unmeasured gene cannot be represented. Fit on the union of the checkpoint genes and the knockout genes.
     wide = ad.read_h5ad(args.wide_rna)
     if list(wide.obs_names) != list(rna.obs_names):
         raise ValueError("The wide matrix does not carry the checkpoint's cells in order")
@@ -233,10 +229,7 @@ def run(args) -> None:
     panel_control = panel_values[panel_conditions == "ctrl"].mean(0)
 
     for target in observed:
-        # create_cell_graph_dataset_for_prediction locates the knockout inside the name
-        # list it is handed. Passing the measured panel would cover only 5 of 24
-        # knockouts, since most CRISPR targets are not among the 1,276 HVGs. GEARS itself
-        # passes its GO-graph node list here for exactly that reason, and this follows it.
+        # The prediction graph locates the knockout in the name list it is handed; the measured panel misses most targets, so this follows GEARS and passes the fuller list.
         try:
             graphs = create_cell_graph_dataset_for_prediction(
                 [target], control_adata, genes, device, num_samples=args.pool_size)

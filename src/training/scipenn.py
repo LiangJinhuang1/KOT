@@ -61,10 +61,9 @@ def run_scipenn(context: dict, cfg: dict) -> tuple[list, None, dict]:
 
     reference_rna = counts_adata(rna_counts[fit_rows], rna_adata.obs_names[fit_rows],
                                  rna_adata.var_names)
-    # Protein is supplied in the units this benchmark SCORES, and sciPENN is told not to
-    # normalise it again. Its own normalize_total + log1p is compositional over the 4-plex
-    # panel, which no per-protein rescale can undo, and it cost this model most of its
-    # signal (primary Spearman +0.031). The RNA side keeps sciPENN's own normalisation.
+    # Protein is supplied in the units this benchmark scores; sciPENN is told not to
+    # normalise it again. Its own normalize_total + log1p is compositional over a small
+    # panel, which no per-protein rescale can undo. The RNA side keeps sciPENN's own normalisation.
     targets = adt_targets(context, cfg)
     reference_protein = counts_adata(targets, rna_adata.obs_names[fit_rows], protein_names)
     query_rna = counts_adata(rna_counts, rna_adata.obs_names, rna_adata.var_names)

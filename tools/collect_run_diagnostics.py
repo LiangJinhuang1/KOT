@@ -64,7 +64,6 @@ DEFAULT_METRICS = [
 
 CHECKPOINTS = ["training", "final", "best_align", "best_val_align", "best_dyn", "best_total"]
 
-# Metrics carried into the per-config table as mean ± sd over every seed in the cell.
 AGGREGATE_METRICS = [
     "mean_foscttm", "val_foscttm", "val_foscttm_in_full_pool",
     "jvp_rhs_cos_median",

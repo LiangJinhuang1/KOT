@@ -9,7 +9,7 @@
 #SBATCH --output=logs/crispr_scgpt_isp_%A_%a.log
 #SBATCH --array=0-2%3
 # Submit: sbatch slurm/crispr_scgpt_isp.sh FROZEN_KOT_RUN NEW_OUTPUT_ROOT
-# Never install scGPT into the container: it pins scvi-tools 0.20.3 against the container's 1.2.0 and would break RegVelo.
+# Never install scGPT into the container; its pins would break other methods.
 # scGPT reuses the GEARS PertData path; stage the same Dataverse assets per seed (see crispr_gears_isp.sh).
 set -euo pipefail
 if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then cd "$SLURM_SUBMIT_DIR"; else cd "$(dirname "$0")/.."; fi

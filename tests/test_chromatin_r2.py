@@ -9,7 +9,11 @@ import pandas as pd
 import torch
 from scipy import sparse
 
-from src.data.chromatin_r2 import shared_splicing_targets, load_gamma_anchors, gamma_anchor_loss
+from src.data.chromatin_r2 import (
+    global_linear_scale, shared_splicing_targets, splicing_targets,
+    load_gamma_anchors, gamma_anchor_loss,
+)
+from src.losses.chromatin_laws import CP10K_TARGET, GLOBAL_LINEAR
 from tools.build_gamma_anchors import build_anchors, K562_SHEET, LN2
 
 
@@ -31,6 +35,35 @@ class SharedRNAUnitTests(unittest.TestCase):
         np.testing.assert_array_equal(actual[1], 0)
         np.testing.assert_array_equal(adata.layers["unspliced"].toarray(), u)
         np.testing.assert_array_equal(adata.layers["spliced"].toarray(), s)
+
+    def test_panel_library_is_not_the_transcriptome_total(self):
+        u = np.array([[1., 3., 2.], [0., 0., 0.]], dtype=np.float32)
+        s = np.array([[4., 0., 10.], [0., 0., 0.]], dtype=np.float32)
+        adata = SimpleNamespace(layers={"unspliced": sparse.csr_matrix(u),
+                                        "spliced": sparse.csr_matrix(s)})
+        columns = [2, 0]
+        panel = np.expm1(shared_splicing_targets(adata, columns, library="panel"))
+        full = np.expm1(shared_splicing_targets(adata, columns, library="transcriptome"))
+        self.assertAlmostEqual(float(panel[0].sum()), CP10K_TARGET, places=3)
+        self.assertNotAlmostEqual(float(full[0].sum()), CP10K_TARGET, places=3)
+        self.assertFalse(np.allclose(panel[0], full[0]))
+
+    def test_global_linear_scale_is_the_training_median_not_the_held_out_tail(self):
+        totals = np.array([10.0, 20.0, 30.0, 1000.0])
+        self.assertAlmostEqual(global_linear_scale(totals[:2]), 15.0)
+        self.assertAlmostEqual(global_linear_scale(totals), 25.0)
+
+    def test_global_linear_targets_are_raw_counts_times_one_scale(self):
+        u = np.array([[1., 3., 2.]], dtype=np.float32)
+        s = np.array([[4., 0., 10.]], dtype=np.float32)
+        adata = SimpleNamespace(layers={"unspliced": sparse.csr_matrix(u),
+                                        "spliced": sparse.csr_matrix(s)})
+        columns = [2, 0]
+        scale = 20.0
+        actual = splicing_targets(adata, columns, GLOBAL_LINEAR, global_scale=scale)
+        factor = CP10K_TARGET / scale
+        np.testing.assert_allclose(actual[0], np.array([2., 1., 10., 4.]) * factor)
+        self.assertGreater(actual.max(), np.log1p(CP10K_TARGET))
 
 
 class GammaAnchorTests(unittest.TestCase):

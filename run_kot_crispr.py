@@ -74,7 +74,7 @@ REPLICATE_COLUMN = "replicate"
 # Collapse threshold: rescale would inflate a near-constant phi, so the protein is dropped instead.
 MIN_CALIBRATION_SD_RATIO = 0.01
 
-# Stabilizer for relative Jacobian error when the nonlinear response is ~0.
+# Stabilizer for relative Jacobian error when the nonlinear response vanishes.
 LINEARIZATION_EPS = 1e-12
 
 # Self effects can destroy protein while leaving transcript; they do not test an RNA→protein map.

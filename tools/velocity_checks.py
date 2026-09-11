@@ -192,8 +192,7 @@ def rows_for_pair(name: str, compare_name: str) -> list[dict]:
     rna_adata, protein_adata = load_pair_inputs(cfg, meta)
     S_np, kin_mask = projection_for(cfg, rna_adata, protein_adata)
 
-    # Feature space is what makes the gene axis meaningful: a PCA representation has no
-    # gene to mask or to match against the other file.
+    # Feature space makes the gene axis meaningful; PCA has no gene to mask.
     D_r = matrix_from_adata(rna_adata, cfg.get("kot_rna_layer"), "RNA").shape[1]
     velocity, layer = resolve_velocity_matrix(
         rna_adata, cfg.get("velocity_layer"), D_r, use_feature_space=True,
