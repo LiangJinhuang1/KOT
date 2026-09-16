@@ -46,28 +46,13 @@ staged synthetic runs, and the validation-split knobs are documented in
 
 ## Cluster
 
-The SLURM scripts run inside the existing Singularity image and preserve the
-repository-root module command, so an editable install is optional on the
-cluster:
+SLURM wrappers stay on the HPC checkout under `slurm/` and are not part of this
+GitHub tree. Training is the same module command from the repository root,
+inside the project container; caches stay under the project directory:
 
 ```bash
-sbatch --export=ALL,STAGE=clean,SCALE=mean,MODELS=kot slurm/train_stage.sh
-```
-
-Parallel sweeps use one runner argument string per line:
-
-```bash
-bash slurm/make_jobs.sh --out jobs.txt
-sbatch --export=ALL,JOBS_FILE=jobs.txt,MAX_PARALLEL=16 slurm/parallel_train.sh
-```
-
-Submit from the repository root. The scripts use `SLURM_SUBMIT_DIR`, mount that
-directory into the container, and keep caches under the project directory.
-
-Before a long run, a quick container check is useful:
-
-```bash
-sbatch --export=ALL,RUN_CMD='python -m src.training.runner --help' slurm/train_slurm.sh
+python -m src.training.runner --datasets pbmc_retained --models kot_main
+python -m src.training.runner --help
 ```
 
 ## Optional Backends
