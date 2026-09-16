@@ -9,6 +9,9 @@ Datasets/
 analysis/
 results/
 .ncbi/
+figure_data/
+scratch/
+scratch_lens4/
 
 # Documents and local drafts
 assistant.py
@@ -16,8 +19,6 @@ assistant.py
 !README.md
 !config/README.md
 *.sh
-!slurm/
-!slurm/*.sh
 *.qmd
 *.ipynb
 
@@ -25,6 +26,7 @@ assistant.py
 jobs_*.txt
 jobs/
 archive/
+slurm/
 
 # --- Python ---
 __pycache__/
@@ -60,3 +62,4 @@ STAR
 samtools*/
 references/
 HGNC_set.txt
+settings.txt
