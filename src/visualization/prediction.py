@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D
 from scipy import stats
 
 from src.visualization import METHOD_COLORS
@@ -36,7 +37,19 @@ CANONICAL = {"lr_beta": 0.001, "lr_warmup_epochs": 300,
 
 # Covered by the kinetics term, or reached by alignment alone.
 COVERAGE_COLORS = {True: METHOD_COLORS["kot"], False: "#767676"}
-COVERAGE_LABELS = {True: "in kinetics", False: "alignment only"}
+COVERAGE_LABELS = {True: "In kinetics", False: "Not in kinetics"}
+
+
+def series_flag(series: pd.Series) -> pd.Series:
+    """True/False from a CSV column that may already be bool or still a string."""
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype(bool)
+    return series.astype(str).str.strip().str.lower().isin(("true", "1", "yes"))
+
+
+def blank_subset(series: pd.Series) -> pd.Series:
+    text = series.astype(str).str.strip().str.lower()
+    return series.isna() | text.isin(("", "nan", "none"))
 
 
 def canonical_rows(dataset: str) -> pd.DataFrame:
@@ -44,8 +57,11 @@ def canonical_rows(dataset: str) -> pd.DataFrame:
     df = pd.read_csv(RESULTS_DIR / "protein_eval_per_protein.csv")
     keep = df["dataset"] == dataset
     for column, value in CANONICAL.items():
-        keep &= df[column].astype(type(value)) == value
-    return df[keep & df["beta_anchor_subset_n"].isna()].copy()
+        if isinstance(value, bool):
+            keep &= series_flag(df[column]) == value
+        else:
+            keep &= df[column].astype(type(value)) == value
+    return df[keep & blank_subset(df["beta_anchor_subset_n"])].copy()
 
 
 def per_protein_median(df: pd.DataFrame, metric: str = "spearman") -> pd.DataFrame:
@@ -98,19 +114,20 @@ def ranked_protein_panel(ax, df: pd.DataFrame, metric: str = "spearman",
         ax.scatter(x[mask], per_protein["median"][mask], s=5,
                    color=COVERAGE_COLORS[covered], linewidths=0, zorder=3,
                    label=COVERAGE_LABELS[covered])
-    # The named markers sit at almost the same height at each end of the ranking, so
-    # they are stacked into the empty side of the curve rather than offset uniformly:
-    # the leading group downwards, under a curve that has not descended yet, and the
-    # trailing group upwards and leftwards, away from the axis edge.
-    leaders = [(i, -1, 4, "left") for i in range(n_label)]
-    trailers = [(i, 1, -4, "right") for i in range(len(x) - n_label, len(x))]
-    for group in (leaders, trailers):
-        for step, (i, sign, dx, ha) in enumerate(group):
-            ax.annotate(clean_protein(per_protein["protein"][i]),
-                        (x[i], per_protein["median"][i]), textcoords="offset points",
-                        xytext=(dx, sign * (7 + 9 * step)), color="0.35", ha=ha,
-                        arrowprops=dict(arrowstyle="-", lw=0.5, color="0.7",
-                                        shrinkA=0, shrinkB=1))
+    # The first three proteins sit at almost the same height on the left, so a
+    # left-edge ladder draws leader lines through those points. Park the names
+    # in the gap to their right, above the descending tail.
+    n_label = min(n_label, len(x) // 2)
+    named = ([(i, "left", 0.34, 0.96 - 0.10 * s) for s, i in enumerate(range(n_label))]
+             + [(i, "right", 0.98, 0.22 + 0.11 * s)
+                for s, i in enumerate(range(len(x) - n_label, len(x)))])
+    for i, ha, fx, fy in named:
+        ax.annotate(clean_protein(per_protein["protein"][i]),
+                    xy=(x[i], per_protein["median"][i]), xycoords="data",
+                    xytext=(fx, fy), textcoords="axes fraction",
+                    color="0.35", ha=ha, va="center", fontsize=6,
+                    arrowprops=dict(arrowstyle="-", lw=0.5, color="0.7",
+                                    shrinkA=0, shrinkB=1))
     ax.set_xlim(-1, len(x))
     return per_protein
 
@@ -139,3 +156,131 @@ def pooled_calibration_panel(ax, predicted: np.ndarray, observed: np.ndarray, *,
     rho = stats.spearmanr(obs.ravel(), pred.ravel()).statistic
     ax.text(0.03, 0.97, f"ρ = {rho:.2f}", transform=ax.transAxes, ha="left", va="top")
     return rho
+
+
+# Lineage markers named before looking at test Spearman. A missing name is skipped,
+# not replaced by whichever protein scored best.
+PRESET_MARKERS = ("CD4", "CD14", "CD19")
+
+CONTROL_ARMS = ("shuffle", "reverse", "zero", "permS")
+ARM_LABELS = {
+    "none": "KOT",
+    "nodyn": "No kinetics",
+    "shuffle": "Shuffled velocity",
+    "reverse": "Reversed velocity",
+    "zero": "Zero velocity",
+    "permS": "Permuted links",
+}
+NODYN_RUNS = {
+    "bmmc_cite_retained": Path(
+        "cache/training/run_20260829_042713_nodyn_bmmc_scv_cfgB_warm300_beta1p0e-3"),
+    "pbmc_retained": Path(
+        "cache/training/run_20260829_042713_nodyn_pbmc_scv_cfgB_warm300_beta1p0e-3"),
+}
+NODYN_EVAL_CSV = RESULTS_DIR / "protein_eval_nodyn_per_protein.csv"
+
+
+def control_rows(dataset: str, arm: str) -> pd.DataFrame:
+    """Canonical hyper-parameters, one velocity/link control arm."""
+    df = pd.read_csv(RESULTS_DIR / "protein_eval_per_protein.csv")
+    keep = (df["dataset"] == dataset) & (df["lr_beta"].astype(float) == CANONICAL["lr_beta"])
+    keep &= df["lr_warmup_epochs"].astype(int) == CANONICAL["lr_warmup_epochs"]
+    keep &= blank_subset(df["beta_anchor_subset_n"])
+    permuted = series_flag(df["kot_s_permute"])
+    if arm == "permS":
+        keep &= permuted
+        keep &= df["kot_velocity_ablation"].astype(str) == "none"
+    else:
+        keep &= ~permuted
+        keep &= df["kot_velocity_ablation"].astype(str) == arm
+    return df[keep].copy()
+
+
+def paired_protein_delta(reference: pd.DataFrame, other: pd.DataFrame,
+                         metric: str = "spearman") -> pd.DataFrame:
+    """Per-protein, per-seed difference; incomplete pairs are an error."""
+    keys = ["dataset", "seed", "protein"]
+    left = reference[keys + [metric, "in_kinetics"]].copy()
+    right = other[keys + [metric]].copy()
+    if left.duplicated(keys).any() or right.duplicated(keys).any():
+        raise ValueError("Duplicate dataset/seed/protein rows would bias paired deltas")
+    merged = left.merge(right, on=keys, how="inner", suffixes=("_ref", "_other"),
+                        validate="one_to_one")
+    ref_keys = set(map(tuple, left[keys].to_numpy()))
+    other_keys = set(map(tuple, right[keys].to_numpy()))
+    if ref_keys != other_keys:
+        raise ValueError("Prediction arms do not share the same proteins and seeds")
+    merged["delta"] = merged[f"{metric}_ref"] - merged[f"{metric}_other"]
+    return merged
+
+
+def marker_name_matches(protein: str, marker: str) -> bool:
+    return clean_protein(protein).split("-")[0] == marker
+
+
+def preset_proteins(names) -> list[str]:
+    """The preselected markers that actually exist in this panel, in declared order."""
+    available = list(names)
+    found = []
+    for marker in PRESET_MARKERS:
+        hits = [name for name in available if marker_name_matches(name, marker)]
+        if len(hits) == 1:
+            found.append(hits[0])
+        elif len(hits) > 1:
+            exact = [name for name in hits if clean_protein(name) == marker]
+            found.append(exact[0] if exact else hits[0])
+    return found
+
+
+def paired_delta_panel(ax, deltas: pd.DataFrame):
+    """One point per protein: median KOT − control Spearman over seeds."""
+    per_protein = deltas.groupby(["protein", "in_kinetics"])["delta"].median().reset_index()
+    per_protein = per_protein.sort_values("delta", ascending=False).reset_index(drop=True)
+    x = np.arange(len(per_protein))
+    for covered in (True, False):
+        mask = (per_protein["in_kinetics"] == covered).to_numpy()
+        ax.scatter(x[mask], per_protein["delta"][mask], s=5,
+                   color=COVERAGE_COLORS[covered], linewidths=0, zorder=3,
+                   label=COVERAGE_LABELS[covered])
+    ax.axhline(0, color="0.45", lw=0.7, ls=(0, (4, 2)), zorder=1)
+    ax.set_xlim(-1, len(x))
+    return per_protein
+
+
+def marker_arm_panel(ax, frames: dict[str, pd.DataFrame], proteins: list[str],
+                     arms: list[str]):
+    """Preselected markers, one cluster per marker, arms as coloured ticks."""
+    colours = {
+        "none": METHOD_COLORS["kot"],
+        "nodyn": METHOD_COLORS["kot_nodyn"],
+        "shuffle": "#D55E00",
+        "reverse": "#E69F00",
+        "zero": "#767676",
+        "permS": "#CC79A7",
+    }
+    width = 0.14
+    for i, protein in enumerate(proteins):
+        for j, arm in enumerate(arms):
+            df = frames.get(arm)
+            if df is None or df.empty:
+                continue
+            values = df.loc[df["protein"] == protein, "spearman"]
+            if values.empty:
+                continue
+            x = i + (j - (len(arms) - 1) / 2) * width
+            ax.scatter(np.full(len(values), x), values, s=6, color=colours[arm],
+                       alpha=0.55, linewidths=0, zorder=3)
+            ax.plot([x - 0.05, x + 0.05], [values.median()] * 2, color="#1A1A1A",
+                    lw=0.9, zorder=4)
+    ax.set_xticks(range(len(proteins)))
+    ax.set_xticklabels([clean_protein(name) for name in proteins])
+    ax.set_ylim(-0.05, 1.05)
+    handles = [Line2D([0], [0], marker="o", color="none",
+                      markerfacecolor=colours[arm], markersize=4,
+                      label=ARM_LABELS[arm])
+               for arm in arms if arm in frames]
+    if handles:
+        ax.legend(handles=handles, loc="lower left", frameon=False, ncols=2,
+                  fontsize=6)
+    return proteins
+

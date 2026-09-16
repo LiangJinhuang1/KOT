@@ -54,7 +54,10 @@ GEOMETRY_COLUMNS = [
     "explained_variance", "neighbour_preservation", "blur_usable",
 ]
 MANIFEST_COLUMNS = [
-    "run_id", "map_transform", "regulatory_transform", "rna_kinetic_coords",
+    # `condition` is not recoverable from the other columns: a full arm and its
+    # shuffle control share every one of them, differing only in whether the
+    # velocity rows were permuted. Without it a 3-arm manifest has duplicate rows.
+    "run_id", "condition", "map_transform", "regulatory_transform", "rna_kinetic_coords",
     "lambda_dyn", "stabilization", "kappa_mode", "phi_gate",
     "lambda_held_block", "lambda_gamma_anchor", "align_dims", "sinkhorn_blur",
     "seed", "status", *GEOMETRY_COLUMNS,
@@ -540,6 +543,7 @@ def intended_row(line: str, sinkhorn_blur: float | None = None) -> dict:
         blur = config.get("sinkhorn_blur", sinkhorn_blur if sinkhorn_blur is not None else 0.1)
     return {
         "run_id": run_dir.name,
+        "condition": args.condition,
         "map_transform": args.chromatin_transform,
         "regulatory_transform": args.regulatory_transform,
         "rna_kinetic_coords": args.rna_kinetic_coords,

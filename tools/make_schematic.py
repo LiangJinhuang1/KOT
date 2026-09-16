@@ -88,10 +88,11 @@ def arrow(x1, y1, x2, y2, color, width=1.1, head="head"):
 
 
 def text(x, y, s, *, size=BASE, color=INK, anchor="start", weight="normal",
-         style="normal"):
+         style="normal", extra: str = ""):
+    suffix = f" {extra}" if extra else ""
     return (f'    <text x="{x:.1f}" y="{y:.1f}" font-family="{FONT}" '
             f'font-size="{size}" fill="{color}" text-anchor="{anchor}" '
-            f'font-weight="{weight}" font-style="{style}">{s}</text>')
+            f'font-weight="{weight}" font-style="{style}"{suffix}>{s}</text>')
 
 
 def build() -> str:
@@ -112,7 +113,8 @@ def build() -> str:
 
     out.append('  <g id="inputs">')
     out.append(text(14, 24, "RNA cells", size=BASE, color=RNA, weight="600"))
-    out.append(text(14, 36, "state r  +  velocity v", size=SMALL, color=GREY))
+    out.append(text(14, 36, "state r + velocity v", size=SMALL, color=GREY,
+                    extra='letter-spacing="0.55"'))
     rna_groups = load_branch("rna", n=150)
     if rna_groups:
         bnd = bounds_of(rna_groups)

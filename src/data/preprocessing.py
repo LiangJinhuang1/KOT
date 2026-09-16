@@ -190,7 +190,7 @@ def source_stamp(path) -> str:
     return f"{abs_path}|size={stat.st_size}|mtime={int(stat.st_mtime)}"
 
 
-def load_and_preprocess_cached(
+def preprocessed_cache_prefix(
     rna_path,
     protein_path=None,
     protein_label="ADT",
@@ -200,7 +200,6 @@ def load_and_preprocess_cached(
     rna_raw_layer=None,
     rna_umap_path=None,
     cache_dir="cache/preprocessed",
-    force_recompute=False,
     cache_version=None,
     rna_min_cells=3,
     rna_n_top_genes=2000,
@@ -213,7 +212,12 @@ def load_and_preprocess_cached(
     atac_min_cells=3,
     atac_n_components=30,
     atac_n_neighbors=30,
-):
+) -> str:
+    """Stem shared by the RNA/protein/ATAC cache files for these inputs.
+
+    The hash matches :func:`load_and_preprocess_cached`. Callers that only need
+    cell IDs can open the cache without reprocessing.
+    """
     key_parts = source_stamp(rna_path)
     if rna_raw_layer:
         key_parts += f"|rna_raw_layer={rna_raw_layer}"
@@ -243,7 +247,56 @@ def load_and_preprocess_cached(
     cache_key = hashlib.md5(key_parts.encode("utf-8")).hexdigest()[:12]
     base_name = os.path.splitext(os.path.basename(rna_path))[0]
     safe_base = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in base_name)
-    cache_prefix = os.path.join(cache_dir, f"{safe_base}_{cache_key}")
+    return os.path.join(cache_dir, f"{safe_base}_{cache_key}")
+
+
+def load_and_preprocess_cached(
+    rna_path,
+    protein_path=None,
+    protein_label="ADT",
+    protein_obsm_key=None,
+    atac_path=None,
+    atac_label="ATAC",
+    rna_raw_layer=None,
+    rna_umap_path=None,
+    cache_dir="cache/preprocessed",
+    force_recompute=False,
+    cache_version=None,
+    rna_min_cells=3,
+    rna_n_top_genes=2000,
+    rna_n_pcs=30,
+    rna_n_neighbors=30,
+    add_log_velocity_layer=False,
+    log_velocity_scale=1.0,
+    protein_min_cells=1,
+    protein_n_pcs=10,
+    atac_min_cells=3,
+    atac_n_components=30,
+    atac_n_neighbors=30,
+):
+    cache_prefix = preprocessed_cache_prefix(
+        rna_path,
+        protein_path=protein_path,
+        protein_label=protein_label,
+        protein_obsm_key=protein_obsm_key,
+        atac_path=atac_path,
+        atac_label=atac_label,
+        rna_raw_layer=rna_raw_layer,
+        rna_umap_path=rna_umap_path,
+        cache_dir=cache_dir,
+        cache_version=cache_version,
+        rna_min_cells=rna_min_cells,
+        rna_n_top_genes=rna_n_top_genes,
+        rna_n_pcs=rna_n_pcs,
+        rna_n_neighbors=rna_n_neighbors,
+        add_log_velocity_layer=add_log_velocity_layer,
+        log_velocity_scale=log_velocity_scale,
+        protein_min_cells=protein_min_cells,
+        protein_n_pcs=protein_n_pcs,
+        atac_min_cells=atac_min_cells,
+        atac_n_components=atac_n_components,
+        atac_n_neighbors=atac_n_neighbors,
+    )
     rna_cache = f"{cache_prefix}.rna.h5ad"
     protein_cache = f"{cache_prefix}.protein.h5ad"
     atac_cache = f"{cache_prefix}.atac.h5ad"

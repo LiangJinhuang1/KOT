@@ -180,6 +180,25 @@ def median_tick(ax, value: float, position: float, *, half: float = 0.30,
                 zorder=zorder + (0 if extra else 1))
 
 
+def fit_to_venue(fig, max_width: float | None = None) -> None:
+    """Shrink a figure whose saved width would overrun the venue text block.
+
+    ``savefig.bbox="tight"`` measures the drawn artists, not the canvas, so a
+    figure authored at the full width still writes a wider PDF whenever anything
+    overhangs. LaTeX then scales it back down and every font lands below the
+    ladder, which is the one thing the ladder exists to prevent.
+    """
+    limit = max_width or VENUE_WIDTHS[STYLE_STATE["venue"]]["full"]  # type: ignore[index]
+    pad = 2 * float(mpl.rcParams["savefig.pad_inches"])
+    for _ in range(3):
+        fig.canvas.draw()
+        width = fig.get_tightbbox(fig.canvas.get_renderer()).width + pad
+        if width <= limit + 1e-3:
+            return
+        w, h = fig.get_size_inches()
+        fig.set_size_inches(w * limit / width, h)
+
+
 def save_figure(fig, path, *, formats: tuple[str, ...] = ("pdf", "png"),
                 dpi: int = 300, close: bool = True, quiet: bool = False,
                 verify: bool | None = None) -> list[Path]:
@@ -190,6 +209,7 @@ def save_figure(fig, path, *, formats: tuple[str, ...] = ("pdf", "png"),
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    fit_to_venue(fig)
 
     if verify if verify is not None else STYLE_STATE["verify"]:
         findings = check_overlaps(fig, verbose=False)
@@ -211,6 +231,29 @@ def save_figure(fig, path, *, formats: tuple[str, ...] = ("pdf", "png"),
     return written
 
 
+def _drawn_texts(fig, renderer):
+    """Visible text with the extent a reader actually sees.
+
+    Two things a raw ``findobj`` sweep gets wrong, both of which report collisions
+    that are not on the page:
+
+    * a tick for a value outside the view limits still owns a visible ``Text``,
+      parked at the axes edge, so a run of them stacks into itself;
+    * ``Annotation.get_window_extent`` unions the words with their arrow, so two
+      labels whose leader lines converge collide even when the words are far apart.
+    """
+    offview = set()
+    for ax in fig.axes:
+        for labels, lim, i in ((ax.get_xticklabels(which="both"), ax.get_xlim(), 0),
+                               (ax.get_yticklabels(which="both"), ax.get_ylim(), 1)):
+            for t in labels:
+                if not (min(lim) <= t.get_position()[i] <= max(lim)):
+                    offview.add(t)
+    return [(t, mpl.text.Text.get_window_extent(t, renderer))
+            for t in fig.findobj(mpl.text.Text)
+            if t.get_text().strip() and t.get_visible() and t not in offview]
+
+
 def check_overlaps(fig, *, verbose: bool = True) -> list[tuple[str, str]]:
     """Geometric bbox check (figure-style §9.1).
 
@@ -222,11 +265,7 @@ def check_overlaps(fig, *, verbose: bool = True) -> list[tuple[str, str]]:
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
 
-    texts = [
-        (t, t.get_window_extent(renderer))
-        for t in fig.findobj(mpl.text.Text)
-        if t.get_text().strip() and t.get_visible()
-    ]
+    texts = _drawn_texts(fig, renderer)
     spines = [
         (s, s.get_window_extent(renderer))
         for ax in fig.axes for s in ax.spines.values() if s.get_visible()
@@ -236,11 +275,22 @@ def check_overlaps(fig, *, verbose: bool = True) -> list[tuple[str, str]]:
         for ax in fig.axes
     }
 
+    rotated_ticks = {t for ax in fig.axes
+                     for t in (ax.get_xticklabels(which="both")
+                               + ax.get_yticklabels(which="both"))
+                     if t.get_rotation() % 180}
+
     findings: list[tuple[str, str]] = []
     for i, (ta, ba) in enumerate(texts):
         for tb, bb in texts[i + 1:]:
-            if ba.overlaps(bb):
-                findings.append((ta.get_text()[:40], tb.get_text()[:40]))
+            if not ba.overlaps(bb):
+                continue
+            # Neighbouring rotated ticks always "overlap" by axis-aligned box while
+            # their glyphs do not, and matplotlib places ticks itself: crowding there
+            # is a locator question, not a stray-annotation one.
+            if ta in rotated_ticks and tb in rotated_ticks:
+                continue
+            findings.append((ta.get_text()[:40], tb.get_text()[:40]))
     for t, bt in texts:
         for s, bs in spines:
             if bt.overlaps(bs) and t not in own_ticklabels.get(s.axes, set()):
@@ -275,10 +325,13 @@ def embedding_axes(ax, x_label: str = "Dim 1", y_label: str = "Dim 2",
                 xycoords="axes fraction", arrowprops=arrow)
     ax.annotate("", xy=(pad, pad + frac), xytext=(pad, pad),
                 xycoords="axes fraction", arrowprops=arrow)
-    ax.text(pad + frac / 2, pad - 0.015, x_label, transform=ax.transAxes,
-            fontsize=small, color="0.35", ha="center", va="top")
-    ax.text(pad - 0.015, pad + frac / 2, y_label, transform=ax.transAxes,
-            fontsize=small, color="0.35", ha="right", va="center", rotation=90)
+    # At the arrow tips, not beside their midpoints. In a narrow panel the label is
+    # wider than the arrow is long, so midpoint placement puts both boxes over the
+    # shared corner and they collide (section 9.1).
+    ax.text(pad + frac + 0.015, pad, x_label, transform=ax.transAxes,
+            fontsize=small, color="0.35", ha="left", va="center")
+    ax.text(pad, pad + frac + 0.015, y_label, transform=ax.transAxes,
+            fontsize=small, color="0.35", ha="center", va="bottom")
 
 
 def chance_line(ax, value: float = 0.5, *, axis: str = "y",

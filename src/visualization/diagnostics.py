@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Rectangle
 
 from src.visualization import METHOD_COLORS, dataset_label, method_label
 from src.visualization.runs import CACHE_DIR, read_diagnostics, run_flags
@@ -106,6 +107,7 @@ def flag_panel(ax, flags: pd.DataFrame, colors: dict[str, str]):
     """Share of runs carrying each failure flag, per dataset, with the count annotated."""
     categories = ["clean"] + list(FLAG_LABELS)
     width = 0.8 / flags["dataset"].nunique()
+    tallest = 0.0
     for i, dataset in enumerate(sorted(flags["dataset"].unique())):
         sub = flags[flags["dataset"] == dataset]
         counts = [int(sub["flags"].apply(lambda f, c=c: c in f).sum()) for c in categories]
@@ -116,11 +118,16 @@ def flag_panel(ax, flags: pd.DataFrame, colors: dict[str, str]):
         ax.bar(x, [c / len(sub) for c in counts], width=width, color=colors[dataset],
                label=f"{short} (n = {len(sub)})", zorder=3)
         for xx, count in zip(x, counts):
-            ax.text(xx, count / len(sub), str(count), ha="center", va="bottom",
-                    color="0.35")
+            # Offset in points, not in data: a zero-height bar would otherwise print
+            # its count directly onto the bottom spine.
+            ax.annotate(str(count), (xx, count / len(sub)), textcoords="offset points",
+                        xytext=(0, 2), ha="center", va="bottom", color="0.35")
+        tallest = max(tallest, max(counts) / len(sub))
     ax.set_xticks([j + width / 2 for j in range(len(categories))])
     ax.set_xticklabels([FLAG_LABELS.get(c, c) for c in categories], rotation=45,
                        ha="right")
+    # Headroom for the count above the tallest bar, which otherwise reaches the title.
+    ax.set_ylim(0, tallest * 1.18)
     ax.set_ylabel("Share of runs")
 
 
@@ -141,3 +148,68 @@ def read_by_config(name: str) -> pd.DataFrame:
 
 def read_checkpoints() -> pd.DataFrame:
     return pd.read_csv(RESULTS_DIR / "checkpoint_eval_summary.csv")
+
+
+# Historical tune table, locked except lambda_dyn and lr_beta. This is not the
+# 12-seed canonical protocol, and it is not a lambda × anchor grid.
+TUNE_LOCK = {
+    "fitted_side": "tune",
+    "lr_phi": 0.001,
+    "lr_alpha_kappa": 0.0001,
+    "lr_warmup_epochs": 300,
+    "sinkhorn_reg": 0.1,
+}
+TUNE_DATASETS = ("bmmc_cite_retained", "pbmc_retained")
+TUNE_LAMBDAS = (1, 100, 300, 500, 1000, 2000)
+TUNE_BETAS = (0.001, 0.003, 0.01)
+
+
+def tune_lambda_grid(summary: pd.DataFrame, dataset: str, value: str) -> pd.DataFrame:
+    """lambda_dyn × lr_beta grid; missing experiments stay NaN."""
+    keep = summary["dataset"] == dataset
+    for column, expected in TUNE_LOCK.items():
+        series = summary[column]
+        if isinstance(expected, float):
+            keep &= np.isclose(pd.to_numeric(series, errors="coerce"), expected)
+        elif isinstance(expected, int):
+            keep &= pd.to_numeric(series, errors="coerce") == expected
+        else:
+            keep &= series == expected
+    sub = summary.loc[keep, ["lambda_dyn", "lr_beta", value, "seeds"]].copy()
+    sub["lambda_dyn"] = pd.to_numeric(sub["lambda_dyn"], errors="coerce").astype(float)
+    sub["lr_beta"] = pd.to_numeric(sub["lr_beta"], errors="coerce").astype(float)
+    sub[value] = pd.to_numeric(sub[value], errors="coerce")
+    sub["seeds"] = pd.to_numeric(sub["seeds"], errors="coerce")
+    if sub.duplicated(["lambda_dyn", "lr_beta"]).any():
+        raise ValueError(f"{dataset}: duplicate tune-grid cells")
+    index = pd.MultiIndex.from_product(
+        [np.asarray(TUNE_LAMBDAS, dtype=float), np.asarray(TUNE_BETAS, dtype=float)],
+        names=["lambda_dyn", "lr_beta"])
+    sub = sub.set_index(["lambda_dyn", "lr_beta"]).reindex(index).reset_index()
+    sub["dataset"] = dataset
+    return sub
+
+
+def heatmap_grid(ax, table: pd.DataFrame, value: str, *, cmap: str, vmin, vmax):
+    """Draw the lambda × lr_beta grid; hatched cells were not run."""
+    lambdas = np.asarray(TUNE_LAMBDAS, dtype=float)
+    betas = np.asarray(TUNE_BETAS, dtype=float)
+    matrix = table.pivot(index="lr_beta", columns="lambda_dyn", values=value)
+    matrix = matrix.reindex(index=betas, columns=lambdas)
+    masked = np.ma.masked_invalid(matrix.to_numpy(dtype=float))
+    image = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax,
+                      interpolation="nearest")
+    if "seeds" in table.columns:
+        not_run = table.pivot(index="lr_beta", columns="lambda_dyn",
+                              values="seeds").reindex(index=betas, columns=lambdas)
+        missing = not_run.isna().to_numpy()
+    else:
+        missing = np.isnan(matrix.to_numpy(dtype=float))
+    for row, col in np.argwhere(missing):
+        ax.add_patch(Rectangle((col - 0.5, row - 0.5), 1, 1, fill=False,
+                               hatch="////", edgecolor="0.6", linewidth=0.4))
+    ax.set_xticks(range(len(TUNE_LAMBDAS)), [str(v) for v in TUNE_LAMBDAS])
+    ax.set_yticks(range(len(TUNE_BETAS)), [str(v) for v in TUNE_BETAS])
+    ax.set_xlabel(r"$\lambda_{\mathrm{dyn}}$")
+    ax.set_ylabel(r"$\mathrm{lr}_\beta$")
+    return image

@@ -71,7 +71,7 @@ def funnel_panel(ax, coverage: pd.DataFrame, colors: dict[str, str]):
                 color=colors[row["dataset"]], zorder=3)
         for yy, count in zip(y, counts):
             ax.text(count / total + 0.015, yy, f"{count:.0f}", va="center",
-                    color="0.35")
+                    color="0.35", fontsize=6)
     ax.set_yticks([len(FUNNEL) - 1 - j - height / 2 for j in range(len(FUNNEL))])
     ax.set_yticklabels([label for _, label in FUNNEL])
     ax.set_xlim(0, 1.18)
@@ -88,9 +88,12 @@ def terms_panel(ax, coverage: pd.DataFrame, colors: dict[str, str]):
                zorder=3)
         for xx, (column, _) in zip(x, TERMS):
             ax.text(xx, float(row[column]), f"{row[column]:.0f}", ha="center",
-                    va="bottom", color="0.35")
+                    va="bottom", color="0.35", fontsize=6)
     ax.set_xticks([j + width / 2 for j in range(len(TERMS))])
     ax.set_xticklabels([label for _, label in TERMS], rotation=45, ha="right")
+    # Headroom for the count above the tallest bar, which otherwise reaches the title.
+    tallest = max(float(row[c]) for _, row in coverage.iterrows() for c, _ in TERMS)
+    ax.set_ylim(0, tallest * 1.18)
     ax.set_ylabel("Proteins")
 
 

@@ -7,8 +7,14 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, "/home/jinliang/.claude/skills/figure-style")
-from kernel import apply_figure_style, set_frame, panel_letter, panel_crops
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# The external figure-style skill this script imported no longer exists anywhere, so
+# the script had stopped running at all. src/visualization/style.py is the same 8/7/6
+# ladder and open frame, and it also enforces the venue width on save.
+from src.visualization.style import apply_style, figsize, panel_letter, save_figure
 
 STAMP = "run_20260830_225641_anch"
 PANELS = [("bmmc", "bmmc_cite_retained", "BMMC CITE-seq (53 anchors)"),
@@ -43,8 +49,10 @@ def load(panel, ds, cfg):
     return [PCT[panel][k] for k in ks], {n: np.array(v) for n, v in out.items()}
 
 
-apply_figure_style(frame="open", sizes=(8, 7, 6))
-fig, axes = plt.subplots(2, 2, figsize=(7.1, 5.0), sharex=True, sharey=True)
+apply_style(sizes=(8, 7, 6))
+# 5.5in is the ICLR text block. At 7.1in LaTeX scales the figure down and every
+# font lands below the 8/7/6 ladder this script asks for.
+fig, axes = plt.subplots(2, 2, figsize=figsize("full", 3.9), sharex=True, sharey=True)
 letters = iter("abcd")
 
 for row, (cfg, _) in enumerate(CFGS):
@@ -57,14 +65,14 @@ for row, (cfg, _) in enumerate(CFGS):
             s = series[name].std(axis=0, ddof=1)
             ax.fill_between(pcts, m - s, m + s, color=color, alpha=0.12, lw=0, zorder=1)
             ax.plot(pcts, m, "-o", color=color, lw=lw, ms=3.2, zorder=3, mec="white", mew=0.6)
-        set_frame(ax, "open")
         ax.margins(0.06)
         ax.set_xticks([0, 25, 50, 75, 100])
+        ax.yaxis.set_major_locator(mpl.ticker.MaxNLocator(nbins=4, prune="both"))
         if row == 0:
             ax.set_title(ds_label, pad=5)
         ax.text(0.97, 0.05, "n = 12 seeds", transform=ax.transAxes, ha="right",
                 fontsize=mpl.rcParams["legend.fontsize"], color="0.35")
-        panel_letter(ax, next(letters), dx=-0.085, dy=1.03)
+        panel_letter(ax, next(letters))
 
 for row, (_, cfg_label) in enumerate(CFGS):
     box = axes[row, 1].get_position()
@@ -77,45 +85,14 @@ handles = [mpl.lines.Line2D([], [], color=c, lw=lw, marker="o", ms=3.2,
 axes[0, 0].legend(handles=handles, loc="upper right", frameon=False, ncol=1,
                   handlelength=1.5, borderaxespad=0.2, labelspacing=0.25)
 
-fig.suptitle(r"Anchoring $\beta$ rescales $\kappa$ inversely, and only where the prior binds",
-             y=0.985, fontsize=mpl.rcParams["axes.titlesize"])
+# No suptitle: it collided with the panel letter, and in the paper the caption says
+# this. Panel titles still name the two datasets.
 fig.supxlabel("anchors retained (%)", y=0.035, fontsize=mpl.rcParams["axes.labelsize"])
 fig.supylabel("value / full-anchor value", x=0.016, fontsize=mpl.rcParams["axes.labelsize"])
-fig.subplots_adjust(left=0.105, right=0.855, top=0.885, bottom=0.115, wspace=0.09, hspace=0.15)
+# hspace 0.30, not 0.15: the bottom row's panel letter sits above its axes and landed
+# on the spines of the row above.
+fig.subplots_adjust(left=0.105, right=0.855, top=0.94, bottom=0.115, wspace=0.09, hspace=0.30)
 
-out = Path("figures/anchor_ablation/kappa_beta_degeneracy.png")
-fig.savefig(out, dpi=300)
-fig.savefig(out.with_suffix(".pdf"))
-print("saved", out)
-
-fig.canvas.draw()
-r = fig.canvas.get_renderer()
-offview = set()
-for a in fig.axes:
-    for labels, lim, i in ((a.get_yticklabels(), a.get_ylim(), 1),
-                           (a.get_xticklabels(), a.get_xlim(), 0)):
-        for t in labels:
-            v = t.get_position()[i]
-            if not (min(lim) <= v <= max(lim)):
-                offview.add(t)
-
-
-def onscreen(t):
-    b = t.get_window_extent(r)
-    return (fig.bbox.x0 <= b.x1 and b.x0 <= fig.bbox.x1
-            and fig.bbox.y0 <= b.y1 and b.y0 <= fig.bbox.y1)
-texts = [(t, t.get_window_extent(r)) for t in fig.findobj(mpl.text.Text)
-         if t.get_text().strip() and t.get_visible() and onscreen(t) and t not in offview]
-spines = [(s, s.get_window_extent(r)) for a in fig.axes for s in a.spines.values() if s.get_visible()]
-tl = {a: set(a.get_xticklabels(which="both") + a.get_yticklabels(which="both")) for a in fig.axes}
-ov = [(a.get_text()[:22], b.get_text()[:22]) for i, (a, ba) in enumerate(texts)
-      for b, bb in texts[i+1:] if ba.overlaps(bb)]
-ov += [(t.get_text()[:22], "SPINE") for t, bt in texts for s, bs in spines
-       if bt.overlaps(bs) and t not in tl[s.axes]]
-outside = [t.get_text()[:22] for t, b in texts
-           if not (fig.bbox.x0 <= b.x0 and b.x1 <= fig.bbox.x1
-                   and fig.bbox.y0 <= b.y0 and b.y1 <= fig.bbox.y1)]
-print("BBOX overlaps:", ov if ov else "none")
-print("outside figure:", outside if outside else "none")
-for letter, box in panel_crops(fig).items():
-    print("panel", letter, box)
+# save_figure writes PDF+PNG, holds the figure to the venue text block, and runs the
+# same bbox check every other figure in the paper is held to.
+save_figure(fig, Path("figures/anchor_ablation/kappa_beta_degeneracy"), verify=True)

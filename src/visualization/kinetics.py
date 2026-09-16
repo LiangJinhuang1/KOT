@@ -1,9 +1,7 @@
-"""Kinetic-parameter recovery figures.
+"""Fitted kinetic rates versus the literature-derived priors used in training.
 
-The panels here carry the claim no alignment baseline can make: KOT fits a
-per-protein degradation rate beta, and those rates can be checked against
-independently measured protein half-lives. SCOT, moscot, GLUE and uniPort have
-no kinetic parameters at all, so there is nothing to compare them against.
+These panels measure agreement with anchor targets, not independent recovery.
+Unanchored-protein comparisons live in control_effects.py.
 """
 
 from __future__ import annotations
@@ -117,7 +115,7 @@ def recovery_panel(ax, sub: pd.DataFrame, *, title: str, ylim: tuple[float, floa
             ax.annotate(
                 r["marker"], xy=(r["target"], r["fitted"]),
                 xytext=(5 if side == "low" else -5, 9 + rank * 7),
-                textcoords="offset points", fontsize=5.5, color=ink(color),
+                textcoords="offset points", fontsize=6, color=ink(color),
                 ha="left" if side == "low" else "right", va="bottom",
                 arrowprops=dict(arrowstyle="-", lw=0.4, color="0.65",
                                 shrinkA=0, shrinkB=1.5))
@@ -135,10 +133,12 @@ def recovery_panel(ax, sub: pd.DataFrame, *, title: str, ylim: tuple[float, floa
     ax.xaxis.set_minor_locator(LogLocator(base=10, subs=(), numticks=1))
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
-    ax.set_xlabel("Literature rate")
+    ax.set_xlabel("Anchor target β (model units)")
     if show_ylabel:
         ax.set_ylabel("Fitted $\\beta$")
     ax.set_title(title)
+    # Bottom right stays: it is the corner the identity line and the fitted points
+    # both leave empty. The top-left move put this box straight on the dashed line.
     ax.text(0.97, 0.06, f"$\\rho$ = {rho:.2f}\nn = {len(g)}", transform=ax.transAxes,
             fontsize=6, color="0.25", ha="right", va="bottom", linespacing=1.4)
     return rho, g
@@ -148,9 +148,10 @@ def plot_beta_recovery(df: pd.DataFrame, save_path: str | Path,
                        *, n_label: int = 1, datasets=("bmmc_cite_retained", "pbmc_retained"),
                        backend_pairs=(("bmmc_cite_retained", "bmmc_cite_regvelo"),
                                       ("pbmc_retained", "pbmc_regvelo"))):
-    """Three panels: recovery on two datasets, then the velocity-backend comparison."""
+    """Anchor agreement on two datasets, backend sensitivity, and rate compression."""
     apply_style()
-    fig, axes = plt.subplots(1, 4, figsize=figsize("full", 2.1), layout="constrained")
+    fig, axes = plt.subplots(2, 2, figsize=figsize("full", 4.6), layout="constrained")
+    axes = axes.ravel()
     fig.get_layout_engine().set(w_pad=0.08, wspace=0.07)
 
     ylim = beta_limits(df, datasets)
@@ -197,7 +198,7 @@ def plot_beta_recovery(df: pd.DataFrame, save_path: str | Path,
     ax.set_xticklabels(["scVelo", "RegVelo"])
     ax.tick_params(axis="x", pad=2)
     ax.set_xlim(-0.25, 1.55)
-    ax.set_ylabel("Rank recovery $\\rho$")
+    ax.set_ylabel("Anchor rank agreement $\\rho$")
     ax.set_title("Velocity backend")
     panel_letter(ax, "c")
 
@@ -210,7 +211,7 @@ def plot_beta_recovery(df: pd.DataFrame, save_path: str | Path,
     ax.legend(loc="lower right", frameon=False)
     panel_letter(ax, "d")
     notes.append(f"{dataset_label(datasets[0])}: {len(table)} markers with "
-                 f"{int(table['seeds'].median())} seeds each")
+                 f"{int(table['seeds'].median())} run/seed observations each")
 
     save_figure(fig, Path(save_path).with_suffix(""))
     return notes
@@ -241,7 +242,7 @@ def beta_spread_panel(ax, df: pd.DataFrame, dataset: str, *, n_label: int = 0):
     ax.scatter(x, table["fitted"], s=4, color=METHOD_COLORS["kot"], linewidths=0,
                zorder=3, label="fitted")
     ax.scatter(x, table["target"], s=4, marker="_", color="#767676", linewidths=0.9,
-               zorder=3, label="literature")
+               zorder=3, label="anchor target")
     # The ends of the range only: naming 52 markers needs a tick per marker, and the
     # panel's claim is the compression between the two series, not any one marker.
     ends = [(0, (2, -8), "left"), (len(table) - 1, (-2, 6), "right")][:n_label]
@@ -250,6 +251,6 @@ def beta_spread_panel(ax, df: pd.DataFrame, dataset: str, *, n_label: int = 0):
                     textcoords="offset points", xytext=offset, ha=ha,
                     fontsize=STYLE_STATE["ladder"][2], color="0.35")
     ax.set_xlim(-1, len(table))
-    ax.set_xlabel("Marker, by literature rate")
+    ax.set_xlabel("Marker, by anchor target")
     ax.set_yscale("log")
     return table

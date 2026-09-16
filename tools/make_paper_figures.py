@@ -13,7 +13,7 @@ import pandas as pd
 import yaml
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import LogLocator, MaxNLocator
 from scipy.stats import gaussian_kde
 from sklearn.decomposition import PCA
 
@@ -34,12 +34,14 @@ from src.visualization.alignment import confusion_panel, modality_mixing
 from src.visualization.benchmark import collect_benchmark, find_collapsed
 from src.visualization.kinetics import collect_beta, plot_beta_recovery
 from src.visualization.prediction import (
-    canonical_rows, coverage_strip_panel, pooled_calibration_panel,
-    ranked_protein_panel,
+    CONTROL_ARMS, canonical_rows, control_rows, coverage_strip_panel,
+    paired_delta_panel, paired_protein_delta, preset_proteins,
+    ranked_protein_panel, marker_arm_panel,
 )
 from src.visualization.diagnostics import (
-    anchor_panel, checkpoint_panel, collect_flags, flag_panel,
-    gradient_panel, read_by_config, read_checkpoints,
+    TUNE_DATASETS, anchor_panel, checkpoint_panel, collect_flags, flag_panel,
+    gradient_panel, heatmap_grid, read_by_config, read_checkpoints,
+    tune_lambda_grid,
 )
 from src.visualization.linkage import (
     dataset_colors, funnel_panel, read_coverage, terms_panel,
@@ -53,9 +55,9 @@ from src.visualization.physics import (
 from src.visualization.runs import (
     CACHE_DIR, curated_runs, is_collapsed, read_diagnostics, run_rank,
 )
+from src.visualization.lineage_map import lineages_for_run
 
 POINT_STYLE = dict(s=0.9, alpha=0.45, linewidths=0, rasterized=True)
-PREPROCESSED_DIR = Path("cache/preprocessed")
 
 
 def seed_dirs(dataset: str, model: str, require: tuple[str, ...]):
@@ -118,36 +120,6 @@ def load_aligned(run: Path) -> tuple[np.ndarray, np.ndarray]:
     return np.load(run / "aligned_rna.npy"), np.load(run / "aligned_protein.npy")
 
 
-def newest_protein_cache(dataset_stem: str) -> Path | None:
-    """The most recently written preprocessing cache for a dataset, or None.
-
-    A hash in the filename pins the figure to a superseded cache; mtime follows the current one.
-    """
-    caches = sorted(PREPROCESSED_DIR.glob(f"{dataset_stem}_*.protein.h5ad"),
-                    key=lambda f: f.stat().st_mtime)
-    return caches[-1] if caches else None
-
-
-def load_lineages(protein_h5ad: Path | None, n: int) -> pd.Series | None:
-    """Coarse lineage per cell, or None with the reason printed.
-
-    A silent None once shipped blank panels, so every refusal says why.
-    """
-    if protein_h5ad is None:
-        print("[fig3] no lineage labels: no protein cache in cache/preprocessed/ for "
-              "this dataset — run preprocessing first")
-        return None
-    a = ad.read_h5ad(protein_h5ad, backed="r")
-    if "cell_type" not in a.obs.columns:
-        print(f"[fig3] no lineage labels: {protein_h5ad.name} has no 'cell_type' column")
-        return None
-    if len(a.obs) != n:
-        print(f"[fig3] no lineage labels: {protein_h5ad.name} has {len(a.obs)} cells "
-              f"but the run has {n}")
-        return None
-    return a.obs["cell_type"].astype(str).map(lineage).reset_index(drop=True)
-
-
 def joint_embedding(xr: np.ndarray, xp: np.ndarray, idx: np.ndarray, seed: int = 0):
     stacked = np.vstack([xr[idx], xp[idx]])
     xy = PCA(n_components=2, random_state=seed).fit_transform(stacked)
@@ -163,6 +135,24 @@ def co_embedding_scatter(ax, xy_r: np.ndarray, xy_p: np.ndarray, rng):
     pts = np.vstack([xy_r, xy_p])
     cols = np.array([MODALITY_COLORS["RNA"]] * len(xy_r) +
                     [MODALITY_COLORS["Protein"]] * len(xy_p))
+    order = rng.permutation(len(pts))
+    ax.scatter(pts[order, 0], pts[order, 1], color=cols[order], **POINT_STYLE)
+
+
+def co_embedding_state_scatter(ax, xy_r: np.ndarray, xy_p: np.ndarray,
+                               states_r, states_p, rng):
+    """Co-embedding with the same state colours on both modalities.
+
+    Modality colours hide branch-identity errors: a swapped map still looks like
+    mixed RNA/protein clouds. Identity is the state colour. Draw order is shuffled
+    so neither modality sits on top.
+    """
+    states_r = np.asarray(states_r)
+    states_p = np.asarray(states_p)
+    colors = state_color_map(np.concatenate([states_r, states_p]))
+    cols = np.array([colors[str(s)] for s in states_r] +
+                    [colors[str(s)] for s in states_p])
+    pts = np.vstack([xy_r, xy_p])
     order = rng.permutation(len(pts))
     ax.scatter(pts[order, 0], pts[order, 1], color=cols[order], **POINT_STYLE)
 
@@ -208,7 +198,7 @@ def figure3(out: Path, max_cells: int = 12000, seed: int = 0):
 
     xr, xp = load_aligned(run)
     fos = pd.read_csv(run / "foscttm.csv")["foscttm"].to_numpy()
-    lin = load_lineages(newest_protein_cache("bmmc_cite_scvelo_results_retained"), len(xr))
+    lin = lineages_for_run(run, len(xr))
 
     idx = rng.choice(len(xr), min(max_cells, len(xr)), replace=False)
     xy_r, xy_p = joint_embedding(xr, xp, idx, seed=seed)
@@ -275,7 +265,7 @@ def figure3(out: Path, max_cells: int = 12000, seed: int = 0):
             ax.fill_between(grid, i, i + d, color=c, alpha=.78, lw=0, zorder=3 + i)
             ax.plot(grid, i + d, color=ink(c), lw=.7, zorder=3 + i)
             ax.text(-0.012, i + .2, name, transform=ax.get_yaxis_transform(),
-                    ha="right", va="center", fontsize=5.5, color=ink(c))
+                    ha="right", va="center", fontsize=6, color=ink(c))
         chance_line(ax, FOSCTTM_CHANCE, axis="x", label="chance")
         ax.set_yticks([]); ax.spines["left"].set_visible(False)
         ax.set_xlim(0, 0.75); ax.set_ylim(-0.08, len(groups))
@@ -370,6 +360,60 @@ def branch_identity_pairs() -> pd.DataFrame | None:
     return wide.dropna(subset=need).reset_index()
 
 
+FIGURE2_CONFUSION_ARMS = (
+    ("kot", "With kinetics"),
+    ("kot_nodyn", "Alignment only"),
+)
+
+
+def confusion_from_run(run: Path) -> tuple[list, list] | None:
+    """Branch confusion stored with one seed directory, or None if it was not written."""
+    diagnostics = run / "diagnostics.json"
+    if not diagnostics.exists():
+        return None
+    payload = read_diagnostics(diagnostics)
+    matrix, labels = payload.get("branch_confusion_matrix"), payload.get("branch_confusion_labels")
+    if not isinstance(matrix, list) or not isinstance(labels, list):
+        return None
+    n_labels = len(labels)
+    if n_labels < 2 or len(matrix) != n_labels:
+        return None
+    if any(not isinstance(row, list) or len(row) != n_labels for row in matrix):
+        return None
+    return matrix, labels
+
+
+def figure2_nodyn_sibling(run: Path) -> Path | None:
+    """Same run/seed no-kinetics directory when it is usable as a paired control."""
+    parts = run.relative_to(CACHE_DIR).parts
+    nodyn = CACHE_DIR.joinpath(parts[0], "kot_nodyn", *parts[2:])
+    if not (nodyn / "diagnostics.json").exists():
+        return None
+    if is_collapsed(read_diagnostics(nodyn / "diagnostics.json")):
+        return None
+    if confusion_from_run(nodyn) is None:
+        return None
+    return nodyn
+
+
+def figure2_confusion_sources(matched: dict[str, Path] | None, fallback=None
+                              ) -> list[tuple[str, str, list | None, list | None]]:
+    """Both kinetic arms, even when one matrix is missing.
+
+    Plotting only the failing arm makes recovery invisible. A missing matrix stays
+    an empty panel. Do not fill a hole from another run or seed: that would look
+    like a paired control.
+    """
+    rows = []
+    for model, title in FIGURE2_CONFUSION_ARMS:
+        found = confusion_from_run(matched[model]) if matched and model in matched else None
+        if found is None and fallback is not None:
+            found = fallback(model)
+        matrix, labels = found if found is not None else (None, None)
+        rows.append((model, title, matrix, labels))
+    return rows
+
+
 def branch_confusion(model: str) -> tuple[list, list] | None:
     """The median-identity curated branch run's confusion matrix for one model.
 
@@ -428,7 +472,7 @@ def figure1b(out: Path, max_cells: int = 8000, seed: int = 0):
         ax.set_title(label)
         ax.text(0.5, -0.04,
                 f"FOSCTTM {fos:.3f}" + (f" · mixing {mix:.2f}" if mix is not None else ""),
-                transform=ax.transAxes, fontsize=6.5, color="0.3",
+                transform=ax.transAxes, fontsize=6, color="0.3",
                 ha="center", va="top")
         embedding_axes(ax, "PC 1", "PC 2")
         panel_letter(ax, letter)
@@ -445,27 +489,41 @@ def protein_path_of(run: Path) -> Path | None:
     The staged synthetic dataset has three stages with different ground truth, so
     reading a fixed path would silently pair a run with another stage's truth.
     """
-    cfg = yaml.safe_load((run / "run_config.yaml").read_text()) or {}
-    paths = cfg.get("dataset_paths") or {}
-    pp = paths.get("protein_path") or cfg.get("protein_path")
-    return Path(pp) if pp else None
+    config_path = run / "run_config.yaml"
+    if config_path.exists():
+        cfg = yaml.safe_load(config_path.read_text()) or {}
+        paths = cfg.get("dataset_paths") or {}
+        pp = paths.get("protein_path") or cfg.get("protein_path")
+        if pp:
+            return Path(pp)
+    posix = run.as_posix()
+    if "/synthetic_linked_ode/" not in posix:
+        return None
+    # syn_branch_ablation seeds predate run_config.yaml; the run name still names the stage.
+    for stage_name in ("branch", "clean", "oracle"):
+        if f"syn_{stage_name}_" in posix or f"syn_{stage_name}/" in posix:
+            fallback = Path(f"cache/synthetic_linked_ode/{stage_name}/protein.h5ad")
+            if fallback.exists():
+                return fallback
+    return None
 
 
 def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int = 0):
     """Controlled recovery on the synthetic linked-ODE system.
 
     Defaults to the `branch` stage: it carries the branching structure the
-    method is actually meant to handle, and it is the harder case. True kappa
-    is constant by construction there, so panel d shows the fitted spread
-    against that constant rather than a scatter.
+    method is actually meant to handle, and it is the harder case. The six
+    panels are ground truth, state-coloured co-embeddings for KOT and the
+    no-kinetics arm, branch resolution across seeds, and matched confusion
+    matrices for both arms.
     """
-    apply_style()
+    apply_style("iclr")
     rng = np.random.default_rng(seed)
 
-    req = ("aligned_rna.npy", "per_cell_diagnostics.npz", "run_config.yaml")
+    req = ("aligned_rna.npy", "aligned_protein.npy", "diagnostics.json")
     cands = seed_dirs("synthetic_linked_ode", "kot", req)
     if not cands:
-        print("[fig2] no synthetic run with per-cell arrays and a config; skipping")
+        print("[fig2] no synthetic run with aligned arrays; skipping")
         return
 
     resolved = [(f, d, protein_path_of(d)) for f, d in cands]
@@ -481,65 +539,104 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
                 if f"syn_{stage}_ablation" in str(r[1])]
     preferred = restored or ablation or on_stage
     preferred.sort()
-    _, run, prot = preferred[len(preferred) // 2]
+    search = restored + ablation if (restored or ablation) else on_stage
+    seen = set()
+    unique = []
+    for row in search:
+        if row[1] in seen:
+            continue
+        seen.add(row[1])
+        unique.append(row)
+    paired = [row for row in unique
+              if confusion_from_run(row[1]) is not None
+              and figure2_nodyn_sibling(row[1]) is not None]
+    chosen = paired or preferred
+    chosen = sorted(chosen)
+    _, run, prot = chosen[len(chosen) // 2]
+    matched = {"kot": run}
+    sibling = figure2_nodyn_sibling(run)
+    if sibling is not None:
+        matched["kot_nodyn"] = sibling
     print(f"[fig2] panels from {run}")
     print(f"[fig2] ground truth from {prot}")
+    if paired:
+        print(f"[fig2] chose among {len(paired)} kot/nodyn pairs")
+    else:
+        print("[fig2] no paired no-kinetics sibling with a confusion matrix")
+    if "kot_nodyn" in matched:
+        print(f"[fig2] paired no-kinetics run {matched['kot_nodyn']}")
     a = ad.read_h5ad(prot)
 
     xr, xp = load_aligned(run)
     n = len(xr)
-    obs = a.obs.iloc[:n].reset_index(drop=True)
-    z = np.load(run / "per_cell_diagnostics.npz", allow_pickle=True)
-
-    fig, axes = plt.subplots(1, 5, figsize=figsize("full", 1.85), layout="constrained")
-    fig.get_layout_engine().set(w_pad=0.07, wspace=0.06)
-
-    ax = axes[0]
-    xy = PCA(n_components=2, random_state=seed).fit_transform(
-        np.asarray(a.layers["protein_mean"])[:n])
+    if len(xp) != n or len(a) != n:
+        raise ValueError(
+            f"{run}: aligned RNA ({n}), protein ({len(xp)}), and protein h5ad "
+            f"({len(a)}) must share one cell order; refusing to colour by state"
+        )
+    obs = a.obs.reset_index(drop=True)
+    if "state" not in obs.columns:
+        raise ValueError(f"{prot}: missing obs['state'] needed for identity colours")
     states = obs["state"].to_numpy()
+
+    fig, axes = plt.subplots(2, 3, figsize=figsize("full", 3.7), layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.10, h_pad=0.16, wspace=0.12, hspace=0.16)
+
+    ax = axes[0, 0]
+    xy = PCA(n_components=2, random_state=seed).fit_transform(
+        np.asarray(a.layers["protein_mean"]))
     for st, c in state_color_map(states).items():
         m = states == st
         ax.scatter(xy[m, 0], xy[m, 1], color=c, label=state_label(st), **POINT_STYLE)
     ax.set_title("Ground truth")
-    ax.legend(markerscale=6, loc="best")
+    # Pinned, not "best": the corner arrows own the lower left, and "best" drops the
+    # legend straight onto the "PC 1" label.
+    ax.legend(markerscale=6, loc="upper right")
     embedding_axes(ax, "PC 1", "PC 2")
     panel_letter(ax, "a")
 
-    ax = axes[1]
+    ax = axes[0, 1]
     idx = rng.choice(n, min(max_cells, n), replace=False)
     xy_r, xy_p = joint_embedding(xr, xp, idx, seed=seed)
-    co_embedding_scatter(ax, xy_r, xy_p, rng)
+    # Synthetic evaluation arrays keep cell order, so RNA i and protein i share a state label.
+    co_embedding_state_scatter(ax, xy_r, xy_p, states[idx], states[idx], rng)
     mix = modality_mixing(xy_r, xy_p, random_state=seed)
-    ax.set_title("After alignment")
+    ax.set_title("With kinetics")
     if mix is not None:
         ax.text(0.02, 0.98, f"mixing {mix:.2f}", transform=ax.transAxes,
-                fontsize=6.5, color="0.3", ha="left", va="top")
+                fontsize=6, color="0.3", ha="left", va="top")
+    ax.text(0.98, 0.02, "colours as in a", transform=ax.transAxes,
+            fontsize=6, color="0.45", ha="right", va="bottom")
     embedding_axes(ax, "PC 1", "PC 2")
     panel_letter(ax, "b")
 
-    ax = axes[2]
-    t_true = obs["true_time"].to_numpy()
-    err = np.asarray(z["time_err"], float)
-    k = min(len(t_true), len(err))
-    ax.scatter(t_true[:k], err[:k], s=0.8, alpha=0.25, linewidths=0,
-               color=METHOD_COLORS["kot"], rasterized=True)
-    bins = np.linspace(np.nanmin(t_true[:k]), np.nanmax(t_true[:k]), 13)
-    # digitize puts a value equal to bins[-1] in an extra bin; clip it back.
-    which = np.clip(np.digitize(t_true[:k], bins), 1, len(bins) - 1)
-    med = [np.nanmedian(err[:k][which == i]) if (which == i).sum() > 5 else np.nan
-           for i in range(1, len(bins))]
-    ax.plot(0.5 * (bins[:-1] + bins[1:]), med, color="#1A1A1A", lw=1.1, zorder=6)
-    ax.set_xlabel("True pseudotime")
-    ax.set_ylabel("Pseudotime error")
-    ax.set_title("Timing error")
-    ax.margins(x=0.04, y=0.08)
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune="both"))
-    ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
+    ax = axes[0, 2]
+    ax.set_title("No kinetics")
     panel_letter(ax, "c")
+    if "kot_nodyn" not in matched:
+        ax.text(0.5, 0.5, "no paired no-kinetics run",
+                transform=ax.transAxes, fontsize=6, color="0.45",
+                ha="center", va="center")
+        ax.set_xticks([]); ax.set_yticks([])
+    else:
+        xr_n, xp_n = load_aligned(matched["kot_nodyn"])
+        if len(xr_n) != n or len(xp_n) != n:
+            raise ValueError(
+                f"{matched['kot_nodyn']}: aligned shapes {(len(xr_n), len(xp_n))} "
+                f"do not match the kinetics run ({n})"
+            )
+        xy_n_r, xy_n_p = joint_embedding(xr_n, xp_n, idx, seed=seed)
+        co_embedding_state_scatter(ax, xy_n_r, xy_n_p, states[idx], states[idx], rng)
+        mix_n = modality_mixing(xy_n_r, xy_n_p, random_state=seed)
+        if mix_n is not None:
+            ax.text(0.02, 0.98, f"mixing {mix_n:.2f}", transform=ax.transAxes,
+                    fontsize=6, color="0.3", ha="left", va="top")
+        ax.text(0.98, 0.02, "colours as in a", transform=ax.transAxes,
+                fontsize=6, color="0.45", ha="right", va="bottom")
+        embedding_axes(ax, "PC 1", "PC 2")
 
     # Branch stage is mirror-symmetric on purpose: OT alone cannot tell the branches apart.
-    ax = axes[3]
+    ax = axes[1, 0]
     pairs = branch_identity_pairs()
     if pairs is not None and len(pairs):
         groups = [("Separation", "sep"), ("Identity", "raw")]
@@ -554,17 +651,15 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
                 median_tick(ax, float(np.median(vals)), x, half=0.12,
                             color=ink(color), lw=1.3, orient="horizontal", zorder=6)
         ax.set_xticks(range(len(groups)))
-        ax.set_xticklabels([g for g, _ in groups], rotation=30, ha="right")
+        ax.set_xticklabels([g for g, _ in groups])
         ax.set_xlim(-0.55, len(groups) - 0.45)
         ax.set_ylim(0, 1.05)
         ax.set_ylabel("Fraction of cells")
-        ax.set_title("Branch resolution")
+        ax.set_title(f"Branch resolution ({len(pairs)} seeds)")
         ax.legend(handles=[
             Line2D([0], [0], marker="o", color="none", markersize=3,
                    markerfacecolor=c, label=lbl) for _, lbl, c in arms],
             loc="lower left")
-        ax.text(0.99, 0.5, f"n = {len(pairs)} seeds", transform=ax.transAxes,
-                fontsize=6, color="0.45", ha="right", va="center")
         ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
     else:
         ax.text(0.5, 0.5, "no matched kot / kot_nodyn\nbranch pairs",
@@ -574,17 +669,25 @@ def figure2(out: Path, stage: str = "branch", max_cells: int = 8000, seed: int =
         ax.set_title("Branch resolution")
     panel_letter(ax, "d")
 
-    # Only the failing arm: the swap is what dynamics has to resolve.
-    ax = axes[4]
-    found = branch_confusion("kot_nodyn")
-    if found is None:
-        ax.text(0.5, 0.5, "no curated branch run\nwith a confusion matrix",
-                transform=ax.transAxes, color="0.45", ha="center", va="center")
-        ax.set_xticks([]); ax.set_yticks([])
-    else:
-        confusion_panel(ax, *found)
-    ax.set_title("Alignment only")
-    panel_letter(ax, "e")
+    for column, (model, title, matrix, labels) in enumerate(
+            figure2_confusion_sources(matched), start=1):
+        ax = axes[1, column]
+        if matrix is None or labels is None:
+            ax.text(0.5, 0.5, "no curated branch run\nwith a confusion matrix",
+                    transform=ax.transAxes, color="0.45", ha="center", va="center")
+            ax.set_xticks([]); ax.set_yticks([])
+        else:
+            confusion_panel(ax, matrix, labels)
+        ax.set_title(title)
+        panel_letter(ax, "ef"[column - 1])
+        paired = bool(matched and model in matched and confusion_from_run(matched[model]))
+        if matrix is None:
+            source = "missing"
+        elif paired:
+            source = "paired run"
+        else:
+            source = "unpaired source"
+        print(f"[fig2] confusion {model}: {source}")
 
     print(f"[fig2] stage={stage}  mixing={mix if mix is None else round(mix, 3)}")
     save_figure(fig, out / "fig2_synthetic")
@@ -607,6 +710,8 @@ def figure5(out: Path):
     ax = axd["a"]
     ladder_panel(ax, syn, "mean_foscttm", arms, ylabel="FOSCTTM",
                  chance=FOSCTTM_CHANCE)
+    # Stacked panels: an edge tick on one meets the neighbour's edge tick (section 3.4).
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
     ax.tick_params(labelbottom=False)
     ax.set_title("Synthetic: alignment")
     ax.legend(loc="upper left", frameon=False)
@@ -616,6 +721,7 @@ def figure5(out: Path):
     ladder_panel(ax, syn, "jvp_rhs_cos_median", arms, ylabel="JVP\u00b7RHS cosine")
     ax.set_title("Synthetic: ODE agreement")
     ax.set_ylim(-0.95, 1.1)
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
     ax.set_xlabel("Velocity corrupted")
     panel_letter(ax, "b")
 
@@ -666,7 +772,7 @@ def figure6(out: Path, dataset: str = "bmmc_cite_retained", max_cells: int = 140
     panel_letter(ax, "a")
 
     ax = axes[1]
-    lineages = load_lineages(newest_protein_cache(dataset.replace("_retained", "")), n)
+    lineages = lineages_for_run(run, n)
     if lineages is None:
         ax.set_visible(False)
     else:
@@ -688,45 +794,70 @@ def figure6(out: Path, dataset: str = "bmmc_cite_retained", max_cells: int = 140
 
 
 def figure7(out: Path):
-    """Predicted protein against measured protein: coverage, per marker, and pooled."""
+    """Predicted protein against measured protein, with matched kinetic controls."""
     apply_style()
-    fig, axes = plt.subplots(1, 3, figsize=figsize("full", 2.5),
-                             gridspec_kw=dict(width_ratios=[1, 1.5, 1.2]))
+    fig, axes = plt.subplots(2, 2, figsize=figsize("full", 4.8),
+                             gridspec_kw=dict(width_ratios=[1, 1.35],
+                                              height_ratios=[1, 1.05]))
 
-    # Short names so group ticks fit; spelled out in panel b's title.
     frames = {short: canonical_rows(d) for short, d in
               (("BMMC", "bmmc_cite_retained"), ("PBMC", "pbmc_retained"))}
+    kot = frames["PBMC"]
+    dataset = "pbmc_retained"
 
-    ax = axes[0]
+    ax = axes[0, 0]
     coverage_strip_panel(ax, frames)
     ax.set_ylabel("Spearman ρ, per protein")
     panel_letter(ax, "a")
 
-    ax = axes[1]
-    ranked_protein_panel(ax, frames["PBMC"])
+    ax = axes[0, 1]
+    ranked_protein_panel(ax, kot)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
     ax.set_xlabel("Protein, ranked")
     ax.set_ylabel("Spearman ρ")
-    ax.set_title(f'{dataset_label("pbmc_retained")}, 12 seeds')
+    ax.set_title(f"{dataset_label(dataset)}, {kot['seed'].nunique()} seeds")
     ax.legend(loc="lower left", frameon=False)
     panel_letter(ax, "b")
 
-    ax = axes[2]
-    # The one real dataset whose runs saved the full ADT panel.
-    run = pick_run("pbmc_retained", "kot",
-                   require=("phi_full_panel.npy", "protein_full_panel.npy"))
-    if run is None:
-        print("[fig7] no PBMC run saved phi_full_panel.npy")
-        ax.set_visible(False)
-    else:
-        pooled_calibration_panel(ax, np.load(run / "phi_full_panel.npy"),
-                                 np.load(run / "protein_full_panel.npy"))
-        ax.set_xlabel("Measured ADT (z)")
-        ax.set_ylabel("Predicted φ(r) (z)")
-        ax.set_title("All markers pooled")
+    ax = axes[1, 0]
+    frames_arms = {"none": kot}
+    delta_source = "no-kinetics model"
+    try:
+        from tools.score_heldout_phi import nodyn_rows
+        nodyn = nodyn_rows(dataset, kot)
+        deltas = paired_protein_delta(kot, nodyn)
+        frames_arms["nodyn"] = nodyn
+    except FileNotFoundError as exc:
+        print(f"[fig7] nodyn scoring unavailable ({exc}); pairing against shuffled velocity")
+        shuffle = control_rows(dataset, "shuffle")
+        deltas = paired_protein_delta(kot, shuffle)
+        frames_arms["shuffle"] = shuffle
+        delta_source = "shuffled velocity"
+    paired_delta_panel(ax, deltas)
+    ax.set_xlabel("Protein, ranked by Δ")
+    ax.set_ylabel("Δ Spearman (KOT − control)")
+    ax.set_title(f"KOT minus {delta_source}")
+    ax.legend(loc="lower left", frameon=False)
     panel_letter(ax, "c")
+
+    for arm in CONTROL_ARMS:
+        arm_rows = control_rows(dataset, arm)
+        if arm_rows.empty:
+            print(f"[fig7] control {arm} has no canonical rows")
+            continue
+        frames_arms[arm] = arm_rows
+    proteins = preset_proteins(kot["protein"].unique())
+    ax = axes[1, 1]
+    marker_arm_panel(ax, frames_arms, proteins,
+                     [arm for arm in ("none", "nodyn", *CONTROL_ARMS)
+                      if arm in frames_arms])
+    ax.set_ylabel("Spearman ρ")
+    ax.set_title("Preselected markers")
+    panel_letter(ax, "d")
 
     fig.tight_layout()
     save_figure(fig, out / "fig7_prediction")
+    return None
 
 
 # Methods with aligned arrays, in the Fig. 3a row order. Missing methods did not save those arrays.
@@ -746,10 +877,9 @@ def figure8(out: Path, dataset: str = "bmmc_cite_retained", max_cells: int = 900
         return
     print(f"[fig8] {len(models)} methods: {', '.join(models)}")
 
-    fig, axes = plt.subplots(2, len(models), figsize=figsize("full", 2.6),
-                             layout="constrained")
+    fig, axes = plt.subplots(2, len(models), figsize=figsize("full", 2.75),
+                             layout="constrained", squeeze=False)
     fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.01, hspace=0.02)
-    cache = newest_protein_cache(dataset.replace("_retained", ""))
 
     for col, model in enumerate(models):
         xr, xp = load_aligned(runs[model])
@@ -759,15 +889,14 @@ def figure8(out: Path, dataset: str = "bmmc_cite_retained", max_cells: int = 900
 
         ax = axes[0, col]
         co_embedding_scatter(ax, xy_r, xy_p, rng)
-        ax.set_title(method_label(model))
-        ax.text(0.02, 0.98, f"mixing {modality_mixing(xy_r, xy_p):.2f}",
-                transform=ax.transAxes, color="0.35", ha="left", va="top")
+        mix = modality_mixing(xy_r, xy_p, random_state=seed)
+        label = method_label(model)
+        ax.set_title(f"{label}\nmixing {mix:.2f}" if mix is not None else label)
         bare_axes(ax)
 
         ax = axes[1, col]
-        lineages = load_lineages(cache, n)
+        lineages = lineages_for_run(runs[model], n)
         if lineages is None:
-            # MaxFuse batching drops cells, so types cannot be recovered.
             ax.text(0.5, 0.5, f"labels unavailable\n(n = {n:,})", transform=ax.transAxes,
                     ha="center", va="center", color="0.45")
             bare_axes(ax)
@@ -778,13 +907,18 @@ def figure8(out: Path, dataset: str = "bmmc_cite_retained", max_cells: int = 900
             if mask.any():
                 ax.scatter(xy_r[mask, 0], xy_r[mask, 1], color=LINEAGE_COLORS[name],
                            **POINT_STYLE)
+        if col == len(models) - 1:
+            ax.text(0.99, 0.02, "colours as in Fig. 3", transform=ax.transAxes,
+                    fontsize=6, color="0.45", ha="right", va="bottom")
         bare_axes(ax)
 
     embedding_axes(axes[1, 0], "Dim 1", "Dim 2")
     modality_legend(axes[0, -1], loc="lower right")
     fig.text(0.005, 0.72, "By modality", rotation=90, va="center", ha="left")
     fig.text(0.005, 0.28, "By lineage", rotation=90, va="center", ha="left")
-    panel_letter(axes[0, 0], "a")
+    # Top-row titles are two lines (method + mixing); the default letter
+    # offset is sized for a single line and would sit on the title.
+    panel_letter(axes[0, 0], "a", dy_points=26)
     panel_letter(axes[1, 0], "b")
     save_figure(fig, out / "fig8_coembedding")
 
@@ -796,6 +930,9 @@ def figure9(out: Path, seed: int = 0):
     fractions = np.geomspace(1e-4, 0.1, 24)
 
     fig, axes = plt.subplots(1, 2, figsize=figsize("full", 2.3), layout="constrained")
+    # Both panels end on a log decade; without the extra gutter the last tick of one
+    # meets the first tick of the other (section 3.4).
+    fig.get_layout_engine().set(wspace=0.12)
 
     ax = axes[0]
     runs = curated_method_runs(datasets[0], GRID_MODELS)
@@ -813,6 +950,10 @@ def figure9(out: Path, seed: int = 0):
 
     ax = axes[1]
     runtime_panel(ax, collect_runtimes(datasets), GRID_MODELS)
+    # Four decades in a half-width panel run their labels together; thin them.
+    for axis in (ax.xaxis, ax.yaxis):
+        if axis.get_scale() == "log":
+            axis.set_major_locator(LogLocator(base=10, numticks=4))
     ax.set_title("Cost")
     ax.text(0.03, 0.97, "mixed hardware", transform=ax.transAxes, color="0.45",
             ha="left", va="top")
@@ -858,6 +999,7 @@ def supplement(out: Path):
     # Checkpoint-choice cost; the ablation arm does not bear on it.
     models = ["kot"]
     fig, axes = plt.subplots(1, 3, figsize=figsize("full", 2.4), layout="constrained")
+    fig.get_layout_engine().set(wspace=0.10)
 
     ax = axes[0]
     checkpoint_panel(ax, checkpoints, "mean_foscttm", models)
@@ -873,6 +1015,7 @@ def supplement(out: Path):
 
     ax = axes[2]
     gradient_panel(ax, read_by_config("summary_warmup_lambda_cfgBC_by_config.csv"))
+    ax.xaxis.set_major_locator(LogLocator(base=10, numticks=4))
     ax.set_title("Do the two terms fight?")
     ax.legend(loc="best", frameon=False)
     panel_letter(ax, "c")
@@ -880,6 +1023,7 @@ def supplement(out: Path):
     save_figure(fig, dest / "figS1_optimization")
 
     fig, axes = plt.subplots(1, 3, figsize=figsize("full", 2.4), layout="constrained")
+    fig.get_layout_engine().set(wspace=0.12)
 
     ax = axes[0]
     flags = collect_flags(COVERAGE_DATASETS)
@@ -891,18 +1035,67 @@ def supplement(out: Path):
     anchors = read_by_config("anchor_ablation_cfgB_by_config.csv")
     ax = axes[1]
     anchor_panel(ax, anchors, "mean_foscttm", colors)
+    # An edge tick here meets the neighbouring panel's edge tick (section 3.4).
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
     ax.set_ylabel("FOSCTTM")
     ax.set_title("Anchors and alignment")
     panel_letter(ax, "b")
 
     ax = axes[2]
     anchor_panel(ax, anchors, "beta_anchor_mean_abs_err", colors)
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
     ax.set_ylabel(r"$\beta$ anchor error")
     ax.set_title("Anchors and β")
     ax.legend(loc="best", frameon=False)
     panel_letter(ax, "c")
 
     save_figure(fig, dest / "figS2_stability")
+
+    figure_robustness(out)
+
+
+def figure_robustness(out: Path):
+    """Historical tune slice: lambda_dyn × lr_beta. Not a lambda × anchor product."""
+    apply_style()
+    dest = out / "appendix"
+    dest.mkdir(parents=True, exist_ok=True)
+    summary_path = Path("cache/results/summary.csv")
+    if not summary_path.exists():
+        print("[figS5] cache/results/summary.csv missing; skipping")
+        return
+    summary = read_by_config("summary.csv")
+    fig, axes = plt.subplots(2, 2, figsize=figsize("full", 3.6), layout="constrained")
+    metrics = (
+        ("foscttm_fitted_mean", "FOSCTTM", "viridis_r", 0.10, 0.50),
+        ("jvp_cos_med_mean", "JVP·RHS cosine", "viridis", 0.0, 1.0),
+    )
+    images = [None, None]
+    for col, dataset in enumerate(TUNE_DATASETS):
+        for row, (value, ylabel, cmap, vmin, vmax) in enumerate(metrics):
+            table = tune_lambda_grid(summary, dataset, value)
+            ax = axes[row, col]
+            images[row] = heatmap_grid(ax, table, value, cmap=cmap, vmin=vmin, vmax=vmax)
+            if row == 0:
+                ax.set_title(dataset_label(dataset))
+                ax.set_xlabel("")
+            if col == 1:
+                ax.set_ylabel("")
+            else:
+                ax.set_ylabel(ylabel)
+            missing = int(table["seeds"].isna().sum())
+            print(f"[figS5] {dataset} {value}: {missing} of {len(table)} cells not run")
+            panel_letter(ax, "abcd"[2 * row + col])
+    cbar0 = fig.colorbar(images[0], ax=list(axes[0]), fraction=0.046, pad=0.02)
+    cbar1 = fig.colorbar(images[1], ax=list(axes[1]), fraction=0.046, pad=0.02)
+    # Both bars: yellow at the top = better (low FOSCTTM, high cosine).
+    cbar0.ax.invert_yaxis()
+    cbar0.set_label("FOSCTTM (lower better)")
+    cbar1.set_label("JVP·RHS cosine (higher better)")
+    fig.text(0.5, -0.02,
+             r"Hatched: not run. $\lambda_{\mathrm{dyn}}\times\mathrm{lr}_\beta$ tune slice, "
+             r"not a $\lambda\times$anchor grid (Fig. 11).",
+             ha="center", va="top", fontsize=6, color="0.35")
+    save_figure(fig, dest / "figS5_lambda_beta")
 
 
 def tables(out: Path):
@@ -986,7 +1179,7 @@ def main():
     print("\n=== Figure 3: real CITE-seq ===")
     figure3(args.out)
 
-    print("\n=== Figure 4: kinetic recovery ===")
+    print("\n=== Figure 4: agreement with kinetic anchor targets ===")
     for note in plot_beta_recovery(collect_beta(), args.out / "fig4_kinetics"):
         print("   ", note)
 

@@ -87,7 +87,9 @@ def ladder_panel(ax, df: pd.DataFrame, metric: str, models: list[str], *,
     """
     positions = {arm: i for i, arm in enumerate(LADDER)}
     gap = len(LADDER) + 0.6
-    positions.update({arm: gap + i for i, arm in enumerate(OFF_LADDER)})
+    # 1.4 apart, not 1: the off-ladder names are words, and at 45 degrees two
+    # adjacent word ticks overlap where the ladder's short labels do not (section 9.1).
+    positions.update({arm: gap + 1.4 * i for i, arm in enumerate(OFF_LADDER)})
 
     for model in models:
         color = METHOD_COLORS[model]

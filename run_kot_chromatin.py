@@ -1501,7 +1501,6 @@ def preflight_checks(model, law: str, chromatin: torch.Tensor, target: torch.Ten
                      rows: torch.Tensor, velocity_rows: torch.Tensor, scale: torch.Tensor,
                      adata: sc.AnnData, reference_layer: str,
                      reference_columns: np.ndarray | None = None,
-                     foscttm_cells: int = 2000,
                      target_layer: str | None = None) -> dict:
     """The gate before launching anything else.
 
@@ -1520,7 +1519,12 @@ def preflight_checks(model, law: str, chromatin: torch.Tensor, target: torch.Ten
         kappa = model.kappa(chromatin[probe])
         alpha = model.g(alpha_features(model, chromatin, production)[probe])
     observed = target[rows]
-    sample = torch.randperm(len(rows))[:foscttm_cells]
+    # Every evaluation cell, not a draw. An unseeded randperm here made FOSCTTM a
+    # property of whichever process scored the checkpoint: eight rescorings of ONE
+    # byte-identical checkpoint spanned 0.2198-0.2277 (SD 0.0025), wider than the
+    # differences between the arms this metric exists to compare. calc_frac_idx walks
+    # rows in GPU batches, so the whole val set costs batch-sized strips, not n^2.
+    sample = torch.arange(len(rows), device=rows.device)
     checks = {
         **state_metrics(spliced_block(prediction, law), spliced_block(observed, law), sample),
         "state_prediction_finite": bool(torch.isfinite(prediction).all()),

@@ -12,7 +12,11 @@ kot_unbounded,native
 kot_unbounded_sn,native
 Linear ODE,holdout_second
 MaxFuse,holdout_second
+mlp,holdout_second
 moscot,holdout_second
+ridge,holdout_second
+scbutterfly,holdout_second
+scipenn,holdout_second
 SCOT,holdout_second
 totalVI (paired),paired
 uniPort,holdout_second
