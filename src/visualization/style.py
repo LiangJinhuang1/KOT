@@ -199,13 +199,13 @@ def fit_to_venue(fig, max_width: float | None = None) -> None:
         fig.set_size_inches(w * limit / width, h)
 
 
-def save_figure(fig, path, *, formats: tuple[str, ...] = ("pdf", "png"),
+def save_figure(fig, path, *, formats: tuple[str, ...] = ("pdf", "png", "svg"),
                 dpi: int = 300, close: bool = True, quiet: bool = False,
                 verify: bool | None = None) -> list[Path]:
     """Save one figure to every requested format, PDF first.
 
-    The PDF is what goes into LaTeX; the PNG exists for quick viewing and for the
-    §9 render-then-verify pass, which needs rasterised pixels to inspect.
+    The PDF is what goes into LaTeX. PNG is for preview and the bbox check.
+    SVG is the Inkscape / Illustrator / draw.io-import copy — text stays text.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,15 @@
-"""SVG, not matplotlib: box-and-arrow fights pyplot, and labels stay editable."""
+#!/usr/bin/env python
+"""Emit the Figure 1a method schematic as an editable SVG.
+
+Written as SVG rather than plotted: box-and-arrow diagrams fight matplotlib, and
+the output needs to stay editable in Inkscape or Illustrator through revisions.
+Text is real text (not paths), so labels can be retyped downstream.
+
+Geometry, palette, and type sizes match the plotted panels so the schematic and
+the data figures read as one system.
+
+    PYTHONPATH=. python tools/make_schematic.py --out figures/fig1a_schematic.svg
+"""
 from __future__ import annotations
 
 import argparse
@@ -11,14 +22,17 @@ from sklearn.decomposition import PCA
 
 from src.data.synthetic_linked_ode import stage_output_paths
 
+# 100 user units = 1 inch, so the file is authored at final printed size.
 W, H = 550, 232
 RNA, PROT, KOT = "#5D3A9B", "#9C6500", "#0072B2"
 GREY, RULE, INK = "#767676", "#CFCFCF", "#1A1A1A"
 FONT = "Liberation Sans, Arial, Helvetica, sans-serif"
-BASE, SMALL, TINY = 11, 9.5, 8.5
+BASE, SMALL, TINY = 11, 9.5, 8.5     # 8pt / 7pt / 6pt at 100 units per inch
 
 
-# Paths come from the runner so a stage-layout change cannot leave the schematic stale.
+# Asymmetric on purpose (RNA under cache/velocity/, protein under cache/) — taken
+# from the runner rather than re-typed, so a change to the stage layout cannot
+# leave the schematic reading a path that no longer exists.
 BRANCH_RNA, BRANCH_PROTEIN = (Path(p) for p in stage_output_paths("branch"))
 
 
@@ -88,11 +102,10 @@ def arrow(x1, y1, x2, y2, color, width=1.1, head="head"):
 
 
 def text(x, y, s, *, size=BASE, color=INK, anchor="start", weight="normal",
-         style="normal", extra: str = ""):
-    suffix = f" {extra}" if extra else ""
+         style="normal"):
     return (f'    <text x="{x:.1f}" y="{y:.1f}" font-family="{FONT}" '
             f'font-size="{size}" fill="{color}" text-anchor="{anchor}" '
-            f'font-weight="{weight}" font-style="{style}"{suffix}>{s}</text>')
+            f'font-weight="{weight}" font-style="{style}">{s}</text>')
 
 
 def build() -> str:
@@ -111,10 +124,10 @@ def build() -> str:
     out.append('  </defs>')
     out.append(f'  <rect width="{W}" height="{H}" fill="white"/>')
 
+    # ---------------------------------------------------------------- inputs
     out.append('  <g id="inputs">')
     out.append(text(14, 24, "RNA cells", size=BASE, color=RNA, weight="600"))
-    out.append(text(14, 36, "state r + velocity v", size=SMALL, color=GREY,
-                    extra='letter-spacing="0.55"'))
+    out.append(text(14, 36, "state r  +  velocity v", size=SMALL, color=GREY))
     rna_groups = load_branch("rna", n=150)
     if rna_groups:
         bnd = bounds_of(rna_groups)
@@ -153,6 +166,7 @@ def build() -> str:
             out.append(dots(px, py, PROT))
     out.append('  </g>')
 
+    # ------------------------------------------------------------------- phi
     out.append('  <g id="phi">')
     out.append(f'    <rect x="150" y="96" width="54" height="30" rx="3" '
                f'fill="none" stroke="{KOT}" stroke-width="1.3"/>')
@@ -163,21 +177,35 @@ def build() -> str:
     out.append(text(225, 105, "&#966;(r)", size=SMALL, color=KOT, anchor="middle",
                     style="italic"))
     out.append('  </g>')
+    out.append('  <g id="protein-in">')
+    out.append(arrow(118, 188, 246, 188, INK, 1.1))
+    out.append('  </g>')
 
+    # ------------------------------------------------- shared protein space
     out.append('  <g id="shared">')
     out.append(f'    <rect x="248" y="42" width="152" height="166" rx="3" '
                f'fill="none" stroke="{RULE}" stroke-width="0.8"/>')
     out.append(text(324, 34, "Shared protein space", size=SMALL, color=GREY,
                     anchor="middle"))
     # Both clouds interleave on the same geometry: the claim is that they match.
+    zoom_p = zoom_r = None
     shared = load_branch("protein", n=130, seed=2)
+    box = (260, 62, 128, 118)
     if shared:
         bnd = bounds_of(shared)
-        for xy in (fit_into(v, bnd, (260, 62, 128, 118)) for v in shared.values()):
+        for st, raw in shared.items():
+            xy = fit_into(raw, bnd, box)
+            jitter = rng.normal(0, 1.7, xy.shape)
             out.append(dots(xy[:, 0], xy[:, 1], PROT, r=1.5, opacity=0.5))
-            out.append(dots(xy[:, 0] + rng.normal(0, 1.7, len(xy)),
-                            xy[:, 1] + rng.normal(0, 1.7, len(xy)), RNA,
+            out.append(dots(xy[:, 0] + jitter[:, 0], xy[:, 1] + jitter[:, 1], RNA,
                             r=1.4, opacity=0.5))
+            if st in ("Progenitor", "Branch_A"):
+                # Stem plus one arm: enough manifold for the direction cartoon.
+                if zoom_p is None:
+                    zoom_p, zoom_r = xy, xy + jitter
+                else:
+                    zoom_p = np.vstack([zoom_p, xy])
+                    zoom_r = np.vstack([zoom_r, xy + jitter])
     else:
         for br in (+1, -1):
             base_x, base_y = trajectory(np.linspace(0, 1, 38), branch=br,
@@ -190,39 +218,48 @@ def build() -> str:
                f'stroke="{GREY}" stroke-width="0.9" stroke-dasharray="4 2.5"/>')
     out.append(text(324, 200, "Sinkhorn matches the cloud", size=TINY, color=GREY,
                     anchor="middle"))
-
-    # Kinetics term acts on one cell's arrow.
-    cx, cy = 340, 74
-    out.append(f'    <circle cx="{cx}" cy="{cy}" r="16" fill="white" '
-               f'fill-opacity="0.9" stroke="{KOT}" stroke-width="1" '
-               f'stroke-dasharray="2.5 2"/>')
-    out.append(arrow(cx - 5, cy + 6, cx + 15, cy - 9, KOT, 1.4, "headKOT"))
-    out.append(arrow(cx - 5, cy + 6, cx + 11, cy + 14, GREY, 0.9, "headGrey"))
-    out.append(text(cx + 19, cy - 12, "J&#966;&#183;v", size=SMALL, color=KOT,
-                    style="italic"))
-    out.append(f'    <line x1="{cx + 8}" y1="{cy + 17}" x2="{cx - 14}" y2="{cy + 30}" '
-               f'stroke="{GREY}" stroke-width="0.5"/>')
-    out.append(text(cx - 16, cy + 33, "ruled out", size=TINY, color=GREY,
-                    anchor="end"))
     out.append('  </g>')
 
+    # Kinetics lives beside the cloud, not on it: a zoom of the same synthetic
+    # branch, so the direction constraint is drawn on the real manifold.
     out.append('  <g id="constraint">')
-    out.append(arrow(432, 72, 406, 72, INK, 1.0))
-    out.append(text(436, 62, "the kinetics term", size=SMALL, color=INK, weight="600"))
-    out.append(text(436, 74, "fixes the direction,", size=TINY, color=GREY))
-    out.append(text(436, 85, "not just the cloud", size=TINY, color=GREY))
+    out.append(arrow(400, 108, 432, 108, INK, 1.0))
+    out.append(text(436, 36, "the kinetics term", size=SMALL, color=INK, weight="600"))
+    out.append(text(436, 48, "fixes the direction,", size=TINY, color=GREY))
+    out.append(text(436, 59, "not just the cloud", size=TINY, color=GREY))
 
-    out.append(f'    <line x1="436" y1="108" x2="540" y2="108" stroke="{RULE}" '
-               f'stroke-width="0.8"/>')
-    # Compact form: the full expression does not fit at a legible size.
-    out.append(text(436, 126, "J&#966;&#183;v = &#954;(&#945;&#183;Sr &#8722; &#946;&#183;&#966;)",
+    if zoom_p is not None:
+        z = np.vstack([zoom_p, zoom_r])
+        zb = np.array([z.min(axis=0), z.max(axis=0)])
+        zp = fit_into(zoom_p, zb, (438, 64, 100, 58))
+        zr = fit_into(zoom_r, zb, (438, 64, 100, 58))
+        out.append(dots(zp[:, 0], zp[:, 1], PROT, r=1.4, opacity=0.55))
+        out.append(dots(zr[:, 0], zr[:, 1], RNA, r=1.3, opacity=0.55))
+        i = int(np.argsort(zr[:, 0])[len(zr) // 2])
+        ox, oy = zr[i]
+        tip = zp[np.argmax(zp[:, 0])]
+        mid = zp[np.argsort(zp[:, 0])[len(zp) // 2]]
+        d = tip - mid
+        nrm = float(np.hypot(*d) or 1.0)
+        ux, uy = d[0] / nrm, d[1] / nrm
+        out.append(f'    <circle cx="{ox:.1f}" cy="{oy:.1f}" r="2.4" fill="white" '
+                   f'stroke="{RNA}" stroke-width="0.8"/>')
+        out.append(arrow(ox, oy, ox + 20 * ux, oy + 20 * uy, KOT, 1.4, "headKOT"))
+        out.append(text(ox + 22 * ux, oy + 20 * uy - 5, "J&#966;&#183;v",
+                        size=SMALL, color=KOT, style="italic"))
+        # Off-branch, away from the equation under the zoom.
+        rx, ry = -uy, ux
+        if rx > 0:
+            rx, ry = -rx, -ry
+        out.append(arrow(ox, oy, ox + 16 * rx, oy + 16 * ry, GREY, 0.95, "headGrey"))
+        out.append(text(548, 128, "ruled out", size=TINY, color=GREY, anchor="end"))
+
+    out.append(text(436, 168,
+                    "J&#966;&#183;v = &#954;(&#945;&#183;Sr &#8722; &#946;&#183;&#966;)",
                     size=BASE, color=INK))
-    out.append(text(436, 144, "&#954;  time-scale", size=TINY, color=GREY))
-    out.append(text(436, 155, "&#945;  translation rate", size=TINY, color=GREY))
-    out.append(text(436, 166, "&#946;  degradation rate", size=TINY, color=GREY))
-    out.append(text(436, 177, "S  gene &#8594; protein map", size=TINY, color=GREY))
-    out.append(text(436, 194, "&#946; is checked against", size=TINY, color=PROT))
-    out.append(text(436, 205, "measured half-lives", size=TINY, color=PROT))
+    out.append(text(436, 186, "&#954;  time-scale", size=TINY, color=GREY))
+    out.append(text(436, 197, "&#945;  translation rate", size=TINY, color=GREY))
+    out.append(text(436, 208, "&#946;  degradation rate", size=TINY, color=GREY))
     out.append('  </g>')
 
     out.append('</svg>')
@@ -233,7 +270,10 @@ def rasterise(svg_path: Path, scale: float = 3.0) -> Path:
     """PNG alongside the SVG, so the schematic gets the same render-then-verify
     pass as the plotted panels rather than shipping unlooked-at."""
     png = svg_path.with_suffix(".png")
+    pdf = svg_path.with_suffix(".pdf")
     cairosvg.svg2png(url=str(svg_path), write_to=str(png), scale=scale)
+    cairosvg.svg2pdf(url=str(svg_path), write_to=str(pdf))
+    print(f"Saved: {pdf}")
     return png
 
 
@@ -247,7 +287,8 @@ def main():
     args.out.write_text(build())
     print(f"Saved: {args.out}")
     print(f"Saved: {rasterise(args.out, args.scale)}")
-    print("Edit in Inkscape (free) or Illustrator; text stays editable.")
+    print("Edit the SVG in Inkscape/Illustrator, or figures/fig1a_schematic.drawio "
+          "in diagrams.net; the PDF is what LaTeX cites.")
 
 
 if __name__ == "__main__":

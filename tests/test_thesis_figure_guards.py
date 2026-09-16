@@ -1,4 +1,8 @@
 """Guards for Fig 7/8/S5: cell IDs, paired prediction, and an incomplete tune grid."""
+import struct
+import zlib
+from xml.etree import ElementTree as ET
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,6 +13,59 @@ from src.visualization.h5ad_obs import labels_from_codes
 from src.visualization.lineage_map import aligned_cell_positions
 from src.visualization.prediction import paired_protein_delta, series_flag
 from tools.score_heldout_phi import dense_key
+
+
+def test_save_figure_writes_svg_for_editing():
+    from src.visualization.style import save_figure
+
+    assert "svg" in save_figure.__kwdefaults__["formats"]
+
+
+def test_schematic_drawio_is_editable_and_not_a_half_life_panel():
+    from tools.make_editable_figures import build_schematic
+
+    xml = build_schematic()
+    root = ET.fromstring(xml)
+    cells = {cell.get("id"): cell for cell in root.iter("mxCell")}
+    assert cells["0"] is not None and cells["1"] is not None
+    assert "the kinetics term" in xml
+    assert "ruled out" in xml
+    assert "state r" in xml
+    assert "velocity v" in xml
+    assert "half-lives" not in xml
+    protein = cells["e-prot-shared"]
+    assert protein.get("source") == "prot-port"
+    assert protein.get("target") == "shared"
+    for cell in cells.values():
+        if cell.get("id") in {"0", "1"}:
+            continue
+        assert "html=1" in (cell.get("style") or "")
+        if cell.get("edge") == "1":
+            assert cell.find("mxGeometry") is not None
+
+
+def test_plot_drawio_points_at_sibling_png(tmp_path):
+    from tools.make_editable_figures import build_image_page, png_size
+
+    png = tmp_path / "fig1b_ablation.png"
+    png.write_bytes(tiny_png())
+    xml = build_image_page("fig1b_ablation", png)
+    assert "image=fig1b_ablation.png" in xml
+    assert "data:image" not in xml
+    assert "base64" not in xml
+    assert png_size(png) == (1, 1)
+    assert "shape=image" in xml
+
+
+def tiny_png() -> bytes:
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+            + chunk(b"IEND", b""))
 
 
 def test_aligned_positions_keep_full_order():
@@ -124,6 +181,17 @@ def test_heatmap_hatches_unrun_cells_not_metric_gaps():
     expected_missing = len(TUNE_LAMBDAS) * len(TUNE_BETAS) - 2
     assert len(hatches) == expected_missing
     plt.close(fig)
+
+
+def test_schematic_is_a_cartoon_not_a_half_life_panel():
+    from tools.make_schematic import build
+
+    svg = build()
+    assert "state r" in svg
+    assert "velocity v" in svg
+    assert "the kinetics term" in svg
+    assert "ruled out" in svg
+    assert "half-lives" not in svg
 
 
 def test_task_b_titles_name_the_seen_perturbation_protocol():

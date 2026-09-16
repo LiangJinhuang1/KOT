@@ -443,8 +443,7 @@ def branch_confusion(model: str) -> tuple[list, list] | None:
 def figure1b(out: Path, max_cells: int = 8000, seed: int = 0):
     """The ablation as a picture: what the kinetics term does to the co-embedding.
 
-    This is the only plotted panel of Figure 1 — panel a is a schematic that has
-    to be drawn by hand in a vector editor and dropped in alongside this file.
+    This is the plotted half of Figure 1; panel a is `tools/make_schematic.py`.
     """
     apply_style()
     rng = np.random.default_rng(seed)
