@@ -1,63 +1,125 @@
-# kot
+# KOT — kinetic optimal transport for single-cell multimodal alignment
 
-Research code for kinetic optimal transport (KOT) and multimodal single-cell
-alignment. The repository can be used directly on the cluster or installed as
-an editable Python distribution.
+Research code for the thesis. KOT learns a map `phi` between two single-cell
+modalities and constrains it with a *kinetic* law: the Jacobian of `phi` pushed along a
+velocity in the source modality has to reproduce the target modality's own rate law.
+The claim under test is that this kinetic term buys alignment that a purely
+distributional (optimal-transport) objective does not.
 
-## Environment
+```
+    RNA  --phi-->  protein        J_phi(x) v_x  ~  the protein turnover law
+    ATAC --phi-->  RNA            J_phi(c) v_c  ~  the transcription law
+```
 
-The reproducible environment targets Python 3.11 and a CUDA 12.8 PyTorch build:
+Package name is `kot` (`pyproject.toml`); the implementation lives in `src/`.
+
+## Three experiment tracks
+
+They share `src/` — the `phi`/`kappa`/`alpha` networks, the Sinkhorn divergence, the
+JVP, the optimiser and the LR schedule — and differ in the modality pair and the
+evaluation.
+
+| track | entry point | what it answers |
+|---|---|---|
+| **RNA → protein** | `python -m src.training.runner` | the main result: staged synthetic recovery, then real CITE-seq (BMMC, PBMC) scored by FOSCTTM, lineage and held-out protein prediction |
+| **CRISPR / Papalexi** | `run_kot_crispr.py`, `run_crispr_isp.py` | protein *prediction* under knockout, against protein predictors rather than alignment baselines |
+| **chromatin → RNA** | `run_kot_chromatin.py` | whether the principle survives changing both the source modality and the target kinetic law |
+
+The chromatin track is **excluded from the paper** (`Litterature/ICLR_Tables/REVIEW_NOTES.md:8`).
+Its tooling is kept for provenance in `archive/chromatin_tools/`, its job files in
+`jobs/archive/chromatin/`.
+
+`run_kot_crispr.py` is the frozen CRISPR experiment — evaluation is written before any
+model is scored. `tools/papalexi.py` is the exploratory counterpart; do not mix them.
+
+## Install
+
+Python ≥ 3.11. The base install is analysis-only; every heavy stack is an extra.
 
 ```bash
-conda env create -f environment.yml
-conda activate kot
-python -m pip install --no-deps -e .
+pip install -e '.[kot,velocity]'          # training + scVelo
+pip install -e '.[baselines]'             # moscot, scGLUE, scvi-tools, MaxFuse
+pip install -e '.[protein_baselines]'     # sciPENN, scButterfly (CRISPR competitors)
+pip install -e '.[regvelo]'               # RegVelo velocity backend
+pip install -e '.[dev]'                   # pytest, ruff, build
 ```
 
-`--no-deps` is intentional after creating the Conda environment. It prevents
-pip from replacing the cluster-compatible CUDA build of PyTorch.
+`environment.yml` pins the conda side. The login shell often lacks these; on the
+cluster use the container that `slurm/train_slurm.sh` names.
 
-Run training through the installed command:
+## Running
 
 ```bash
-kot --datasets pbmc_retained --models kot_main
+# 1. velocity for a dataset key in config/velocity.yaml (--list shows them)
+python -m src.data.velocity bmmc_cite
+
+# 2. staged synthetic training (see config/README.md for --models groups)
+python -m src.training.runner --models kot --stage clean --scale mean
+
+# 3. on the cluster — one job, one command
+sbatch --export=ALL,RUN_CMD='python -u -m src.training.runner --models kot --stage clean --scale mean' \
+       slurm/train_slurm.sh
 ```
 
-The package also exposes the programmatic runner:
+Substantial training and memory-heavy evaluation belong on SLURM, not the login node.
+Every independent run needs its own `--run-dir`; parallel jobs sharing one silently
+overwrite each other.
 
-```python
-import kot
+## Layout
 
-kot.run_training(models="kot_main", datasets_filter="pbmc_retained")
+```
+src/            the library — everything the three tracks share
+  data/         loading, preprocessing, splits, velocity, synthetic generators
+  models/       phi / kappa / alpha networks, LinearODE
+  losses/       Sinkhorn divergence, JVP physics term
+  training/     runner + one module per method (kot, glue, moscot, uniport, totalvi, …)
+  evaluation/   FOSCTTM, protocol gates, trajectory DTW, in-silico perturbation
+  visualization/ panel code — one module per figure, shared palette in style.py
+  adapters/     external-tool shims
+config/         training.yaml, datasets.yaml, velocity.yaml, preprocessing.yaml, β/γ anchors
+slurm/          the three submit scripts; everything else is a RUN_CMD
+jobs/           one runner arg-string per line, headers record experimental intent
+tools/          analysis and figure generation (panel code stays in src/visualization/)
+tests/          pytest; `pytest` runs them all
+figures/        generated panels — cite via figures/THESIS_FIGURES.md, not by filename
+figure_data/    the numbers behind revised panels, with their own READMEs
+archive/        superseded scripts kept for provenance, not for reuse
 ```
 
-The existing module invocation remains supported:
+Untracked and local-only (see `.gitignore`): `Datasets/` (raw, 1.6 TB), `cache/`
+(preprocessed, velocity, training runs, 279 GB), `data/` (predictions), `logs/`,
+`vendor/` (competitor source), `Litterature/`.
 
-```bash
-python -m src.training.runner --datasets pbmc_retained --models kot_main
-```
+`main.py` is a scratch driver with most of its dataset list commented out — prefer the
+module entry points above.
 
-Configuration files are project inputs rather than package data. Run commands
-from the repository root, or pass `--config` and `--datasets-config` explicitly.
+## Cache
 
-`config/training.yaml` is the single training config. Model groups, seeds,
-staged synthetic runs, and the validation-split knobs are documented in
-`config/README.md`.
+| path | holds |
+|---|---|
+| `cache/preprocessed/` | hashed preprocessing outputs; the hash is the cache key, so a config change makes a new file rather than overwriting |
+| `cache/velocity/` | per-dataset velocity results, one directory per backend |
+| `cache/training/` | one directory per run: checkpoints, diagnostics, per-cell FOSCTTM, aligned arrays |
+| `cache/results/` | distilled tables |
 
-## Cluster
+## Documentation
 
-SLURM wrappers stay on the HPC checkout under `slurm/` and are not part of this
-GitHub tree. Training is the same module command from the repository root,
-inside the project container; caches stay under the project directory:
+Read the one that matches the task; none of them repeat another.
 
-```bash
-python -m src.training.runner --datasets pbmc_retained --models kot_main
-python -m src.training.runner --help
-```
+- **`config/README.md`** — `training.yaml`, the `--models` groups, seeds, staged synthetic runs
+- **`slurm/README.md`** — which submit script, GPU vs CPU, and the recipes
+- **`jobs/README.md`** — what each job file was for and what is archived
+- **`figures/THESIS_FIGURES.md`** — the citation map. **Read this before quoting any
+  figure**: it records, per panel, what the figure does *not* support, including several
+  published numbers that have since been withdrawn
+- **`AGENTS.md`** — the standing rules for changes to this repo
 
-## Optional Backends
+## Conventions
 
-Model backends are loaded only when selected. For a non-Conda installation,
-install the relevant extra, for example `pip install -e '.[kot]'` or
-`pip install -e '.[velocity]'`. GLUE and uniPort still use the implementations
-under `vendor/` when running from this research repository.
+Cell and gene ordering, state/velocity units, and train/validation/test separation are
+load-bearing — preserve them. Fit preprocessing on the permitted training population
+only, and never train an unpaired method using held-out pairing. Numerical success is
+not biological validity: compare controls on compatible cells, genes and metrics, and
+do not weaken a gate to make a run pass.
+
+`ruff` at line-length 100, `vendor/` and `archive/` excluded.

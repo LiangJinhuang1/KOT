@@ -287,8 +287,7 @@ def main():
     args.out.write_text(build())
     print(f"Saved: {args.out}")
     print(f"Saved: {rasterise(args.out, args.scale)}")
-    print("Edit the SVG in Inkscape/Illustrator, or figures/fig1a_schematic.drawio "
-          "in diagrams.net; the PDF is what LaTeX cites.")
+    print("Edit in Inkscape (free) or Illustrator; text stays editable.")
 
 
 if __name__ == "__main__":

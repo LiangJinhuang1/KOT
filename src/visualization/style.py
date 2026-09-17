@@ -205,7 +205,7 @@ def save_figure(fig, path, *, formats: tuple[str, ...] = ("pdf", "png", "svg"),
     """Save one figure to every requested format, PDF first.
 
     The PDF is what goes into LaTeX. PNG is for preview and the bbox check.
-    SVG is the Inkscape / Illustrator / draw.io-import copy — text stays text.
+    SVG is the Inkscape / Illustrator copy — text stays text.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

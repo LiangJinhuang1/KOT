@@ -57,13 +57,13 @@ For uniPort, keep `uniport_permute_second: true` when using `mode='d'` as the un
 baseline: it removes paired row order before training and restores the original order
 only for FOSCTTM evaluation.
 
-## Cluster
+## SLURM
 
-SLURM wrappers live in the local `slurm/` directory on the HPC copy, not in this
-GitHub tree. From the repository root, inside the container, `--models` takes a
-group name or a comma-separated list (empty uses `default_models`):
+`slurm/train_slurm.sh` runs the runner on the cluster (recipes in slurm/README.md).
+Select models with the
+`MODELS` export (a group name or comma-list; empty = `default_models`):
 
 ```bash
-python -u -m src.training.runner --stage clean --scale mean --models baselines
-python -u -m src.training.runner --stage branch --scale mean --models kot
+sbatch --export=ALL,RUN_CMD='python -u -m src.training.runner --stage clean --scale mean --models baselines' slurm/train_slurm.sh
+sbatch --export=ALL,RUN_CMD='python -u -m src.training.runner --stage branch --scale mean --models kot' slurm/train_slurm.sh
 ```
