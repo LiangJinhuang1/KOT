@@ -82,9 +82,15 @@ def curated_runs(cache_dir: str | Path = CACHE_DIR) -> dict[str, str]:
 
 def run_rank(run_name: str, prefer: tuple[str, ...] = (),
              curated: dict[str, str] | None = None) -> int:
-    """Selection priority: 0 = named explicitly, 1 = curated, 2 = everything else."""
+    """Selection priority: named runs first in the order given, then curated, then rest.
+
+    `prefer` is ORDERED. It used to collapse to a single tier, so a caller listing a
+    preferred run and its fallbacks got whichever name sorted first alphabetically --
+    `syn_branch_ablation` kept winning over `syn_rerun_branch_kot` in Fig. 1b even though
+    it was named second. A one-element `prefer` behaves exactly as before.
+    """
     if run_name in prefer:
-        return 0
+        return prefer.index(run_name)
     if curated is None:
         curated = curated_runs()
-    return 1 if run_name in curated else 2
+    return len(prefer) if run_name in curated else len(prefer) + 1

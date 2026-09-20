@@ -56,9 +56,13 @@ generator checks training/test cell disjointness in each fold. Frozen checkpoint
 and their recorded hashes are retained in provenance; checkpoints were not rerun here.
 
 Left: Spearman correlation. Right: RMSE divided by the standard deviation of observed effects,
-following the project metric definition. Each panel uses the same 94 pooled effect pairs as
-Task A. Faint dots are per-seed metrics, diamonds score ensemble predictions, and bars bootstrap
-whole knockouts. The zero-change predictor has a valid error but undefined rank correlation.
+following the project metric definition. Each panel uses the common_primary set that
+csv/08_crispr_task_b_common.csv scores: 76 pairs over the 19 perturbations every in-silico
+perturbation baseline could produce, dropping CAV1, CD86, MARCH8, PDCD1LG2 and TNFRSF14. That
+is a narrower population than Task A's 94 pairs, so the two figures' numbers are not directly
+comparable; on the wider set KOT scores rho 0.426 and MAE 0.106. Faint dots are per-seed
+metrics, diamonds are the mean of those per-seed metrics, and bars bootstrap whole knockouts
+around that same mean. The zero-change predictor has a valid error but undefined rank correlation.
 This comparison isolates the downstream KOT arm for this upstream ISP; it is not a ranking of
 in-silico perturbation methods with different supervision or knockout coverage.
 

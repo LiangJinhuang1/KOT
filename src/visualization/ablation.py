@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.visualization import METHOD_COLORS, method_label
+from src.visualization import METHOD_COLORS, dataset_style, method_label
 from src.visualization.style import chance_line
 
 RESULTS_DIR = Path("cache/results")
@@ -51,8 +51,24 @@ ARM_LABELS = {
     "permS":       "permuted S",
 }
 
+# The arms as Tables 3 and 4 name them, so a reader moving between the figure and the
+# tables sees one vocabulary. ARM_LABELS above is kept only as the short form.
+ARM_LABELS_TABLE = {
+    **ARM_LABELS,
+    "real":        "Real velocity",
+    "corrupt0.25": r"Corrupted 25\%",
+    "corrupt0.5":  r"Corrupted 50\%",
+    "corrupt0.75": r"Corrupted 75\%",
+    "shuffle":     "Shuffled velocity",
+    "reverse":     r"Reverse $v\to-v$",
+    "zero":        r"Zero $v\to 0$",
+    "permS":       r"Permuted mapping $S$",
+    "noDyn":       "No dynamics",
+}
+
 # Markers reused from the Fig. 3 benchmark so one dataset keeps one glyph.
-DATASET_MARKERS = {"bmmc_cite_retained": "o", "pbmc_retained": "s"}
+# Shape from the shared key; fill still distinguishes the two so the panel reads in
+# grey scale as well as in colour.
 DATASET_FILL = {"bmmc_cite_retained": "none", "pbmc_retained": "full"}
 
 
@@ -108,7 +124,7 @@ def ladder_panel(ax, df: pd.DataFrame, metric: str, models: list[str], *,
     ax.axvline(gap - 0.8, color="0.8", lw=0.7, zorder=1)
     order = LADDER + OFF_LADDER
     ax.set_xticks([positions[a] for a in order])
-    ax.set_xticklabels([ARM_LABELS[a] for a in order], rotation=45, ha="right")
+    ax.set_xticklabels([ARM_LABELS_TABLE[a] for a in order], rotation=45, ha="right")
     ax.set_xlim(-0.4, positions[OFF_LADDER[-1]] + 0.4)
     ax.set_ylabel(ylabel)
     if chance is not None:
@@ -125,18 +141,18 @@ def real_panel(ax, df: pd.DataFrame, metric: str, datasets: list[str], *, xlabel
     # permS first: it corrupts the LINKAGE, not the velocity, so it heads the panel
     # separated by a rule rather than sitting inside a velocity ladder it is not on.
     arms = [a for a in ["permS"] + LADDER + OFF_LADDER if a in set(df["arm"])]
-    color = METHOD_COLORS["kot"]
     for dataset in datasets:
         sub = df[df["dataset"] == dataset].set_index("arm")
         present = [a for a in arms if a in sub.index]
         y = [len(arms) - 1 - arms.index(a) for a in present]
+        marker, color, _ = dataset_style(dataset)
         ax.errorbar([float(sub.loc[a, f"{metric}_mean"]) for a in present], y,
                     xerr=[float(sub.loc[a, f"{metric}_sd"]) for a in present],
-                    fmt=DATASET_MARKERS[dataset], fillstyle=DATASET_FILL[dataset],
+                    fmt=marker, fillstyle=DATASET_FILL[dataset],
                     ms=3.4, color=color, lw=0, elinewidth=0.8, capsize=1.5,
                     markeredgewidth=0.8, zorder=3)
     ax.set_yticks(range(len(arms)))
-    ax.set_yticklabels([ARM_LABELS[a] for a in reversed(arms)])
+    ax.set_yticklabels([ARM_LABELS_TABLE[a] for a in reversed(arms)])
     ax.set_ylim(-0.6, len(arms) - 0.4)
     ax.axhline(len(arms) - 1.5, color="0.8", lw=0.7, zorder=1)
     ax.set_xlabel(xlabel)

@@ -42,8 +42,11 @@ METHOD_COLORS = {
     "kot_anchor":                   "#3E92C8",
     "kot_noanchor":                 "#7BB6DC",
     "kot_nodyn":                    "#9ECAE1",
-    "kot_fixedkappa":               "#6BAED6",
-    "kot_fixedalpha":               "#4292C6",
+    # Ordered dark-to-light by how well the arm does on the synthetic ladder
+    # (real-velocity FOSCTTM: oracle .023, kappa fixed .273, alpha fixed .468),
+    # so Fig. 5a/b reads without checking the key. Only Fig. 5 draws these two.
+    "kot_fixedkappa":               "#4292C6",
+    "kot_fixedalpha":               "#6BAED6",
     "kot_oracle":                   "#08519C",
     "kot_oracle_learnalpha":        "#2171B5",
     "kot_oracle_learnalpha_kappa":  "#4292C6",
@@ -64,10 +67,10 @@ METHOD_COLORS = {
 
 # Human-readable method names. Internal codenames never reach an axis (§5.6).
 METHOD_LABELS = {
-    "kot":                         "KOT (ours)",
+    "kot":                         "KOT",
     "kot_anchor":                  "KOT + β-anchor",
     "kot_noanchor":                "KOT, no β-anchor",
-    "kot_nodyn":                   "KOT, no kinetics",
+    "kot_nodyn":                   r"KOT ($\lambda_{\mathrm{dyn}}\!=\!0$)",
     "kot_fixedkappa":              "KOT, κ fixed",
     "kot_fixedalpha":              "KOT, α fixed",
     "kot_oracle":                  "KOT, oracle kinetics",
@@ -83,10 +86,41 @@ METHOD_LABELS = {
 }
 
 # Dataset display names. Internal keys never reach a panel title (§5.6).
+# Datasets carry one shape and one colour in every figure, so a reader who learns the
+# key in Fig. 1c can reuse it in Fig. 3, 4, 5 and 9. Blue is KOT's colour; amber stays
+# separable from it down to 2-point markers, where a light-blue tint does not. RegVelo
+# variants inherit their dataset's style -- the backend is an axis, not a dataset.
+DATASET_COLORS = {
+    "bmmc_cite_retained": "#0072B2",
+    "bmmc_cite_regvelo":  "#0072B2",
+    "pbmc_retained":      "#E69F00",
+    "pbmc_regvelo":       "#E69F00",
+}
+
+DATASET_MARKERS = {
+    "bmmc_cite_retained": "o",
+    "bmmc_cite_regvelo":  "o",
+    "pbmc_retained":      "s",
+    "pbmc_regvelo":       "s",
+}
+
+DATASET_SHORT = {
+    "bmmc_cite_retained": "BMMC",
+    "bmmc_cite_regvelo":  "BMMC",
+    "pbmc_retained":      "PBMC",
+    "pbmc_regvelo":       "PBMC",
+}
+
+# The two reported panels are named by the short form everywhere, because figures used
+# three spellings for the same dataset -- "BMMC", "BMMC CITE-seq" and "BMMC (n=5)" -- and
+# Fig. S2 carried two of them in one figure. The RegVelo rows keep the long form: they
+# share a short name with their retained counterpart by design (the backend is an axis,
+# not a dataset), so shortening them would make the two indistinguishable wherever a
+# figure draws both, which Fig. 4's backend panel does.
 DATASET_LABELS = {
-    "pbmc_retained":      "PBMC CITE-seq",
+    "pbmc_retained":      "PBMC",
     "pbmc_regvelo":       "PBMC CITE-seq (RegVelo)",
-    "bmmc_cite_retained": "BMMC CITE-seq",
+    "bmmc_cite_retained": "BMMC",
     "bmmc_cite_regvelo":  "BMMC CITE-seq (RegVelo)",
     "papalexi_retained":  "Papalexi ECCITE-seq",
     "papalexi_regvelo":   "Papalexi ECCITE-seq (RegVelo)",
@@ -138,6 +172,10 @@ LINEAGE_COLORS = {
     "HSC / progenitor": "#767676",
     "Erythroid":        "#D55E00",
     "Monocyte":         "#E69F00",
+    # One Dendritic everywhere: Figs. 3, 6 and 8 used to disagree, because Fig. 8 darkened
+    # this to ink(target=3.0) so the marker would not vanish as a 2-point dot on white.
+    # Kept as Wong yellow for consistency; if a scatter needs more contrast, raise the
+    # marker size rather than forking the palette.
     "Dendritic":        "#F0E442",
     "B lineage":        "#0072B2",
     "CD4 T":            "#56B4E9",
@@ -181,6 +219,14 @@ def state_label(name: str) -> str:
 
 def method_color(name: str) -> str:
     return METHOD_COLORS.get(str(name), "#767676")
+
+
+def dataset_style(name: str) -> tuple[str, str, str]:
+    """(marker, colour, short name) for a dataset, shared by every figure."""
+    key = str(name)
+    return (DATASET_MARKERS.get(key, "o"),
+            DATASET_COLORS.get(key, METHOD_COLORS["kot"]),
+            DATASET_SHORT.get(key, dataset_label(key)))
 
 
 def method_label(name: str) -> str:

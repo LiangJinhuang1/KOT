@@ -10,20 +10,34 @@ import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
 
-from src.evaluation.crispr_metrics import bootstrap_over_units, metric_suite
+from src.evaluation.crispr_metrics import metric_suite
 from src.visualization.style import apply_style, figsize, panel_letter, save_figure
 
 KEYS = ['perturbation', 'replicate', 'protein']
 PAIR_KEYS = ['perturbation', 'protein']
 MODEL_ARMS = ['full', 'noDyn', 'shuffleVel']
 TASK_A_ARMS = MODEL_ARMS + ['cognate_mrna', 'zero_change']
-TASK_B_PROTOCOL = 'Leave-one-replicate-out, seen perturbations'
+# Task B is scored on `common_primary`, the effect set `csv/08_crispr_task_b_common.csv`
+# uses: the perturbations every ISP baseline (GEARS, RegVelo, scGPT, multipert) could
+# produce. Those cover 19 of the 24, so the table drops these five. The source CSV carries
+# only `in_primary`, so the set has to be named here rather than read from a column --
+# reconstructing it reproduces csv/08 to every digit (KOT rho 0.45616, MAE 0.12171,
+# NRMSE 0.80344). Task A keeps all 94 effects because its table, csv/07, does.
+TASK_B_EXCLUDED = ('CAV1', 'CD86', 'MARCH8', 'PDCD1LG2', 'TNFRSF14')
+TASK_B_PAIRS, TASK_B_PERTURBATIONS = 76, 19
+TASK_B_PROTOCOL = ('Leave-one-replicate-out, seen perturbations '
+                   f'({TASK_B_PAIRS} effects, {TASK_B_PERTURBATIONS} perturbations)')
 TASK_B_PANEL_TITLES = {
     'spearman': f'{TASK_B_PROTOCOL}: ranking',
     'nrmse': f'{TASK_B_PROTOCOL}: error',
 }
-LABELS = {'full': 'KOT', 'noDyn': 'No kinetics', 'shuffleVel': 'Shuffled velocity',
-          'cognate_mrna': 'Cognate RNA', 'zero_change': 'Zero change'}
+# Panel E's rows are `csv/07_crispr_task_a.csv`'s `arm` column verbatim, so a value on
+# the panel and the same value in Table 7 are labelled the same thing. The heatmap column
+# headers are shorter because they are matrices, not methods: there "No dynamics" matches
+# the vocabulary Figs. 5, 7 and 10 use.
+LABELS = {'full': 'KOT', 'noDyn': 'KOT no dynamics', 'shuffleVel': 'Shuffled velocity',
+          'cognate_mrna': 'Cognate mRNA', 'zero_change': 'Zero change'}
+MATRIX_TITLES = ['Real', 'KOT', 'No dynamics']
 COLORS = {'full': '#0072B2', 'noDyn': '#777777', 'shuffleVel': '#D55E00',
           'cognate_mrna': '#009E73', 'zero_change': '#333333'}
 PROTEINS = ['CD366', 'CD86', 'PDL1', 'PDL2']
@@ -110,7 +124,17 @@ def read_task_b(root: Path, observed: pd.DataFrame) -> tuple[pd.DataFrame, dict,
     zero = frame[frame.arm == 'full'].copy()
     zero['arm'], zero['delta_p_phi'] = 'zero_change', 0.
     frame = pd.concat([frame, zero], ignore_index=True)
-    return validate_effects(frame, observed, MODEL_ARMS + ['zero_change']), hashes, protocols
+    # Narrow BOTH the predictions and the reference table, so `validate_effects` still
+    # checks every arm against the same population instead of against the wider primary set.
+    frame = frame[~frame.perturbation.isin(TASK_B_EXCLUDED)].copy()
+    observed = observed[~observed.perturbation.isin(TASK_B_EXCLUDED)]
+    checked = validate_effects(frame, observed, MODEL_ARMS + ['zero_change'])
+    pairs = checked.drop_duplicates(PAIR_KEYS)
+    if (len(pairs), pairs.perturbation.nunique()) != (TASK_B_PAIRS, TASK_B_PERTURBATIONS):
+        raise ValueError(f'common_primary is {len(pairs)} effects over '
+                         f'{pairs.perturbation.nunique()} perturbations, not '
+                         f'{TASK_B_PAIRS}/{TASK_B_PERTURBATIONS}; Table 8 would disagree')
+    return checked, hashes, protocols
 
 
 def pooled_effects(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -122,25 +146,80 @@ def pooled_effects(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return per_seed, ensemble
 
 
+def bootstrap_seed_mean(block: pd.DataFrame, unit: str, metrics: list[str],
+                        n_boot: int, seed: int) -> dict:
+    """Perturbation bootstrap of the SEED-MEAN metric -- the statistic the tables report.
+
+    Resampling the seed-ensembled prediction instead would put an interval around a
+    different number from the marker it decorates: averaging twelve seeds' predictions
+    before scoring is a twelve-model ensemble and it beats any single run (KOT MAE 0.1305
+    against 0.1313). `csv/07_crispr_task_a.csv` reports the mean of the per-seed metrics,
+    so the panel reports that, and the interval is built around the same estimand.
+
+    One draw of perturbations is scored on EVERY seed before averaging, so seed spread and
+    perturbation spread are not confounded: the draw is the experiment, the seeds are
+    twelve runs of it.
+    """
+    seeds = sorted(block.seed.unique())
+    units = pd.unique(block[unit].to_numpy())
+    prepared = []
+    for value in seeds:
+        sub = block[block.seed == value]
+        labels = sub[unit].to_numpy()
+        prepared.append((sub.predicted.to_numpy(float), sub.observed.to_numpy(float),
+                         [np.nonzero(labels == u)[0] for u in units]))
+    rng = np.random.default_rng(seed)
+    draws = {metric: np.full(n_boot, np.nan) for metric in metrics}
+    for index in range(n_boot):
+        drawn = rng.integers(0, len(units), len(units))
+        scored = {metric: [] for metric in metrics}
+        for predicted, observed, rows_per_unit in prepared:
+            rows = np.concatenate([rows_per_unit[position] for position in drawn])
+            values = metric_suite(predicted[rows], observed[rows])
+            for metric in metrics:
+                scored[metric].append(values[metric])
+        for metric in metrics:
+            with np.errstate(invalid='ignore'):
+                draws[metric][index] = np.nan if np.isnan(scored[metric]).all() \
+                    else np.nanmean(scored[metric])
+    out = {}
+    for metric in metrics:
+        if np.isnan(draws[metric]).all():
+            out[metric] = (float('nan'), float('nan'))
+        else:
+            low, high = np.nanpercentile(draws[metric], [2.5, 97.5])
+            out[metric] = (float(low), float(high))
+    return out
+
+
 def summarize_effects(per_seed: pd.DataFrame, ensemble: pd.DataFrame,
                       n_boot: int = 2000) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Per-seed metrics, and the seed mean with a perturbation-bootstrap interval.
+
+    `ensemble` is still returned by :func:`pooled_effects` and still drives the heatmaps
+    and the scatter, where one central prediction per effect is what a reader wants. It
+    no longer supplies the scored numbers: the mean of the per-seed metrics is what the
+    comparison tables report, and a panel that disagreed with its own dot cloud -- the
+    diamond sat left of the seeds whose mean it appeared to be -- was the result.
+    """
+    metrics = ['spearman', 'mae', 'nrmse']
     seeds = []
     for (arm, seed), block in per_seed.groupby(['arm', 'seed']):
         seeds.append({'arm': arm, 'seed': seed,
                       **metric_suite(block.predicted.to_numpy(), block.observed.to_numpy())})
+    seeds = pd.DataFrame(seeds)
     summary = []
-    for arm, block in ensemble.groupby('arm'):
-        values = metric_suite(block.predicted.to_numpy(), block.observed.to_numpy())
-        row = {'arm': arm, 'n_perturbations': block.perturbation.nunique(), **values}
-        for metric in ['spearman', 'mae', 'nrmse']:
-            if arm == 'zero_change' and metric == 'spearman':
-                low, high = np.nan, np.nan
-            else:
-                low, high = bootstrap_over_units(block, 'perturbation', 'predicted',
-                                                 'observed', metric, n_boot, 20260916)
-            row[f'{metric}_ci_low'], row[f'{metric}_ci_high'] = low, high
+    for arm, block in per_seed.groupby('arm'):
+        scored = seeds[seeds.arm == arm]
+        row = {'arm': arm, 'n': int(scored['n'].max()),
+               'n_perturbations': block.perturbation.nunique(),
+               'n_seeds': block.seed.nunique(),
+               **{metric: float(scored[metric].mean()) for metric in metrics}}
+        intervals = bootstrap_seed_mean(block, 'perturbation', metrics, n_boot, 20260916)
+        for metric in metrics:
+            row[f'{metric}_ci_low'], row[f'{metric}_ci_high'] = intervals[metric]
         summary.append(row)
-    return pd.DataFrame(seeds), pd.DataFrame(summary)
+    return seeds, pd.DataFrame(summary)
 
 
 def performance_panel(ax, seed_metrics: pd.DataFrame, summary: pd.DataFrame,
@@ -194,7 +273,7 @@ def plot_task_a(ensemble: pd.DataFrame, seed_metrics: pd.DataFrame,
     cmap = plt.get_cmap('RdBu_r').copy()
     cmap.set_bad('#EEEEEE')
     axes = []
-    for col, (matrix, title) in enumerate(zip(matrices, ['Measured', 'KOT', 'No kinetics'])):
+    for col, (matrix, title) in enumerate(zip(matrices, MATRIX_TITLES)):
         ax = fig.add_subplot(top[0, col]); axes.append(ax)
         im = ax.imshow(matrix, aspect='auto', cmap=cmap, vmin=-limit, vmax=limit,
                        interpolation='nearest')
@@ -215,8 +294,8 @@ def plot_task_a(ensemble: pd.DataFrame, seed_metrics: pd.DataFrame,
                    label=protein, alpha=.75, edgecolors='none')
     lim = max(abs(block.observed).max(), abs(block.predicted).max()) * 1.1
     ax.plot([-lim, lim], [-lim, lim], color='.5', ls='--', lw=.7)
-    ax.set(xlim=(-lim, lim), ylim=(-lim, lim), xlabel='Measured protein change',
-           ylabel='Predicted protein change', title=f'Measured vs KOT ({len(block)} effects)')
+    ax.set(xlim=(-lim, lim), ylim=(-lim, lim), xlabel='Real protein change',
+           ylabel='Predicted protein change', title=f'Real vs KOT ({len(block)} effects)')
     ax.legend(loc='upper left', fontsize=6, handletextpad=.3)
     ax.set_aspect('equal', adjustable='box')
     panel_letter(ax, 'd')
@@ -249,13 +328,19 @@ def plot_effect_arrows(ensemble: pd.DataFrame, out: Path) -> tuple[pd.DataFrame,
         raise ValueError('Too few complete protein response vectors for PCA')
     values = [matrix.to_numpy()[complete] for matrix in matrices]
     pca = PCA(n_components=2).fit(values[0])
+    # Named on the axes. PC1 is 95% of the measured variance and loads 0.95 on PDL1, so a
+    # reader who takes the axes for abstract components misreads the panel: this plane is
+    # almost exactly (PDL1 response, CD86 response).
+    share = pca.explained_variance_ratio_
     # Project DISPLACEMENTS directly: subtracting the PCA training mean would move zero change.
     projected = [value @ pca.components_.T for value in values]
     lim = max(np.max(abs(value)) for value in projected) * 1.12
     fig, axes = plt.subplots(1, 3, figsize=figsize('full', 2.6), sharex=True, sharey=True,
                              layout='constrained')
+    # Same three matrices as Fig. 12a-c, so the same headers: this panel used to say
+    # "Measured" and "No kinetics" for the arrays Fig. 12 calls Real and No dynamics.
     rows = []
-    for col, (xy, label, color) in enumerate(zip(projected, ['Measured', 'KOT', 'No kinetics'],
+    for col, (xy, label, color) in enumerate(zip(projected, MATRIX_TITLES,
                                                ['#333333', '#0072B2', '#777777'])):
         ax = axes[col]
         ax.axhline(0, color='.88', lw=.6); ax.axvline(0, color='.88', lw=.6)
@@ -263,14 +348,15 @@ def plot_effect_arrows(ensemble: pd.DataFrame, out: Path) -> tuple[pd.DataFrame,
                   angles='xy', scale_units='xy', scale=1, color=color, alpha=.4, width=.006)
         ax.scatter(xy[:, 0], xy[:, 1], s=8, color=color, edgecolors='none')
         ax.scatter(0, 0, s=15, marker='+', color='black', zorder=5)
-        ax.set(title=label, xlim=(-lim, lim), ylim=(-lim, lim), xlabel='Effect PC 1')
+        ax.set(title=label, xlim=(-lim, lim), ylim=(-lim, lim),
+               xlabel=f'Effect PC 1 ({share[0]:.0%})')
         ax.set_aspect('equal', adjustable='box')
         ax.spines[['top', 'right']].set_visible(False)
         panel_letter(ax, 'abc'[col])
         for perturbation, point in zip(np.array(perturbations)[complete], xy):
             rows.append({'series': label, 'perturbation': perturbation,
                          'effect_pc1': point[0], 'effect_pc2': point[1]})
-    axes[0].set_ylabel('Effect PC 2')
+    axes[0].set_ylabel(f'Effect PC 2 ({share[1]:.0%})')
     save_figure(fig, out / 'figS4_crispr_effect_arrows', verify=True)
     loadings = pd.DataFrame(pca.components_.T, index=proteins, columns=['PC1', 'PC2'])
     loadings.index.name = 'protein'

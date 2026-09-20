@@ -66,9 +66,9 @@ def group_violin_panel(ax, values: np.ndarray, groups, order: list[str],
                        colors: dict[str, str]):
     """One violin per group, medians ticked, groups with too few cells dropped.
 
-    Violins rather than the Fig. 3b ridges: eight distributions have to sit beside two
-    other panels here, and a ridge stack needs the full panel height a ridge figure
-    gives it.
+    Vertical, not horizontal: the cosine is peaked near 1, so density has to use the
+    category axis as width. Laid on its side, the same peak becomes a needle and the
+    long tail empties the panel. Ridges need a full-height figure this row does not have.
     """
     present = [g for g in order if (np.asarray(groups) == g).sum() >= 20]
     data = [values[np.asarray(groups) == g] for g in present]
@@ -81,9 +81,9 @@ def group_violin_panel(ax, values: np.ndarray, groups, order: list[str],
     parts["cmedians"].set_color("#1A1A1A")
     parts["cmedians"].set_linewidth(0.9)
     ax.set_xticks(range(len(present)))
-    # Upright, not 45 degrees: eight lineage names at 45 collide in a third-width
-    # panel, and the geometric check catches it every time.
-    ax.set_xticklabels(present, rotation=90)
+    # 45° rather than 90°: the vertical labels spent a strip of panel height on
+    # names the neighbouring panels do not need.
+    ax.set_xticklabels(present, rotation=45, ha="right", rotation_mode="anchor")
     return present
 
 

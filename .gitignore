@@ -25,6 +25,7 @@ assistant.py
 # Generated locally; SLURM wrappers stay on the HPC checkout
 jobs_*.txt
 jobs/
+reports/
 slurm/
 
 # --- Python ---

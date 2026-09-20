@@ -130,7 +130,7 @@ def figsize(width: str | float = "full", height: float = 2.0,
 
 
 def panel_letter(ax, letter: str, *, dy_points: float | None = None,
-                 case: str = "lower"):
+                 case: str = "upper"):
     """Bold panel letter, above the panel title and aligned with the axes left edge.
 
     Placed in offset *points* above the axes, not in axes fractions to its left:
@@ -307,35 +307,44 @@ def check_overlaps(fig, *, verbose: bool = True) -> list[tuple[str, str]]:
 
 
 def embedding_axes(ax, x_label: str = "Dim 1", y_label: str = "Dim 2",
-                   *, frac: float = 0.18, pad: float = 0.02):
+                   *, frac: float = 0.18, pad: float = 0.02, clip: bool | None = None):
     """Strip a dimensionality-reduction scatter to a corner arrow pair (§6.6).
 
     UMAP/t-SNE/PCA coordinates have no interpretable units, so tick values are
     noise. The arrows name the axes and show orientation without spending any
     of the panel's label budget.
+
+    ``pad < 0`` puts the L in the margin so it cannot sit on the cloud. Text
+    then has to opt out of axes clipping, or the labels vanish.
     """
     ax.set_xticks([])
     ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_visible(False)
 
+    if clip is None:
+        clip = pad >= 0
     small = STYLE_STATE["ladder"][1]  # type: ignore[index]
     arrow = dict(arrowstyle="-|>", lw=0.7, color="0.35", mutation_scale=5)
     ax.annotate("", xy=(pad + frac, pad), xytext=(pad, pad),
-                xycoords="axes fraction", arrowprops=arrow)
+                xycoords="axes fraction", arrowprops=arrow, annotation_clip=clip)
     ax.annotate("", xy=(pad, pad + frac), xytext=(pad, pad),
-                xycoords="axes fraction", arrowprops=arrow)
+                xycoords="axes fraction", arrowprops=arrow, annotation_clip=clip)
     # At the arrow tips, not beside their midpoints. In a narrow panel the label is
     # wider than the arrow is long, so midpoint placement puts both boxes over the
     # shared corner and they collide (section 9.1).
     ax.text(pad + frac + 0.015, pad, x_label, transform=ax.transAxes,
-            fontsize=small, color="0.35", ha="left", va="center")
+            fontsize=small, color="0.35", ha="left", va="center", clip_on=clip)
+    # Left-aligned like the x label, not centred on the arrow: centring puts half the
+    # text at negative axes-x, and with clip_on it is silently cut -- "PC 2" rendered
+    # as "C 2" as soon as a panel got narrow enough.
     ax.text(pad, pad + frac + 0.015, y_label, transform=ax.transAxes,
-            fontsize=small, color="0.35", ha="center", va="bottom")
+            fontsize=small, color="0.35", ha="left", va="bottom", clip_on=clip)
 
 
 def chance_line(ax, value: float = 0.5, *, axis: str = "y",
-                label: str = "chance", text_x: float = 0.99):
+                label: str = "chance", text_x: float = 0.99,
+                ha: str | None = None, va: str | None = None):
     """Draw the random-baseline reference for a bounded metric.
 
     A FOSCTTM axis without its 0.5 reference is unreadable: 0.42 looks like a
@@ -346,11 +355,15 @@ def chance_line(ax, value: float = 0.5, *, axis: str = "y",
     if axis == "y":
         ax.axhline(value, color="0.45", lw=0.7, ls=(0, (4, 2)), zorder=1)
         ax.text(text_x, value, f" {label} ", transform=ax.get_yaxis_transform(),
-                fontsize=small, color="0.45", ha="right", va="bottom")
+                fontsize=small, color="0.45",
+                ha="right" if ha is None else ha,
+                va="bottom" if va is None else va)
     else:
         ax.axvline(value, color="0.45", lw=0.7, ls=(0, (4, 2)), zorder=1)
         ax.text(value, text_x, f" {label}", transform=ax.get_xaxis_transform(),
-                fontsize=small, color="0.45", ha="left", va="top")
+                fontsize=small, color="0.45",
+                ha="left" if ha is None else ha,
+                va="top" if va is None else va)
 
 
 def relative_luminance(hex_color: str) -> float:

@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.visualization import METHOD_COLORS, method_label
+from src.visualization import METHOD_COLORS, dataset_style, method_label
 from src.visualization.runs import CACHE_DIR, curated_runs, is_collapsed, read_diagnostics
 
 ALIGNED_RNA = "aligned_rna.npy"
@@ -48,9 +48,14 @@ def curated_method_runs(dataset: str, models: list[str]) -> dict[str, Path]:
     return out
 
 
-def collect_runtimes(datasets: list[str]) -> pd.DataFrame:
-    """Runtime and cell count for every curated run of every model on `datasets`."""
-    curated = set(curated_runs())
+def collect_runtimes(datasets: list[str], allowed: set | None = None) -> pd.DataFrame:
+    """Runtime and cell count per run, for `allowed` run dirs or else the curated set.
+
+    `allowed` exists so a figure can cost the SAME runs it plots elsewhere. Falling back
+    to the manifest had Fig. 9 timing the superseded `*_scvelo_*` dirs in panel b while
+    panel a drew the canonical ones.
+    """
+    curated = set(allowed) if allowed is not None else set(curated_runs())
     rows = []
     for path in CACHE_DIR.rglob("*/diagnostics.json"):
         parts = path.relative_to(CACHE_DIR).parts
@@ -68,24 +73,46 @@ def collect_runtimes(datasets: list[str]) -> pd.DataFrame:
 
 
 def runtime_panel(ax, table: pd.DataFrame, models: list[str]):
-    """Median runtime against cell count, one line per method, both axes log.
+    """Median runtime per method, one marker per dataset, methods ordered by cost.
+
+    Not runtime against cell count: with two CITE-seq panels that axis carries exactly
+    two values, so a log-log scatter invites a scaling reading that two points on
+    unrecorded hardware cannot support. Methods on the y-axis and one log runtime axis
+    answers the question the panel is actually for -- which method is expensive -- and
+    matches the layout of the Fig. 3a benchmark.
 
     Median over seeds rather than every point: a method with twelve seeds would
     otherwise dominate a method with one, and the spread being shown would be scheduler
     noise rather than anything about the method.
     """
-    for model in models:
-        sub = table[table["model"] == model]
+    # Order by cost on the LARGER panel, not by a median pooled over both: seed counts
+    # differ per dataset (MaxFuse has one BMMC run against twelve PBMC ones), so a pooled
+    # median ranked the method with the second-highest BMMC runtime as the cheapest.
+    present = [m for m in models if not table[table["model"] == m].empty]
+    biggest = table.loc[table["n_cells"].idxmax(), "dataset"]
+
+    def cost(model: str) -> float:
+        sub = table[(table["model"] == model) & (table["dataset"] == biggest)]
         if sub.empty:
-            continue
-        grouped = sub.groupby("n_cells")["runtime"].median().sort_index()
-        color = METHOD_COLORS.get(model, "#767676")
-        ax.plot(grouped.index, grouped.values, marker="o", ms=3, lw=1.0, color=color,
-                label=method_label(model), zorder=3)
+            sub = table[table["model"] == model]
+        return float(sub["runtime"].median())
+
+    order = sorted(present, key=cost)
+    for row, model in enumerate(order):
+        sub = table[table["model"] == model]
+        for dataset, group in sub.groupby("dataset"):
+            marker, colour, _ = dataset_style(dataset)
+            ax.plot(group["runtime"].median(), row, marker=marker, ms=3.6, lw=0,
+                    color=colour, markerfacecolor=colour, markeredgecolor="none",
+                    markeredgewidth=0, zorder=3)
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels([method_label(m) for m in order])
+    ax.set_ylim(-0.6, len(order) - 0.4)
+    ax.invert_yaxis()
     ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Cells")
-    ax.set_ylabel("Runtime (s)")
+    ax.set_xlabel("Runtime (s)")
+    ax.spines["left"].set_visible(False)
+    ax.tick_params(axis="y", length=0)
 
 
 def knn_curve_panel(ax, curves: dict[str, np.ndarray], fractions: np.ndarray):

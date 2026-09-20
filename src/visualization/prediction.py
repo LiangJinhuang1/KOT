@@ -24,10 +24,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from scipy import stats
 
-from src.visualization import METHOD_COLORS
+from src.visualization import METHOD_COLORS, dataset_style
+from src.visualization.style import STYLE_STATE
 
 RESULTS_DIR = Path("cache/results")
 
@@ -38,6 +39,43 @@ CANONICAL = {"lr_beta": 0.001, "lr_warmup_epochs": 300,
 # Covered by the kinetics term, or reached by alignment alone.
 COVERAGE_COLORS = {True: METHOD_COLORS["kot"], False: "#767676"}
 COVERAGE_LABELS = {True: "In kinetics", False: "Not in kinetics"}
+
+# Name the uncovered proteins only when the column is short enough to read.
+NAME_UNCOVERED_MAX = 8
+
+# Short panel name -> the dataset key the shared marker/colour registry uses.
+DATASET_KEYS = {"BMMC": "bmmc_cite_retained", "PBMC": "pbmc_retained"}
+
+
+def fig_dpi(ax) -> float:
+    """Points-per-inch conversion needs the figure's own dpi, not the default."""
+    return float(ax.figure.dpi)
+
+
+def spread(disp: list, run: list, pitch: float, floor: float | None = None) -> list:
+    """Target display-y for one cluster: evenly pitched, centred, lifted off the floor.
+
+    A cluster sitting on the panel's floor -- the isotype controls do -- would otherwise
+    have its lowest label centred below the bottom spine.
+    """
+    n = len(run)
+    centre = sum(disp[a] for a in run) / n
+    top = centre + pitch * (n - 1) / 2.0
+    targets = [top - pitch * a for a in range(n)]
+    if floor is not None and targets[-1] < floor:
+        lift = floor - targets[-1]
+        targets = [t + lift for t in targets]
+    return targets
+
+
+def swatch_handles(labels: dict, colours: dict, keys) -> list[Patch]:
+    """Legend patches, so every key in this figure matches Fig. 8's swatches."""
+    return [Patch(facecolor=colours[k], edgecolor="none", label=labels[k]) for k in keys]
+
+
+def coverage_handles() -> list[Patch]:
+    """The In / Not in kinetics key used by panels b and c."""
+    return swatch_handles(COVERAGE_LABELS, COVERAGE_COLORS, (True, False))
 
 
 def series_flag(series: pd.Series) -> pd.Series:
@@ -82,54 +120,108 @@ def coverage_strip_panel(ax, frames: dict[str, pd.DataFrame], metric: str = "spe
     for i, (name, df) in enumerate(frames.items()):
         per_protein = per_protein_median(df, metric)
         for j, covered in enumerate((True, False)):
-            values = per_protein.loc[per_protein["in_kinetics"] == covered, "median"]
+            rows = per_protein[per_protein["in_kinetics"] == covered]
+            values = rows["median"]
             x = 2 * i + j
             jitter = np.random.default_rng(0).normal(0, 0.06, len(values))
             ax.scatter(x + jitter, values, s=3.5, alpha=0.55, linewidths=0,
                        color=COVERAGE_COLORS[covered], zorder=3)
             ax.plot([x - 0.28, x + 0.28], [values.median()] * 2, color="#1A1A1A",
                     lw=1.0, zorder=4)
+            # Name the uncovered proteins when there are few enough to name. On PBMC
+            # that group is six: three real markers at the top and three IgG isotype
+            # controls at the bottom, so the median bar between them is an artefact of
+            # mixing negative controls into a comparison group. Naming them is the only
+            # way the panel shows why its own bar cannot be read.
+            if not covered and len(rows) <= NAME_UNCOVERED_MAX:
+                # Space the names evenly in DISPLAY units, not data units: the three
+                # isotype controls sit within 0.04 of each other, so any offset derived
+                # from their own heights still overlaps. Points close enough to collide
+                # form a cluster whose labels are dealt out at a fixed pitch, each with a
+                # leader line back to its own point. Naming them is the only way the
+                # panel shows why its own median bar cannot be read -- half this group
+                # is negative controls.
+                order = np.argsort(-values.to_numpy())
+                ys = [float(values.iloc[k]) for k in order]
+                pitch = 8.0
+                to_pt = lambda v: ax.transData.transform((0.0, v))[1] * 72.0 / fig_dpi(ax)
+                disp = [to_pt(v) for v in ys]
+                floor = to_pt(ax.get_ylim()[0]) + pitch
+                targets, run = [], [0]
+                for a in range(1, len(disp)):
+                    if disp[run[-1]] - disp[a] < pitch:
+                        run.append(a)
+                    else:
+                        targets.extend(spread(disp, run, pitch, floor))
+                        run = [a]
+                targets.extend(spread(disp, run, pitch, floor))
+                for a, k in enumerate(order):
+                    dy = targets[a] - disp[a]
+                    ax.annotate(clean_protein(rows["protein"].iloc[k]),
+                                xy=(x + jitter[k], ys[a]),
+                                xytext=(4, dy), textcoords="offset points",
+                                fontsize=STYLE_STATE["ladder"][2], color="0.35",
+                                ha="left", va="center", annotation_clip=False,
+                                arrowprops=None if abs(dy) < 1 else dict(
+                                    arrowstyle="-", lw=0.4, color="0.75",
+                                    shrinkA=0, shrinkB=1.5))
             positions.append(x)
             labels.append(COVERAGE_LABELS[covered])
         ax.text(2 * i + 0.5, 1.0, name, transform=ax.get_xaxis_transform(),
                 ha="center", va="bottom")
     ax.set_xticks(positions)
-    ax.set_xticklabels(labels, rotation=90)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_xlim(-0.6, positions[-1] + 0.6)
 
 
-def ranked_protein_panel(ax, df: pd.DataFrame, metric: str = "spearman",
-                         n_label: int = 3):
-    """Every protein in rank order, seed range as a whisker, extremes named.
+def rank_fraction(n: int) -> np.ndarray:
+    """Rank as a fraction of its own panel, so panels of different size share an axis."""
+    return np.arange(n) / max(n - 1, 1)
 
-    Naming all of them would need a tick per protein; naming the ends says where the
-    range runs and leaves the panel readable.
+
+def ranked_protein_panel(ax, frames: dict, metric: str = "spearman"):
+    """Every protein in rank order per dataset, seed range as a whisker.
+
+    Both datasets share the panel. They hold very different protein counts (BMMC 134,
+    PBMC 32), so x is the rank as a FRACTION of each panel rather than an index; colour
+    still carries kinetics coverage and shape carries the dataset, as in Fig. 3a.
+
+    Uncovered proteins are named when there are few enough to name -- on PBMC that is
+    six, half of them isotype controls, which is the panel's whole point. BMMC's 26 are
+    left unnamed rather than crowding the panel.
     """
-    per_protein = per_protein_median(df, metric)
-    x = np.arange(len(per_protein))
-    for covered in (True, False):
-        mask = (per_protein["in_kinetics"] == covered).to_numpy()
-        ax.vlines(x[mask], per_protein["min"][mask], per_protein["max"][mask],
-                  color=COVERAGE_COLORS[covered], lw=0.7, alpha=0.5, zorder=2)
-        ax.scatter(x[mask], per_protein["median"][mask], s=5,
-                   color=COVERAGE_COLORS[covered], linewidths=0, zorder=3,
-                   label=COVERAGE_LABELS[covered])
-    # The first three proteins sit at almost the same height on the left, so a
-    # left-edge ladder draws leader lines through those points. Park the names
-    # in the gap to their right, above the descending tail.
-    n_label = min(n_label, len(x) // 2)
-    named = ([(i, "left", 0.34, 0.96 - 0.10 * s) for s, i in enumerate(range(n_label))]
-             + [(i, "right", 0.98, 0.22 + 0.11 * s)
-                for s, i in enumerate(range(len(x) - n_label, len(x)))])
-    for i, ha, fx, fy in named:
-        ax.annotate(clean_protein(per_protein["protein"][i]),
-                    xy=(x[i], per_protein["median"][i]), xycoords="data",
-                    xytext=(fx, fy), textcoords="axes fraction",
-                    color="0.35", ha=ha, va="center", fontsize=6,
-                    arrowprops=dict(arrowstyle="-", lw=0.5, color="0.7",
-                                    shrinkA=0, shrinkB=1))
-    ax.set_xlim(-1, len(x))
-    return per_protein
+    out = {}
+    for name, df in frames.items():
+        per_protein = per_protein_median(df, metric)
+        x = rank_fraction(len(per_protein))
+        marker, _, _ = dataset_style(DATASET_KEYS[name])
+        for covered in (True, False):
+            mask = (per_protein["in_kinetics"] == covered).to_numpy()
+            if not mask.any():
+                continue
+            ax.vlines(x[mask], per_protein["min"][mask], per_protein["max"][mask],
+                      color=COVERAGE_COLORS[covered], lw=0.6, alpha=0.4, zorder=2)
+            ax.scatter(x[mask], per_protein["median"][mask], s=5, marker=marker,
+                       color=COVERAGE_COLORS[covered], linewidths=0, zorder=3)
+        uncovered = [i for i in range(len(x)) if not per_protein["in_kinetics"][i]]
+        if 0 < len(uncovered) <= NAME_UNCOVERED_MAX:
+            half = len(x) / 2
+            high = [i for i in uncovered if i < half]
+            low = [i for i in uncovered if i >= half]
+            named = ([(i, "left", 0.30, 0.96 - 0.10 * k) for k, i in enumerate(high)]
+                     + [(i, "right", 0.98, 0.22 + 0.11 * k) for k, i in enumerate(low)])
+            for i, ha, fx, fy in named:
+                ax.annotate(clean_protein(per_protein["protein"][i]),
+                            xy=(x[i], per_protein["median"][i]), xycoords="data",
+                            xytext=(fx, fy), textcoords="axes fraction",
+                            color="0.35", ha=ha, va="center", fontsize=6,
+                            arrowprops=dict(arrowstyle="-", lw=0.5, color="0.7",
+                                            shrinkA=0, shrinkB=1))
+        out[name] = per_protein
+    ax.set_xlim(-0.04, 1.04)
+    ax.set_xticks([0, 0.5, 1.0])
+    ax.set_xticklabels(["best", "", "worst"])
+    return out
 
 
 def clean_protein(name: str) -> str:
@@ -163,13 +255,17 @@ def pooled_calibration_panel(ax, predicted: np.ndarray, observed: np.ndarray, *,
 PRESET_MARKERS = ("CD4", "CD14", "CD19")
 
 CONTROL_ARMS = ("shuffle", "reverse", "zero", "permS")
+# Named as Tables 3 and 4 name the same arms, so the figure and the tables share one
+# vocabulary. `nodyn` is "No dynamics" here and in Fig. 5; Figs. 3 and 8 label that same
+# arm "KOT (lambda_dyn=0)" because there it is a METHOD in a method list, not a velocity
+# input in an ablation ladder.
 ARM_LABELS = {
-    "none": "KOT",
-    "nodyn": "No kinetics",
+    "none": "Real velocity",
+    "nodyn": "No dynamics",
     "shuffle": "Shuffled velocity",
-    "reverse": "Reversed velocity",
-    "zero": "Zero velocity",
-    "permS": "Permuted links",
+    "reverse": r"Reverse $v\to-v$",
+    "zero": r"Zero $v\to 0$",
+    "permS": r"Permuted mapping $S$",
 }
 NODYN_RUNS = {
     "bmmc_cite_retained": Path(
@@ -232,19 +328,30 @@ def preset_proteins(names) -> list[str]:
     return found
 
 
-def paired_delta_panel(ax, deltas: pd.DataFrame):
-    """One point per protein: median KOT − control Spearman over seeds."""
-    per_protein = deltas.groupby(["protein", "in_kinetics"])["delta"].median().reset_index()
-    per_protein = per_protein.sort_values("delta", ascending=False).reset_index(drop=True)
-    x = np.arange(len(per_protein))
-    for covered in (True, False):
-        mask = (per_protein["in_kinetics"] == covered).to_numpy()
-        ax.scatter(x[mask], per_protein["delta"][mask], s=5,
-                   color=COVERAGE_COLORS[covered], linewidths=0, zorder=3,
-                   label=COVERAGE_LABELS[covered])
+def paired_delta_panel(ax, frames: dict):
+    """One point per protein: median KOT − control Spearman over seeds, both datasets.
+
+    Fractional rank for the same reason as `ranked_protein_panel`: the two panels hold
+    134 and 32 proteins and still have to share one axis.
+    """
+    out = {}
+    for name, deltas in frames.items():
+        per_protein = (deltas.groupby(["protein", "in_kinetics"])["delta"]
+                       .median().reset_index()
+                       .sort_values("delta", ascending=False).reset_index(drop=True))
+        x = rank_fraction(len(per_protein))
+        marker, _, _ = dataset_style(DATASET_KEYS[name])
+        for covered in (True, False):
+            mask = (per_protein["in_kinetics"] == covered).to_numpy()
+            if mask.any():
+                ax.scatter(x[mask], per_protein["delta"][mask], s=5, marker=marker,
+                           color=COVERAGE_COLORS[covered], linewidths=0, zorder=3)
+        out[name] = per_protein
     ax.axhline(0, color="0.45", lw=0.7, ls=(0, (4, 2)), zorder=1)
-    ax.set_xlim(-1, len(x))
-    return per_protein
+    ax.set_xlim(-0.04, 1.04)
+    ax.set_xticks([0, 0.5, 1.0])
+    ax.set_xticklabels(["best", "", "worst"])
+    return out
 
 
 def marker_arm_panel(ax, frames: dict[str, pd.DataFrame], proteins: list[str],
@@ -259,6 +366,7 @@ def marker_arm_panel(ax, frames: dict[str, pd.DataFrame], proteins: list[str],
         "permS": "#CC79A7",
     }
     width = 0.14
+    lowest = 0.0
     for i, protein in enumerate(proteins):
         for j, arm in enumerate(arms):
             df = frames.get(arm)
@@ -267,6 +375,7 @@ def marker_arm_panel(ax, frames: dict[str, pd.DataFrame], proteins: list[str],
             values = df.loc[df["protein"] == protein, "spearman"]
             if values.empty:
                 continue
+            lowest = min(lowest, float(values.min()), float(values.median()))
             x = i + (j - (len(arms) - 1) / 2) * width
             ax.scatter(np.full(len(values), x), values, s=6, color=colours[arm],
                        alpha=0.55, linewidths=0, zorder=3)
@@ -274,13 +383,17 @@ def marker_arm_panel(ax, frames: dict[str, pd.DataFrame], proteins: list[str],
                     lw=0.9, zorder=4)
     ax.set_xticks(range(len(proteins)))
     ax.set_xticklabels([clean_protein(name) for name in proteins])
-    ax.set_ylim(-0.05, 1.05)
-    handles = [Line2D([0], [0], marker="o", color="none",
-                      markerfacecolor=colours[arm], markersize=4,
-                      label=ARM_LABELS[arm])
-               for arm in arms if arm in frames]
+    # Lower limit from the data, not a fixed -0.05: at that floor the two arms whose
+    # CD4 median is NEGATIVE -- no dynamics at -0.086 and permuted mapping at -0.058 --
+    # had their median bars clipped off the axis, hiding the panel's sharpest result,
+    # along with thirty points reaching -0.54.
+    ax.axhline(0, color="0.45", lw=0.7, ls=(0, (4, 2)), zorder=1)
+    ax.set_ylim(min(-0.05, lowest - 0.06), 1.05)
+    handles = swatch_handles(ARM_LABELS, colours,
+                             [arm for arm in arms if arm in frames])
     if handles:
-        ax.legend(handles=handles, loc="lower left", frameon=False, ncols=2,
-                  fontsize=6)
+        # One column, upper right: six arms across two columns read as three pairs.
+        ax.legend(handles=handles, loc="upper right", frameon=False, ncols=1,
+                  fontsize=6, labelspacing=0.25)
     return proteins
 

@@ -10,16 +10,25 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src.visualization.ablation import ARM_LABELS_TABLE
 from src.visualization.style import apply_style, figsize, panel_letter, save_figure
 
 DATASETS = {'bmmc_cite_retained': 'BMMC', 'pbmc_retained': 'PBMC'}
 ARMS = ['real', 'shuffle', 'reverse', 'zero', 'permS']
-LABELS = ['Original velocity', 'Shuffled velocity', 'Reversed velocity',
-          'Zero velocity', 'Permuted gene links']
+# Axis categories come from the ablation table's vocabulary, not a private one. These
+# panels are the paired view of Table 4's arms, so a reader comparing the two should not
+# have to work out that "Permuted gene links" and "Permuted mapping S" are one control.
+LABELS = [ARM_LABELS_TABLE[arm] for arm in ARMS]
 METRICS = ['mean_foscttm', 'jvp_rhs_cos_median']
 # The intervention and output destination are the only allowed within-seed changes.
 INTERVENTION_KEYS = {'output_root', 'kot_velocity_shuffle', 'kot_velocity_ablation',
                      'kot_s_permute'}
+# The sweep's rungs are shares of each panel, not counts: BMMC 0/5/13/27/40/53 and PBMC
+# 0/1/3/5/8/10 are the SAME six conditions. `csv/16_anchor_count.csv` calls them
+# anchor_share, so the axis does too -- 5 and 1 stop looking like different experiments.
+# Fixed rather than derived: 27/53 rounds to 51% and 3/10 to 30%, neither of which is a rung.
+ANCHOR_SHARES = (0, 10, 25, 50, 75, 100)
+
 
 
 def file_digest(path: Path) -> str:
@@ -141,7 +150,7 @@ def plot_control_effects(paired: pd.DataFrame, out: Path) -> pd.DataFrame:
             ax.set_ylim(4.55, -.55)
             ax.set_title(f'{label}: ' + ('alignment' if col == 0 else 'ODE agreement'))
             ax.set_xlabel('Δ FOSCTTM\nnegative = lower pairing error' if col == 0 else
-                          'Δ JVP–RHS cosine\nnegative = less agreement')
+                          'Δ JVP·RHS cosine\nnegative = less agreement')
             panel_letter(ax, 'abcd'[row*2+col])
             ax.spines[['top', 'right']].set_visible(False)
     fig.get_layout_engine().set(hspace=.10, wspace=.10)
@@ -169,10 +178,10 @@ def plot_velocity_detail(paired: pd.DataFrame, out: Path) -> None:
                        s=10, alpha=.45, color='#0072B2', edgecolors='none')
             ax.errorbar(mean, position, xerr=[[mean-low], [high-mean]], fmt='D',
                         ms=3, color='#1A1A1A', capsize=2)
-        ax.set_yticks(range(3), ['Shuffled velocity', 'Reversed velocity', 'Zero velocity'])
+        ax.set_yticks(range(3), [ARM_LABELS_TABLE[arm] for arm in arms])
         ax.set_ylim(2.5, -.5)
         ax.set_xlim(-extent, extent)
-        ax.set_xlabel('Δ FOSCTTM versus original\nnegative = lower pairing error')
+        ax.set_xlabel('Δ FOSCTTM versus real velocity\nnegative = lower pairing error')
         ax.set_title(f'{label}: velocity effects (zoom)')
         ax.spines[['top', 'right']].set_visible(False)
         panel_letter(ax, 'ab'[col])
@@ -233,52 +242,86 @@ def anchor_comparisons(frame: pd.DataFrame) -> pd.DataFrame:
     return paired
 
 
+def share_of(counts) -> dict:
+    """Map each anchor count onto the rung it actually is, as a share of the panel."""
+    counts = sorted(counts)
+    if len(counts) != len(ANCHOR_SHARES):
+        raise ValueError(f'Expected {len(ANCHOR_SHARES)} anchor rungs, found {counts}')
+    return dict(zip(counts, ANCHOR_SHARES))
+
+
+def anchor_delta_panel(ax, group: pd.DataFrame, shares: dict, colour: str) -> list[dict]:
+    """Per-seed paired effect at each rung: this protein against ITSELF at zero anchors.
+
+    Every panel of this figure is now a paired delta, because an absolute error level
+    cannot be read here. The anchor subset is drawn easy-first -- at zero anchors the
+    proteins that will be anchored already score 0.364 against 0.457 for the ones that
+    will not -- so any vertical gap between an anchored and an unanchored curve is mostly
+    selection, not effect. Differencing within a protein removes that by construction.
+
+    It also fixes what the intervals mean. Plotting levels put between-protein spread on
+    the error bars (the five-protein core ran [0.139, 0.332], nearly the whole panel) and
+    that is not the uncertainty anyone is asking about. Here the bar is the seed bootstrap
+    on a within-protein change.
+    """
+    rows = []
+    for count, subset in group.groupby('beta_anchor_subset_n'):
+        seed_means = subset.groupby('seed').error_delta.mean()
+        mean, low, high = mean_interval(seed_means.to_numpy())
+        x = shares[count]
+        ax.scatter(np.full(len(seed_means), x), seed_means, color=colour, s=8, alpha=.35,
+                   edgecolors='none', zorder=3)
+        ax.errorbar(x, mean, yerr=[[mean - low], [high - mean]], fmt='D', color='#1A1A1A',
+                    ms=3, capsize=2, elinewidth=1, zorder=4)
+        rows.append({'anchor_count': count, 'anchor_share': x,
+                     'metric': 'paired_error_delta', 'mean': mean, 'ci95_low': low,
+                     'ci95_high': high, 'n_seeds': len(seed_means),
+                     'n_proteins_per_seed': int(subset.groupby('seed').size().median())})
+    return rows
+
+
 def plot_anchor_transfer(paired: pd.DataFrame, out: Path) -> pd.DataFrame:
+    """Top row: does anchoring help what you anchored? Bottom row: does it carry over?
+
+    The two rows share units and a zero line, and differ only in y-scale: the direct
+    effect is ~110x the transfer effect, so one axis cannot hold both. The top row used to
+    carry a shaded band marking the bottom row's range; it was removed because an
+    unlabelled stripe reads as an artefact and its label crowded the title. The ratio
+    belongs in the caption.
+    """
     apply_style('iclr')
     fig, axes = plt.subplots(2, 2, figsize=figsize('full', 4.6), layout='constrained')
     summaries = []
     for col, (dataset, name) in enumerate(DATASETS.items()):
-        # Outside-mask proteins never receive the kinetic prior and dilute transfer tests.
-        group = paired[(paired.dataset == dataset) & paired.in_kinetics].copy()
-        ax = axes[0, col]
-        for anchored, label, color in [(True, 'Anchored', '#0072B2'),
-                                        (False, 'Unanchored', '#D55E00')]:
-            subset = group[group.anchored == anchored]
-            seed_means = subset.groupby(['beta_anchor_subset_n', 'seed']).abs_err.mean()
-            means = seed_means.groupby(level=0).mean()
-            ax.plot(means.index, means.values, color=color, lw=1, label=label)
-            for count, values in seed_means.groupby(level=0):
-                mean, low, high = mean_interval(values.to_numpy())
-                ax.errorbar(count, mean, yerr=[[mean-low], [high-mean]], fmt='o',
-                            color=color, ms=3, capsize=2, elinewidth=.8)
-                summaries.append({'dataset': dataset, 'anchors': count, 'anchored': anchored,
-                                  'metric': 'absolute_error', 'mean': mean,
-                                  'ci95_low': low, 'ci95_high': high, 'n_seeds': len(values)})
-        ax.set_title(f'{name}: fit to rate references')
-        ax.set_ylabel('Mean absolute β error\n(model units)')
-        ax.legend(loc='best', fontsize=7)
-        panel_letter(ax, 'ab'[col])
+        shares = share_of(paired.loc[paired.dataset == dataset, 'beta_anchor_subset_n'].unique())
+        # Outside-mask proteins never receive the kinetic prior; the zero-anchor run is
+        # the reference, so it has no delta of its own.
+        group = paired[(paired.dataset == dataset) & paired.in_kinetics
+                       & (paired.beta_anchor_subset_n > 0)]
+        # Bottom row first: the top row needs its range to place the scale band.
         ax = axes[1, col]
-        ax.axhline(0, color='.5', ls='--', lw=.7)
-        unanchored = group[(~group.anchored) & (group.beta_anchor_subset_n > 0)]
-        for count, subset in unanchored.groupby('beta_anchor_subset_n'):
-            seed_means = subset.groupby('seed').error_delta.mean()
-            mean, low, high = mean_interval(seed_means.to_numpy())
-            ax.scatter(np.full(len(seed_means), count), seed_means, color='#D55E00',
-                       s=8, alpha=.35, edgecolors='none')
-            ax.errorbar(count, mean, yerr=[[mean-low], [high-mean]], fmt='D',
-                        color='#1A1A1A', ms=3, capsize=2, elinewidth=1)
-            summaries.append({'dataset': dataset, 'anchors': count, 'anchored': False,
-                              'metric': 'paired_error_delta', 'mean': mean,
-                              'ci95_low': low, 'ci95_high': high, 'n_seeds': len(seed_means),
-                              'n_proteins_per_seed_min': subset.groupby('seed').size().min(),
-                              'n_proteins_per_seed_max': subset.groupby('seed').size().max()})
-        ax.set_title(f'{name}: change on unanchored proteins')
-        ax.set_ylabel('Δ error versus no anchors\nnegative = improvement')
-        panel_letter(ax, 'cd'[col])
-        for ax in axes[:, col]:
-            ax.set_xlabel('Anchors used in fitting')
-            ax.set_xticks(sorted(group.beta_anchor_subset_n.unique()))
+        ax.axhline(0, color='.5', ls='--', lw=.7, zorder=1)
+        summaries += [{'dataset': dataset, 'group': 'unanchored', **row} for row in
+                      anchor_delta_panel(ax, group[~group.anchored], shares, '#D55E00')]
+        ax.set_title(f'{name}: proteins left unanchored')
+
+        ax = axes[0, col]
+        ax.axhline(0, color='.5', ls='--', lw=.7, zorder=1)
+        summaries += [{'dataset': dataset, 'group': 'anchored', **row} for row in
+                      anchor_delta_panel(ax, group[group.anchored], shares, '#0072B2')]
+        ax.set_title(f'{name}: proteins that were anchored')
+
+        for row, ax in enumerate(axes[:, col]):
+            ax.set_xticks(ANCHOR_SHARES)
+            ax.set_xlim(-6, 106)
             ax.spines[['top', 'right']].set_visible(False)
+            panel_letter(ax, 'acbd'[col * 2 + row])
+            # One axis label per row and per column: the four panels share both axes, and
+            # four copies of a two-line y-label cost more width than the points do.
+            if row:
+                ax.set_xlabel('Share anchored (%)')
+            if not col:
+                ax.set_ylabel('\u0394 \u03b2 error versus no anchors'
+                              '\nnegative = improvement')
     save_figure(fig, out / 'fig11_anchor_transfer', verify=True)
     return pd.DataFrame(summaries)

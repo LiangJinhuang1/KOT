@@ -9,7 +9,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.lines import Line2D
 from scipy.stats import gaussian_kde
-from sklearn.neighbors import NearestNeighbors
 
 from src.visualization import (
     FOSCTTM_CHANCE,
@@ -110,35 +109,6 @@ def coembedding_plot_kwargs(cfg: dict) -> dict:
     }
 
 
-def modality_mixing(xy_rna: np.ndarray, xy_prot: np.ndarray, *, k: int = 15,
-                    max_cells: int = 4000, random_state: int = 0) -> float | None:
-    """Fraction of each cell's k nearest co-embedding neighbours from the other modality.
-
-    1.0 = perfectly mixed, 0.0 = the two modalities occupy disjoint regions. This
-    is the number the "after alignment, by modality" panel is really asking about,
-    so it is reported on the panel rather than left to the reader's eye.
-    """
-    rng = np.random.default_rng(random_state)
-    n_r, n_p = len(xy_rna), len(xy_prot)
-    if n_r == 0 or n_p == 0:
-        return None
-    idx_r = rng.choice(n_r, min(n_r, max_cells // 2), replace=False)
-    idx_p = rng.choice(n_p, min(n_p, max_cells // 2), replace=False)
-
-    pts = np.vstack([xy_rna[idx_r], xy_prot[idx_p]])
-    is_prot = np.concatenate([np.zeros(len(idx_r), bool), np.ones(len(idx_p), bool)])
-    k_eff = int(min(k, len(pts) - 1))
-    if k_eff < 1:
-        return None
-
-    nn = NearestNeighbors(n_neighbors=k_eff + 1).fit(pts)
-    neigh = nn.kneighbors(pts, return_distance=False)[:, 1:]
-    cross = (is_prot[neigh] != is_prot[:, None]).mean(axis=1)
-    # Expected cross-fraction under perfect mixing is the other class's share,
-    # so normalise by it to keep 1.0 meaning "as mixed as possible".
-    share = np.where(is_prot, len(idx_r), len(idx_p)) / len(pts)
-    return float(np.mean(cross / share))
-
 
 def plot_coembedding(
     x,
@@ -201,11 +171,7 @@ def plot_coembedding(
     ax.scatter(xy_prot_after[:, 0], xy_prot_after[:, 1],
                c=MODALITY_COLORS.get(second_label, MODALITY_COLORS["Protein"]),
                marker=MODALITY_MARKERS.get(second_label, "^"), label=second_label, **SCATTER_STYLE)
-    mixing = modality_mixing(xy_rna_after, xy_prot_after, random_state=random_state)
-    title = "Co-embedding, by modality"
-    if mixing is not None:
-        title += f"  (mixing {mixing:.2f})"
-    ax.set_title(title)
+    ax.set_title("Co-embedding, by modality")
     ax.legend(markerscale=4, loc="best")
     embedding_axes(ax, after_x, after_y)
     panel_letter(ax, "c")

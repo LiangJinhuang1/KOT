@@ -9,14 +9,26 @@ TWO SETS THAT ARE NOT NESTED, and must not be drawn as one funnel:
   the funnel        total antibodies → mapped to a gene → curated as kinetics-eligible →
                     the gene present in RNA → surviving QC → the gene's velocity usable.
                     Each stage is a subset of the one before it.
-  anchored          proteins with a literature half-life. On BMMC that is 62 while
-                    velocity-backed is 29, so anchoring is a different axis, not a later
-                    stage. Drawn beside the funnel, never inside it.
+  anchored          proteins with a literature half-life that the run actually anchors.
+                    On BMMC that is 52 while velocity-backed is 28, so anchoring is a
+                    different axis, not a later stage. Drawn beside the funnel, never
+                    inside it.
 
-`final_runtime_kinetic_mask` is the mask a run actually used and is LARGER than the
-velocity-backed set, because `kot_kinetics_require_velocity_gene` is false: proteins whose
-gene has no usable velocity still enter the term. Both numbers are shown, since reporting
-only the strict one would overstate how much of the kinetics term is velocity-backed.
+Panel b reports what training did, not what the data could support, so every bar is a
+runtime set:
+
+  alignment_active              every protein feeding the OT term. Needs no gene link, so
+                                on BMMC it is the whole 134-antibody panel.
+  final_runtime_kinetic_mask    the kinetic mask a run used. LARGER than the velocity-
+                                backed set, because `kot_kinetics_require_velocity_gene`
+                                is false: proteins whose gene has no usable velocity still
+                                enter the term (BMMC 101, of which only 28 are backed).
+  strict_velocity_kinetic_mask  that mask intersected with usable velocity. Not the same
+                                as `velocity_usable` (29), which counts good velocity
+                                whether or not the run used the protein -- IgD has usable
+                                velocity but never enters the mask.
+  anchor_in_kinetic_mask        derived here, since the summary only carries the candidate
+                                pool. Matches `beta_anchor_n` in every run's diagnostics.
 """
 
 from __future__ import annotations
@@ -36,22 +48,48 @@ FUNNEL = [
     ("curated_kinetic_eligible", "kinetics-eligible"),
     ("present_in_rna", "gene in RNA"),
     ("retained_after_qc", "survives QC"),
-    ("velocity_usable", "velocity usable"),
+    # "(any)" because panel b's velocity bar is this set intersected with the kinetic
+    # mask, which is one protein smaller on BMMC (IgD). Without the qualifier the 29
+    # here and the 28 there read as a contradiction.
+    ("velocity_usable", "velocity usable (any)"),
 ]
 
 # What each surviving link actually feeds. Not nested, so plotted as its own group.
+# The repeated "Kinetic mask" prefix is deliberate: the velocity-backed bar is a subset of
+# the used bar, and the counts alone (28 vs 101) do not say so.
+# Wrapped, not abbreviated: at 45 degrees a one-line "Kinetic mask: velocity-backed"
+# reaches far enough left to squeeze panel a until its count labels collide.
 TERMS = [
-    ("present_in_rna", "alignment"),
-    ("final_runtime_kinetic_mask", "kinetics (run)"),
-    ("velocity_usable", "kinetics (vel.)"),
-    ("anchored", "β anchored"),
+    ("alignment_active", "Alignment:\nall proteins"),
+    ("final_runtime_kinetic_mask", "Kinetic mask:\nused"),
+    ("strict_velocity_kinetic_mask", "Kinetic mask:\nvelocity-backed"),
+    ("anchor_in_kinetic_mask", "β anchor\ntargets"),
 ]
 
 
 def read_coverage(datasets: list[str]) -> pd.DataFrame:
-    """One row per dataset from the per-dataset coverage summaries."""
-    frames = [pd.read_csv(MAPPING_DIR / f"kinetics_coverage_{d}_summary.csv")
-              for d in datasets]
+    """One row per dataset, plus the two runtime counts only the per-protein table holds.
+
+    `alignment_active` the summary never carries, and `anchored` it carries as the
+    candidate pool: every protein with a literature half-life, including ones outside the
+    kinetic mask that are therefore never anchored (BMMC 62 candidates, 52 anchored). Both
+    are derived from the per-protein table so panel b reports what training did.
+    """
+    frames = []
+    for dataset in datasets:
+        summary = pd.read_csv(MAPPING_DIR / f"kinetics_coverage_{dataset}_summary.csv")
+        detail = pd.read_csv(MAPPING_DIR / f"kinetics_coverage_{dataset}.csv")
+        if len(detail) != int(summary.loc[0, "total_adts"]):
+            raise ValueError(
+                f"{dataset}: per-protein table has {len(detail)} rows but the summary "
+                f"counts {int(summary.loc[0, 'total_adts'])} antibodies; they are out of sync"
+            )
+        anchored_in_mask = int(
+            (detail["anchor_available"] & detail["final_runtime_kinetic_mask"]).sum()
+        )
+        summary["alignment_active"] = int(detail["alignment_active"].sum())
+        summary["anchor_in_kinetic_mask"] = anchored_in_mask
+        frames.append(summary)
     return pd.concat(frames, ignore_index=True)
 
 

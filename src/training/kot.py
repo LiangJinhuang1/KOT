@@ -41,7 +41,10 @@ from src.data.splits import (
 )
 from src.evaluation.foscttm import calc_domainAveraged_FOSCTTM
 from src.evaluation.trajectory_dtw import trajectory_dtw
-from src.visualization import FOSCTTM_CHANCE, METHOD_COLORS, MODALITY_COLORS
+from matplotlib.lines import Line2D
+
+from src.visualization import (FOSCTTM_CHANCE, METHOD_COLORS, MODALITY_COLORS,
+                               state_color_map, state_label)
 from src.visualization.style import (
     apply_style, chance_line, figsize, ink, panel_letter, save_figure,
 )
@@ -1342,11 +1345,24 @@ def plot_grad_interaction(rows: list, output_path: Path) -> None:
     ]
     if has_scaled:
         labelled.append((r"kinetics $\times\ \lambda$", dns_m, "0.45"))
-    for label, ys, color in labelled:
-        ax.annotate(label, xy=(ep[-1], ys[-1]), xytext=(3, 0),
+    ax.set_xlim(0, float(ep[-1]) * 1.38)
+    # Each label sits at its curve's last point, so two curves that converge at the right
+    # edge stack their labels -- on the canonical PBMC run `alignment` and
+    # `kinetics x lambda` end within a few percent of each other. Spread them as a
+    # FRACTION OF THE LOG AXIS, not in display pixels: `tight_layout` below resizes the
+    # axes, so a pixel gap measured now would not survive it.
+    low, high = (math.log10(v) for v in ax.get_ylim())
+    pitch = 0.085 * (high - low)
+    placed: list[float] = []
+    for index in sorted(range(len(labelled)), key=lambda i: labelled[i][1][-1]):
+        label, ys, color = labelled[index]
+        y_log = math.log10(ys[-1])
+        if placed and y_log - placed[-1] < pitch:
+            y_log = placed[-1] + pitch
+        placed.append(y_log)
+        ax.annotate(label, xy=(ep[-1], 10.0 ** y_log), xytext=(3, 0),
                     textcoords="offset points", fontsize=6, color=color,
                     va="center", ha="left")
-    ax.set_xlim(0, float(ep[-1]) * 1.38)
     panel_letter(ax, "a")
 
     # A ratio of exactly 0 (lambda_dyn = 0 during warmup) cannot be drawn on a log
@@ -1370,13 +1386,16 @@ def plot_grad_interaction(rows: list, output_path: Path) -> None:
 
     ax = axes[2]
     ax.axhline(0.0, color="0.45", lw=0.7, ls=(0, (4, 2)))
+    # Kept, but do not caption it: measured spread across probe batches is <= 1e-6, so
+    # this band is invisible at any sane scale. If a future probe design disagrees it
+    # will simply appear.
     ax.fill_between(ep, cos_m - cos_s, cos_m + cos_s,
                     color=METHOD_COLORS["kot"], alpha=0.18, linewidth=0)
     ax.plot(ep, cos_m, color=ink(METHOD_COLORS["kot"]), **probe)
     ax.set_ylim(-1.05, 1.05)
     ax.set_xlim(0, float(ep[-1]) * 1.04)
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("gradient cosine")
+    ax.set_ylabel("Gradient cosine")
     ax.set_title("Cooperate or conflict")
     ax.text(0.99, 0.97, "> 0 cooperate", transform=ax.transAxes,
             fontsize=6, color="0.35", ha="right", va="top")
@@ -1384,18 +1403,30 @@ def plot_grad_interaction(rows: list, output_path: Path) -> None:
             fontsize=6, color="0.35", ha="right", va="bottom")
     panel_letter(ax, "c")
 
-    fig.text(0.5, -0.02,
-             f"Gradients probed at {len(ep)} epochs; band in c is 1 s.d. over probe batches",
-             ha="center", va="top", fontsize=6, color="0.35")
+    # No in-figure footnote. It said "gradients probed at N epochs; band in c is 1 s.d.
+    # over probe batches" and the second half promised something invisible: the four probe
+    # batches agree to about 1e-6, so the band in c is ~1e-6 wide on an axis spanning 2.1
+    # and has never been drawable. The probe count belongs in the caption.
     fig.tight_layout(pad=0.5, w_pad=2.4)
     save_figure(fig, Path(output_path).with_suffix(""))
 
 
-def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
+def plot_foscttm_diagnostics(per_cell: dict, output_path: Path, *,
+                             compare: dict | None = None,
+                             compare_label: str = "No dynamics",
+                             label: str = "KOT") -> None:
     """What per-cell alignment failure co-varies with.
 
     One panel per candidate explanation, each plotted against per-cell FOSCTTM
     so the reader can see which quantity actually tracks alignment quality.
+
+    `compare` is a second arm's per-cell dict, used by panel a only. Panel a asks whether
+    cells align badly BECAUSE the model put them on the wrong branch, and a well-behaved
+    arm cannot answer it: KOT gets 99.5% of branches right, so the split is 14 cells
+    against 4,986, all fourteen sit at the branch junction, and position-matched within
+    that window the difference is -0.0005 -- no contrast at all. The arm that fails
+    answers loudly (3,350 of 5,000 wrong, FOSCTTM 0.596 against 0.057, and the gap grows
+    to +0.74 far from the split), so the panel draws both or it says nothing.
     """
     foscttm      = per_cell["foscttm"]
     time_err     = per_cell["time_err"]
@@ -1412,35 +1443,77 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
                              layout="constrained")
     fig.get_layout_engine().set(h_pad=0.06, w_pad=0.05, hspace=0.06, wspace=0.05)
     axes = axes.ravel()
-    pt = dict(s=1.2, alpha=0.30, linewidths=0, rasterized=True,
-              color=METHOD_COLORS["kot"])
+    # Bigger and fainter than a line-like s=1.2/alpha=0.30, so a single cell stays a
+    # visible dot and density reads as darkness.
+    pt = dict(s=3.6, alpha=0.18, linewidths=0, rasterized=True)
+
+    # Coloured by true cell state, and this is what makes the panels readable rather than
+    # decorative. Every quantity here is a smooth function of a cell's position along the
+    # trajectory -- within a branch, |Spearman| against true time runs to 0.90 -- so both
+    # axes track one parameter and 5,000 cells trace a PARAMETRIC CURVE, not a cloud. The
+    # system has three sub-trajectories (trunk, Branch_A, Branch_B), so the uncoloured
+    # panel overlaid three curves and the folds and loops read as artefacts. Split by
+    # state they are three clean arcs, and panel c's real result appears: ODE consistency
+    # collapses along the progenitor trunk (0.95 -> 0.35) while both branches hold above
+    # 0.8. Pooled, that shows up only as a meaningless r = -0.53.
+    states = np.asarray(per_cell.get("state_true", np.array([])))
+    by_state = (len(states) == len(foscttm)
+                and len(np.unique(states)) > 1)
+    colors = state_color_map(states) if by_state else {}
 
     ax = axes[0]
+    arms = [(label, per_cell, METHOD_COLORS["kot"])]
+    if compare is not None and (np.asarray(compare["branch_match"]) >= 0).any():
+        arms.append((compare_label, compare, METHOD_COLORS["kot_nodyn"]))
     if (branch_match >= 0).any():
-        correct = foscttm[branch_match == 1]
-        wrong   = foscttm[branch_match == 0]
-        bp = ax.boxplot([correct, wrong],
-                        labels=[f"Correct\n(n={len(correct):,})",
-                                f"Wrong\n(n={len(wrong):,})"],
-                        widths=0.5, showfliers=False, patch_artist=True)
-        for patch, color in zip(bp["boxes"], [METHOD_COLORS["kot"], "#767676"]):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.45)
-            patch.set_linewidth(0.6)
-        for key in ("whiskers", "caps", "medians"):
-            for line in bp[key]:
-                line.set_color("0.25")
-                line.set_linewidth(0.7)
+        width = 0.7 / len(arms)
+        for i, (arm_label, block, color) in enumerate(arms):
+            f_arm = np.asarray(block["foscttm"])
+            bm_arm = np.asarray(block["branch_match"])
+            groups = [f_arm[bm_arm == 1], f_arm[bm_arm == 0]]
+            offset = (i - (len(arms) - 1) / 2) * width
+            bp = ax.boxplot(groups, positions=[1 + offset, 2 + offset], widths=width * 0.82,
+                            showfliers=False, patch_artist=True, manage_ticks=False)
+            for patch in bp["boxes"]:
+                patch.set_facecolor(color)
+                patch.set_alpha(0.55)
+                patch.set_linewidth(0.6)
+            for key in ("whiskers", "caps", "medians"):
+                for line in bp[key]:
+                    line.set_color("0.25")
+                    line.set_linewidth(0.7)
+            if len(arms) > 1:
+                ax.plot([], [], "s", ms=3.4, color=color, alpha=0.55, lw=0, label=arm_label)
+            # n above each box's upper whisker cap, read off the artist so the label
+            # tracks the box instead of a fixed height: the four boxes here span
+            # 0.03 to 1.0, and a common baseline put every label inside a box.
+            for j, (pos, values) in enumerate(zip([1 + offset, 2 + offset], groups)):
+                top = float(bp["caps"][2 * j + 1].get_ydata()[0])
+                ax.annotate(f"{len(values):,}", (pos, top), textcoords="offset points",
+                            xytext=(0, 2), ha="center", va="bottom", fontsize=5,
+                            color="0.45")
+        ax.set_xticks([1, 2], ["Correct", "Wrong"])
+        ax.set_xlim(0.5, 2.5)
         ax.set_ylabel("FOSCTTM")
         ax.set_xlabel("Branch assignment")
         ax.set_title("Alignment vs branch error")
         ax.yaxis.set_major_locator(MaxNLocator(nbins=4, prune="both"))
+        if len(arms) > 1:
+            ax.legend(loc="upper left", frameon=False, fontsize=6, handletextpad=0.4,
+                      labelspacing=0.3, borderaxespad=0.2)
     else:
         ax.text(0.5, 0.5, "no ground-truth branch", ha="center", va="center",
                 fontsize=6, color="0.45", transform=ax.transAxes)
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_title("Alignment vs branch error")
-    chance_line(ax, FOSCTTM_CHANCE, axis="y", label="chance")
+    # Label at the LEFT end: with both arms drawn the no-kinetics "Wrong" box straddles
+    # 0.5, so the default right-hand label sat inside it.
+    chance_line(ax, FOSCTTM_CHANCE, axis="y", label="chance",
+                text_x=0.01, ha="left")
+    # Headroom above the chance line. On a run that aligns well the boxes sit near zero,
+    # autoscale stops just past 0.5, and the chance label lands on the title.
+    bottom, top = ax.get_ylim()
+    ax.set_ylim(bottom, max(top, FOSCTTM_CHANCE) + 0.16 * (top - bottom))
     panel_letter(ax, "a")
 
     panels = [
@@ -1450,7 +1523,12 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
         ("Distance to nearest\nprotein cell", align_pc, None, "e", False),
     ]
     for ax, (ylabel, values, ylim, letter, log_y) in zip(axes[1:5], panels):
-        ax.scatter(foscttm, values, **pt)
+        if by_state:
+            for state in sorted(np.unique(states)):
+                m = states == state
+                ax.scatter(foscttm[m], values[m], color=colors[str(state)], **pt)
+        else:
+            ax.scatter(foscttm, values, color=METHOD_COLORS["kot"], **pt)
         ax.set_xlabel("FOSCTTM")
         ax.set_ylabel(ylabel)
         if ylim:
@@ -1469,12 +1547,18 @@ def plot_foscttm_diagnostics(per_cell: dict, output_path: Path) -> None:
         panel_letter(ax, letter)
 
     axes[5].axis("off")
-    axes[5].text(0.06, 0.92,
-                 "Each point is one cell.\nx-axis is per-cell FOSCTTM\n"
-                 "throughout (lower = better).\n\n"
-                 "r is the Pearson correlation\nwith FOSCTTM.",
-                 transform=axes[5].transAxes, fontsize=6, color="0.35",
-                 ha="left", va="top", linespacing=1.5)
+    if by_state:
+        # The key lives in the sixth cell, which was empty anyway, so three colours cost
+        # the figure no panel space.
+        axes[5].legend(handles=[Line2D([0], [0], marker="o", lw=0, ms=3.4,
+                                       markerfacecolor=colors[str(state)],
+                                       markeredgecolor="none",
+                                       label=state_label(state))
+                                for state in sorted(np.unique(states))],
+                       title="True cell state", loc="center left",
+                       bbox_to_anchor=(0.04, 0.5), frameon=False, fontsize=6,
+                       title_fontsize=6, handletextpad=0.4, labelspacing=0.4)
+
 
     save_figure(fig, Path(output_path).with_suffix(""))
 
