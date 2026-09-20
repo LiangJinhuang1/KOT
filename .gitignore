@@ -12,6 +12,9 @@ results/
 figure_data/
 scratch/
 scratch_lens4/
+figures/tables/
+figures/tavotto_revision_20260920/
+figures/tavotto_registry.json
 
 # 文档与脚本（本地 / HPC）
 assistant.py
