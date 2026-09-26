@@ -6,7 +6,7 @@ modality's rate law.
 
 ```
 RNA  --phi-->  protein    (main result)
-ATAC --phi-->  RNA        (exploratory; not in the paper)
+ATAC --phi-->  RNA        (exploratory)
 ```
 
 ## Install

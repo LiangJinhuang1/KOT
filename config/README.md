@@ -68,7 +68,7 @@ live in `Datasets/`, derived files in `cache/`; neither is in git.
 | `pbmc` | RNA → protein (ADT) | 10x *5k PBMC protein v3 Next GEM* |
 | `papalexi_nt_only` | RNA → protein (ADT) | GEO GSE153056, pooled ECCITE-seq; preprocessing fitted on non-targeting (NT) control cells only |
 | `synthetic_linked_ode` | RNA → protein | generated; `runner.py --stage` picks the stage |
-| `bmmc_multiome`, `shareseq_{skin,brain,lung}` | ATAC → RNA | chromatin track, not in the paper |
+| `bmmc_multiome`, `shareseq_{skin,brain,lung}` | ATAC → RNA | chromatin track |
 
 Suffixes:
 
