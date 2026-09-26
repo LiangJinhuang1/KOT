@@ -1,4 +1,4 @@
-# KOT — kinetic optimal transport
+# KOT — Kinetic induced Optimal Transport
 
 Thesis research code. KOT learns a map `phi` between two single-cell modalities and
 adds a kinetic constraint: `phi` must carry source-modality velocity onto the target
