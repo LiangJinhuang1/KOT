@@ -39,4 +39,4 @@ figures/   generated panels
 
 Datasets, caches, checkpoints and cluster scripts are not in this repository.
 
-See `config/README.md` for training settings and the `--models` groups.
+See `config/README.md` for training settings, datasets, anchors, and the `--models` groups.
