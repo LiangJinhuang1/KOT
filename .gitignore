@@ -14,6 +14,12 @@ scratch/
 scratch_lens4/
 figures/tables/
 figures/tavotto_registry.json
+figures/fig1_kot_synthetic_alignment_concept.pdf
+figures/fig1_kot_synthetic_alignment_concept.png
+figures/fig1_kot_synthetic_alignment_concept.svg
+figures/fig1a_schematic_ml.pdf
+figures/fig1a_schematic_ml.png
+figures/fig1a_schematic_ml.svg
 figures/tavotto_revision_20260920/**
 !figures/tavotto_revision_20260920/**/
 !figures/tavotto_revision_20260920/**/*.svg
@@ -34,6 +40,13 @@ jobs_*.txt
 jobs/
 reports/
 slurm/
+tests/test_heatmap_grid.py
+tools/build_iclr_tables.py
+tools/evaluate_iclr_fitted_dynamics.py
+tools/make_chromatin_collapse.py
+tools/make_schematic_ml.py
+tools/make_schematic_v2.py
+tools/make_schematic_variants.py
 
 # --- Python ---
 __pycache__/

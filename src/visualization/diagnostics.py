@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from matplotlib import colormaps
 from matplotlib.patches import Rectangle
 
 from src.visualization import (METHOD_COLORS, dataset_label, dataset_style,
@@ -305,6 +306,9 @@ TUNE_LOCK = {
 TUNE_DATASETS = ("bmmc_cite_retained", "pbmc_retained")
 TUNE_LAMBDAS = (1, 100, 300, 500, 1000, 2000)
 TUNE_BETAS = (0.001, 0.003, 0.01)
+# Missing tune-grid cells: light gray, not white, so "not evaluated" is a fill
+# rather than an empty hole. The caption states the mapping.
+MISSING_CELL = "#D0D0D0"
 
 
 def tune_lambda_grid(summary: pd.DataFrame, dataset: str, value: str) -> pd.DataFrame:
@@ -334,20 +338,25 @@ def tune_lambda_grid(summary: pd.DataFrame, dataset: str, value: str) -> pd.Data
 
 
 def heatmap_grid(ax, table: pd.DataFrame, value: str, *, cmap: str, vmin, vmax,
-                 fmt: str = "{:.3f}"):
-    """Draw the lambda × lr_beta grid; hatched cells were not run.
+                 fmt: str = "{:.3f}", xlabel: str | None = r"$\lambda_{\mathrm{dyn}}$",
+                 ylabel: str | None = r"$\lambda_\beta$", cellsize: float = 7.0,
+                 ticksize: float | None = None):
+    """Draw the lambda × lr_beta grid; gray cells were not evaluated.
 
-    Every run cell is also printed. The differences this grid exists to show sit in the
-    third decimal -- BMMC's best cell is 0.124 against 0.133 at the chosen setting -- and
-    no reader can take that off a viridis ramp. The colour carries the gist, the number
-    carries the comparison.
+    Every run cell is also printed, with the leading zero kept (0.124, not .124).
+    The differences this grid exists to show sit in the third decimal -- BMMC's
+    best cell is 0.124 against 0.133 at the chosen setting -- and no reader can
+    take that off a viridis ramp. The colour carries the gist, the number carries
+    the comparison.
     """
     lambdas = np.asarray(TUNE_LAMBDAS, dtype=float)
     betas = np.asarray(TUNE_BETAS, dtype=float)
     matrix = table.pivot(index="lr_beta", columns="lambda_dyn", values=value)
     matrix = matrix.reindex(index=betas, columns=lambdas)
+    ramp = colormaps[cmap].copy() if isinstance(cmap, str) else cmap.copy()
+    ramp.set_bad(MISSING_CELL)
     masked = np.ma.masked_invalid(matrix.to_numpy(dtype=float))
-    image = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax,
+    image = ax.imshow(masked, aspect="auto", cmap=ramp, vmin=vmin, vmax=vmax,
                       interpolation="nearest")
     if "seeds" in table.columns:
         not_run = table.pivot(index="lr_beta", columns="lambda_dyn",
@@ -356,8 +365,8 @@ def heatmap_grid(ax, table: pd.DataFrame, value: str, *, cmap: str, vmin, vmax,
     else:
         missing = np.isnan(matrix.to_numpy(dtype=float))
     for row, col in np.argwhere(missing):
-        ax.add_patch(Rectangle((col - 0.5, row - 0.5), 1, 1, fill=False,
-                               hatch="////", edgecolor="0.6", linewidth=0.4))
+        ax.add_patch(Rectangle((col - 0.5, row - 0.5), 1, 1, facecolor=MISSING_CELL,
+                               edgecolor="0.78", linewidth=0.35))
     values = matrix.to_numpy(dtype=float)
     for row in range(values.shape[0]):
         for col in range(values.shape[1]):
@@ -366,16 +375,18 @@ def heatmap_grid(ax, table: pd.DataFrame, value: str, *, cmap: str, vmin, vmax,
             red, green, blue, _ = image.cmap(image.norm(values[row, col]))
             # Perceived luminance, so the label stays legible at both ends of the ramp.
             luminance = .299 * red + .587 * green + .114 * blue
-            # No leading zero: both metrics live in [0, 1], the digit carries nothing,
-            # and a cell here is only ~25 pt wide.
-            ax.text(col, row, fmt.format(values[row, col]).replace("0.", "."),
-                    ha="center", va="center", fontsize=5,
+            ax.text(col, row, fmt.format(values[row, col]),
+                    ha="center", va="center", fontsize=cellsize,
                     color="#FFFFFF" if luminance < .55 else "#1A1A1A")
     # Six lambda labels across a 150 pt panel collide flat; the project already rotates
     # crowded categorical ticks (Figs. S1, S2).
     ax.set_xticks(range(len(TUNE_LAMBDAS)), [str(v) for v in TUNE_LAMBDAS],
                   rotation=45, ha="right")
     ax.set_yticks(range(len(TUNE_BETAS)), [str(v) for v in TUNE_BETAS])
-    ax.set_xlabel(r"$\lambda_{\mathrm{dyn}}$")
-    ax.set_ylabel(r"$\mathrm{lr}_\beta$")
+    if ticksize is not None:
+        ax.tick_params(labelsize=ticksize)
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
     return image

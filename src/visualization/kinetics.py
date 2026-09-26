@@ -29,17 +29,40 @@ def clean_marker(name: str) -> str:
     return str(name)
 
 
+# The runs the reported tables are built from: setting B (lambda_dyn 1000, beta learning
+# rate 1e-3, 300-epoch dynamics ramp) at twelve seeds. The curated MANIFEST entries
+# (bmmc_scvelo_kot and siblings) are the earlier canonical lambda_dyn=100 runs at five
+# seeds, so reading those made this figure describe a different model than tables 01 and
+# 09 -- KOT scored 0.178 FOSCTTM on BMMC there against 0.129 in the table. Table 09 takes
+# its scVelo arm from the ablation launch and its RegVelo arm from the full-panel launch;
+# both are setting B, and the figure pairs them the same way so the two agree row for row.
+REPORTED_BETA_RUNS = {
+    "bmmc_cite_retained": "run_20260829_022744_shuf_bmmc_scv_cfgB_warm300_beta1p0e-3_realVel",
+    "pbmc_retained": "run_20260829_022744_shuf_pbmc_scv_cfgB_warm300_beta1p0e-3_realVel",
+    "bmmc_cite_regvelo": "run_20260828_101018_full_bmmc_rgv_S2cfgB_warm300_beta1p0e-3_ramp300",
+    "pbmc_regvelo": "run_20260828_101018_full_pbmc_rgv_S2cfgB_warm300_beta1p0e-3_ramp300",
+}
+
+
 def collect_beta(cache_dir: str | Path = "cache/training",
-                 model: str = "kot") -> pd.DataFrame:
+                 model: str = "kot",
+                 runs: dict[str, str] | None = None) -> pd.DataFrame:
     """One row per (run, dataset, seed, marker): fitted beta against its literature target.
 
-    Restricted to curated runs when a MANIFEST exists, for the same reason
-    :func:`~tools.make_paper_figures.branch_identity_pairs` is: the uncurated sweep
-    arms differ in lambda_dyn and kappa bounds, so pooling them reports a median
-    over configurations that were never meant to be compared. Falls back to every
-    run when there is no manifest, so a fresh checkout still plots.
+    `runs` pins each dataset to the single run the paper reports it from, defaulting to
+    :data:`REPORTED_BETA_RUNS`. Pinning rather than pooling matters here because the
+    sweep arms differ in lambda_dyn, beta learning rate and kappa bounds, so pooling
+    reports a median over configurations that were never meant to be compared -- and
+    because seed counts differ between launches, which silently changes the n this
+    figure prints. Falls back to the curated MANIFEST runs, then to every run, when the
+    pinned directories are absent, so a fresh or partial checkout still plots.
     """
-    curated = curated_runs(cache_dir)
+    runs = REPORTED_BETA_RUNS if runs is None else runs
+    pinned = {ds: run for ds, run in runs.items() if (Path(cache_dir) / run).is_dir()}
+    if pinned and len(pinned) < len(runs):
+        missing = ", ".join(sorted(set(runs) - set(pinned)))
+        print(f"[kinetics] reported beta runs missing for {missing}; those panels are dropped")
+    curated = {} if pinned else curated_runs(cache_dir)
     rows = []
     for dj in Path(cache_dir).rglob("*/diagnostics.json"):
         d = read_diagnostics(dj)
@@ -57,7 +80,10 @@ def collect_beta(cache_dir: str | Path = "cache/training",
         if len(parts) < 4 or parts[1] != model:
             continue
         run, dataset = parts[0], parts[2]
-        if curated and run not in curated:
+        if pinned:
+            if pinned.get(dataset) != run:
+                continue
+        elif curated and run not in curated:
             continue
         seed = parts[3].replace("seed_", "") if len(parts) > 4 else "-"
         for name, t, f in zip(names, targets, fitted):
@@ -204,6 +230,10 @@ def plot_beta_recovery(df: pd.DataFrame, save_path: str | Path,
         if len(pts) != 2:
             continue
         xs, ys, _, ns = zip(*pts)
+        # One label covers both backends, so it may not quote a single backend's seed
+        # count: the scVelo and RegVelo arms come from different launches and a launch
+        # that lost seeds would otherwise be reported with its sibling's n.
+        seed_n = ns[0] if len(set(ns)) == 1 else "/".join(str(n) for n in ns)
         marker, color, short = dataset_style(scvelo_ds)
         # Every seed as its own point, and nothing else. A mean marker or an error bar
         # reads as a summary the panel has not earned with five runs; the raw spread
@@ -214,7 +244,7 @@ def plot_beta_recovery(df: pd.DataFrame, save_path: str | Path,
             ax.plot(x + np.asarray(offsets), rhos, marker, color=color, ms=2.6,
                     markerfacecolor=color, markeredgewidth=0, alpha=0.8,
                     linestyle="none", zorder=5,
-                    label=f"{short} (n={ns[i]})" if i == 0 else None)
+                    label=f"{short} (n={seed_n})" if i == 0 else None)
     ax.set_xticks([0, 1])
     ax.set_xticklabels(["scVelo", "RegVelo"])
     ax.tick_params(axis="x", pad=2)

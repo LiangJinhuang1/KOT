@@ -42,11 +42,10 @@ METHOD_COLORS = {
     "kot_anchor":                   "#3E92C8",
     "kot_noanchor":                 "#7BB6DC",
     "kot_nodyn":                    "#9ECAE1",
-    # Ordered dark-to-light by how well the arm does on the synthetic ladder
-    # (real-velocity FOSCTTM: oracle .023, kappa fixed .273, alpha fixed .468),
-    # so Fig. 5a/b reads without checking the key. Only Fig. 5 draws these two.
-    "kot_fixedkappa":               "#4292C6",
-    "kot_fixedalpha":               "#6BAED6",
+    # Fig. 5a/b only. Hue, not a blue ramp, carries identity: navy / vermillion /
+    # bluish-green stays CVD-safe and clear of panel c's BMMC blue and PBMC amber.
+    "kot_fixedkappa":               "#D55E00",
+    "kot_fixedalpha":               "#009E73",
     "kot_oracle":                   "#08519C",
     "kot_oracle_learnalpha":        "#2171B5",
     "kot_oracle_learnalpha_kappa":  "#4292C6",

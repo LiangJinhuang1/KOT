@@ -130,7 +130,7 @@ def figsize(width: str | float = "full", height: float = 2.0,
 
 
 def panel_letter(ax, letter: str, *, dy_points: float | None = None,
-                 case: str = "upper"):
+                 case: str = "upper", size: float | None = None):
     """Bold panel letter, above the panel title and aligned with the axes left edge.
 
     Placed in offset *points* above the axes, not in axes fractions to its left:
@@ -146,7 +146,7 @@ def panel_letter(ax, letter: str, *, dy_points: float | None = None,
     return ax.annotate(
         text, xy=(0.0, 1.0), xycoords="axes fraction",
         xytext=(0.0, dy_points), textcoords="offset points",
-        fontsize=PANEL_LETTER_SIZE, fontweight="bold",
+        fontsize=PANEL_LETTER_SIZE if size is None else size, fontweight="bold",
         ha="left", va="bottom", annotation_clip=False,
     )
 

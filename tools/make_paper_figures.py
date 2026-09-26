@@ -933,7 +933,7 @@ def figure5(out: Path):
 
     syn = read_arms("synthetic_branch_summary.csv", ABLATION_LR_BETA, ABLATION_WARMUP)
     # No dose-response to show; belongs in the ablation table, not this panel.
-    # Ordered by how well each arm does, which is also the palette's dark-to-light order.
+    # Ordered by how well each arm does on the synthetic ladder.
     arms = ["kot_oracle", "kot_fixedkappa", "kot_fixedalpha"]
 
     ax = axd["a"]
@@ -1446,44 +1446,81 @@ def figure_robustness(out: Path):
         print("[figS5] cache/results/summary.csv missing; skipping")
         return
     summary = read_by_config("summary.csv")
-    fig, axes = plt.subplots(2, 2, figsize=figsize("full", 3.6), layout="constrained")
     # FOSCTTM tops out at 0.52, not 0.50: PBMC at lambda_dyn = 1, lr_beta = 1e-3 scores
     # 0.5049, which a 0.50 ceiling clipped to the same colour as a 0.500 cell. Chance is
     # 0.5, so that one cell is the only one in the grid that is WORSE than random, and the
     # clipping hid exactly that.
     metrics = (
-        ("foscttm_fitted_mean", "FOSCTTM", "viridis_r", 0.10, 0.52),
-        ("jvp_cos_med_mean", "JVP·RHS cosine", "viridis", 0.0, 1.0),
+        ("foscttm_fitted_mean", "FOSCTTM ↓", "viridis_r", 0.10, 0.52, "FOSCTTM"),
+        ("jvp_cos_med_mean", "JVP·RHS cosine ↑", "viridis", 0.0, 1.0,
+         "JVP·RHS cosine"),
     )
+    header_size = PANEL_LETTER_SIZE + 2.0
+    letter_size = PANEL_LETTER_SIZE + 1.5
+    title_size = float(plt.rcParams["axes.titlesize"]) + 1.0
+    tick_size = float(plt.rcParams["xtick.labelsize"]) + 1.0
+    # Constrained layout only for x (tick padding, colour bars). Vertical
+    # positions are packed below, so the 3×6 boxes keep the height that a
+    # title-sized gap actually needs instead of the engine's row spacing.
+    fig = plt.figure(figsize=figsize("full", 3.45), layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.05, hspace=0.12,
+                                rect=(0.03, 0.05, 0.995, 0.94))
+    grid = fig.add_gridspec(2, 3, width_ratios=[1.0, 1.0, 0.065])
+    axes = np.empty((2, 2), dtype=object)
     images = [None, None]
     for col, dataset in enumerate(TUNE_DATASETS):
-        for row, (value, ylabel, cmap, vmin, vmax) in enumerate(metrics):
+        for row, (value, _, cmap, vmin, vmax, _) in enumerate(metrics):
             table = tune_lambda_grid(summary, dataset, value)
-            ax = axes[row, col]
-            images[row] = heatmap_grid(ax, table, value, cmap=cmap, vmin=vmin, vmax=vmax)
-            if row == 0:
-                # Short name: the full label ran into the colorbar's own title.
-                ax.set_title(DATASET_SHORT[dataset])
-                ax.set_xlabel("")
-            if col == 1:
-                ax.set_ylabel("")
-            else:
-                ax.set_ylabel(ylabel)
+            ax = fig.add_subplot(grid[row, col])
+            axes[row, col] = ax
+            images[row] = heatmap_grid(
+                ax, table, value, cmap=cmap, vmin=vmin, vmax=vmax,
+                xlabel="", ylabel="", cellsize=7.0, ticksize=tick_size)
+            ax.tick_params(labelbottom=(row == 1), labelleft=(col == 0),
+                           labelsize=tick_size)
             missing = int(table["seeds"].isna().sum())
             print(f"[figS5] {dataset} {value}: {missing} of {len(table)} cells not run")
-            panel_letter(ax, "abcd"[2 * row + col])
-    cbar0 = fig.colorbar(images[0], ax=list(axes[0]), fraction=0.046, pad=0.02)
-    cbar1 = fig.colorbar(images[1], ax=list(axes[1]), fraction=0.046, pad=0.02)
+            panel_letter(ax, "abcd"[2 * row + col], dy_points=1, size=letter_size)
+    cbar0 = fig.colorbar(images[0], cax=fig.add_subplot(grid[0, 2]))
+    cbar1 = fig.colorbar(images[1], cax=fig.add_subplot(grid[1, 2]))
     # Both bars: yellow at the top = better (low FOSCTTM, high cosine).
+    # Direction lives in the row titles (↓ / ↑); the bars only name the metric.
     cbar0.ax.invert_yaxis()
-    cbar0.set_label("FOSCTTM (lower better)")
-    cbar1.set_label("JVP·RHS cosine (higher better)")
-    # No in-figure footnote. Everything it said belongs in the caption and is recorded in
-    # figures/THESIS_FIGURES.md: the hatched cells, the tune-side 4-seed population, the
-    # 0.5 chance level, and that this is not a lambda x anchor grid. It also had a cost --
-    # `fit_to_venue` scales the figure to the widest drawn artist, so a long footnote line
-    # set the panel width and squeezed the cell labels into each other.
-    save_figure(fig, dest / "figS5_lambda_beta")
+    cbar0.set_label(metrics[0][-1])
+    cbar1.set_label(metrics[1][-1])
+    cbar0.ax.tick_params(labelsize=tick_size)
+    cbar1.ax.tick_params(labelsize=tick_size)
+    fig.supxlabel(r"$\lambda_{\mathrm{dyn}}$")
+    fig.supylabel(r"$\lambda_\beta$")
+    fig.canvas.draw()
+    fig.set_layout_engine(None)
+    # Equal-height rows, gap only for JVP·RHS cosine ↑ plus C/D letters.
+    top_y1, bot_y0, gap = 0.820, 0.145, 0.108
+    height = (top_y1 - bot_y0 - gap) / 2.0
+    top_y0 = bot_y0 + height + gap
+    for col in range(2):
+        box = axes[0, col].get_position()
+        axes[0, col].set_position((box.x0, top_y0, box.width, height))
+        axes[1, col].set_position((box.x0, bot_y0, box.width, height))
+    for cax, y0 in ((cbar0.ax, top_y0), (cbar1.ax, bot_y0)):
+        box = cax.get_position()
+        cax.set_position((box.x0, y0, box.width, height))
+    for col, dataset in enumerate(TUNE_DATASETS):
+        box = axes[0, col].get_position()
+        fig.text((box.x0 + box.x1) / 2, box.y1 + 0.088, DATASET_SHORT[dataset],
+                 ha="center", va="bottom", fontsize=header_size, fontweight="bold",
+                 transform=fig.transFigure)
+    for row in range(2):
+        left, right = axes[row, 0].get_position(), axes[row, 1].get_position()
+        fig.text((left.x0 + right.x1) / 2, left.y1 + 0.054, metrics[row][1],
+                 ha="center", va="bottom", fontsize=title_size,
+                 transform=fig.transFigure)
+    # Caption, not an in-figure footnote: gray = not evaluated. A drawn note
+    # would enter `fit_to_venue` and squeeze the cell labels.
+    print("[figS5] caption: Gray cells were not evaluated.")
+    saved = save_figure(fig, out / "figS5_lambda_beta")
+    for path in saved:
+        shutil.copy2(path, dest / path.name)
 
 
 def tables(out: Path):
